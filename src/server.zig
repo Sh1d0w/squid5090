@@ -348,6 +348,7 @@ pub fn run_openai_server(
     }
 
     g_listen_fd = listen_fd;
+    engine.enable_prefix_cache();
     var buffers = ServerBuffers.init();
     defer buffers.deinit();
 
@@ -626,9 +627,20 @@ fn handle_chat_completions(
 
     // Render Inkling-2-Mini chat template directly into static render_buf!
     var render_writer = tiger.ByteWriter.init(buffers.render_buf);
-    render_chat_template_zero_alloc(&render_writer, messages_json, tools_json, effort, buffers.scratch_str_buf);
+    const sys_prefix_bytes: usize = render_chat_template_zero_alloc(&render_writer, messages_json, tools_json, effort, buffers.scratch_str_buf);
+    const rendered = render_writer.slice();
 
-    const prompt_len = tokenizer.encode_into(render_writer.slice(), true, &buffers.tok_scratch, buffers.prompt_tokens);
+    // Encode system+tools prefix first (clean special-token boundary <|end_message|>) to pass exact checkpoint hint!
+    var system_prefix_tokens: u32 = 0;
+    var prompt_len: usize = 0;
+    if (sys_prefix_bytes > 0 and sys_prefix_bytes < rendered.len) {
+        const sys_len = tokenizer.encode_into(rendered[0..sys_prefix_bytes], true, &buffers.tok_scratch, buffers.prompt_tokens);
+        system_prefix_tokens = @intCast(sys_len);
+        const tail_len = tokenizer.encode_into(rendered[sys_prefix_bytes..], true, &buffers.tok_scratch, buffers.prompt_tokens[sys_len..]);
+        prompt_len = sys_len + tail_len;
+    } else {
+        prompt_len = tokenizer.encode_into(rendered, true, &buffers.tok_scratch, buffers.prompt_tokens);
+    }
     if (prompt_len == 0 or prompt_len >= config.context_tokens_max) {
         send_error_json(fd, 400, "Prompt empty or exceeds max_context", "invalid_request_error", buffers.response_buf);
         return;
@@ -665,8 +677,9 @@ fn handle_chat_completions(
             }
         };
         var ctx: NonStreamCtx = .{ .parser = &parser, .stops = &stops };
-        const stats = engine.generate(
+        const stats = engine.generate_with_hint(
             buffers.prompt_tokens[0..prompt_len],
+            system_prefix_tokens,
             gen_limit,
             @intCast(req_mtp),
             &.{},
@@ -716,20 +729,22 @@ fn handle_chat_completions(
         }
         bw.append_slice("},\"finish_reason\":");
         bw.append_json_escaped(finish_reason);
-        bw.append_fmt("}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}},\"timings\":{{\"prefill_ms\":{d:.2},\"decode_ms\":{d:.2},\"tokens_per_second\":{d:.2},\"spec_acc_pct\":{d:.1},\"spec_dl\":{d:.2}}}}}", .{
+        bw.append_fmt("}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_details\":{{\"cached_tokens\":{d}}}}},\"timings\":{{\"prefill_ms\":{d:.2},\"decode_ms\":{d:.2},\"tokens_per_second\":{d:.2},\"cached_tokens\":{d},\"spec_acc_pct\":{d:.1},\"spec_dl\":{d:.2}}}}}", .{
             stats.prompt_tokens,
             stats.generated_tokens,
             stats.prompt_tokens + stats.generated_tokens,
+            stats.cached_tokens,
             stats.prefill_ms,
             stats.decode_ms,
             tps,
+            stats.cached_tokens,
             acc_pct,
             dl,
         });
 
         tiger.print_stdout(
-            "[http] POST /v1/chat/completions prompt={d} gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-            .{ stats.prompt_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
+            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
         );
         send_json_response(fd, 200, bw.slice());
         return;
@@ -803,8 +818,9 @@ fn handle_chat_completions(
         .stops = &stops,
     };
 
-    const stats = engine.generate(
+    const stats = engine.generate_with_hint(
         buffers.prompt_tokens[0..prompt_len],
+        system_prefix_tokens,
         gen_limit,
         @intCast(req_mtp),
         &.{},
@@ -818,6 +834,11 @@ fn handle_chat_completions(
         if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) return;
     }
 
+    // Emit streaming OpenAI tool_calls delta chunk(s) before final finish_reason="tool_calls"!
+    if (parser.tool_call_count > 0) {
+        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) return;
+    }
+
     const hit_eos: bool = (stats.last_token_id == constants.eos_token_id);
     const finish_reason: []const u8 = if (parser.tool_call_count > 0) "tool_calls" else if (sctx.hit_stop or hit_eos) "stop" else "length";
     const usage_opt: ?engine_mod.GenerateStats = if (include_usage) stats else null;
@@ -828,8 +849,8 @@ fn handle_chat_completions(
     const tps: f64 = if (stats.decode_ms > 0.0) (dec_toks * 1000.0 / stats.decode_ms) else 0.0;
     const dl: f64 = if (stats.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(stats.spec_steps))) else 1.0;
     tiger.print_stdout(
-        "[http] POST /v1/chat/completions (stream) prompt={d} gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-        .{ stats.prompt_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
+        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
     );
 }
 
@@ -1057,30 +1078,96 @@ fn send_chat_sse_delta(
     }
     bw.append_slice("}]");
     if (usage) |st| {
-        bw.append_fmt(",\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}", .{
+        bw.append_fmt(",\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"prompt_tokens_details\":{{\"cached_tokens\":{d}}}}}", .{
             st.prompt_tokens,
             st.generated_tokens,
             st.prompt_tokens + st.generated_tokens,
+            st.cached_tokens,
         });
     }
     bw.append_slice("}\n\n");
     return send_all(fd, bw.slice());
 }
 
+fn send_chat_sse_tool_calls(
+    fd: i32,
+    sse_buf: []u8,
+    req_id: []const u8,
+    created: i64,
+    req_model: []const u8,
+    parser: *const InklingStreamParser,
+) bool {
+    var ti: usize = 0;
+    while (ti < parser.tool_call_count) : (ti += 1) {
+        const tc = parser.tool_calls[ti];
+        const tname = parser.tool_store_writer.buffer[tc.name_offset .. tc.name_offset + tc.name_len];
+        const targs = parser.tool_store_writer.buffer[tc.args_offset .. tc.args_offset + tc.args_len];
+        var bw = tiger.ByteWriter.init(sse_buf);
+        bw.append_slice("data: {\"id\":");
+        bw.append_json_escaped(req_id);
+        bw.append_fmt(",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":", .{created});
+        bw.append_json_escaped(req_model);
+        bw.append_fmt(",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{d},\"id\":\"call_", .{ti});
+        bw.append_slice(&tc.id_hex);
+        bw.append_slice("\",\"type\":\"function\",\"function\":{\"name\":");
+        bw.append_json_escaped(tname);
+        bw.append_slice(",\"arguments\":");
+        bw.append_json_escaped(targs);
+        bw.append_slice("}}]},\"finish_reason\":null}]}\n\n");
+        if (!send_all(fd, bw.slice())) return false;
+    }
+    return true;
+}
+
 /// Zero-allocation Inkling-2-Mini chat template renderer operating directly on JSON slices.
+/// Returns `system_prefix_bytes`: the byte offset right after `tools` + leading `system`/`developer`
+/// + `Thinking effort level` blocks (used as a prefix KV cache checkpoint boundary!).
 fn render_chat_template_zero_alloc(
     out: *tiger.ByteWriter,
     messages_json: []const u8,
     tools_json: []const u8,
     effort: []const u8,
     scratch: []u8,
-) void {
+) usize {
     if (tools_json.len > 2 and tools_json[0] == '[') {
-        out.append_slice("<|message_system|>tool_declare<|content_xml|>");
-        out.append_slice(tools_json);
-        out.append_slice("<|end_message|>");
+        out.append_slice("<|message_system|>tool_declare<|content_xml|>[");
+        var tp: usize = 1;
+        var t_iter: u32 = 0;
+        var emitted_tools: u32 = 0;
+        while (tp < tools_json.len and t_iter < 256) : (t_iter += 1) {
+            tokenizer_mod.skip_ws(tools_json, &tp);
+            if (tp >= tools_json.len or tools_json[tp] == ']') break;
+            const t_start = tp;
+            tokenizer_mod.skip_json_value(tools_json, &tp);
+            const tool_obj = tools_json[t_start..tp];
+            if (tool_obj.len >= 2 and tool_obj[0] == '{') {
+                const fn_obj = extract_raw_field(tool_obj, "function") orelse tool_obj;
+                var type_buf: [64]u8 = undefined;
+                const ttype = extract_string_field(tool_obj, "type", &type_buf) orelse "function";
+                var tname_buf: [256]u8 = undefined;
+                const tname = extract_string_field(fn_obj, "name", &tname_buf) orelse "";
+                const tdesc = extract_string_field(fn_obj, "description", scratch) orelse "";
+                const tparams = extract_raw_field(fn_obj, "parameters") orelse "{}";
+
+                if (emitted_tools > 0) out.append_byte(',');
+                out.append_slice("{\"description\":");
+                out.append_json_escaped(tdesc);
+                out.append_slice(",\"name\":");
+                out.append_json_escaped(tname);
+                out.append_slice(",\"parameters\":");
+                out.append_slice(tparams);
+                out.append_slice(",\"type\":");
+                out.append_json_escaped(ttype);
+                out.append_byte('}');
+                emitted_tools += 1;
+            }
+            tokenizer_mod.skip_ws(tools_json, &tp);
+            if (tp < tools_json.len and tools_json[tp] == ',') tp += 1;
+        }
+        out.append_slice("]<|end_message|>");
     }
 
+    var system_prefix_bytes: usize = out.length;
     var effort_emitted: bool = false;
     var pos: usize = 1; // skip '['
     var msg_iter: u32 = 0;
@@ -1099,16 +1186,18 @@ fn render_chat_template_zero_alloc(
 
         var role_buf: [32]u8 = undefined;
         const role = extract_string_field(msg_obj, "role", &role_buf) orelse "user";
-        if (!effort_emitted and !std.mem.eql(u8, role, "system")) {
+        const is_sys: bool = std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer");
+        if (!effort_emitted and !is_sys) {
             tokenizer_mod.Tokenizer.emit_thinking_effort(out, effort);
             effort_emitted = true;
+            system_prefix_bytes = out.length;
         }
 
         const role_tok: []const u8 = if (std.mem.eql(u8, role, "user"))
             "<|message_user|>"
         else if (std.mem.eql(u8, role, "assistant"))
             "<|message_model|>"
-        else if (std.mem.eql(u8, role, "system"))
+        else if (is_sys)
             "<|message_system|>"
         else if (std.mem.eql(u8, role, "tool"))
             "<|message_tool|>"
@@ -1116,14 +1205,22 @@ fn render_chat_template_zero_alloc(
             "<|message_user|>";
 
         var name_buf: [128]u8 = undefined;
-        const name_opt = extract_string_field(msg_obj, "name", &name_buf);
+        var resolved_name: ?[]const u8 = extract_string_field(msg_obj, "name", &name_buf);
+        if (std.mem.eql(u8, role, "tool") and (resolved_name == null or resolved_name.?.len == 0)) {
+            var tcid_buf: [128]u8 = undefined;
+            if (extract_string_field(msg_obj, "tool_call_id", &tcid_buf)) |tcid| {
+                resolved_name = resolve_tool_name_by_id(messages_json[0..obj_start], tcid, &name_buf);
+            }
+        }
+        const is_assistant: bool = std.mem.eql(u8, role, "assistant");
 
-        // Optional assistant reasoning_content
-        if (std.mem.eql(u8, role, "assistant")) {
+        var has_reasoning: bool = false;
+        if (is_assistant) {
             if (extract_string_field(msg_obj, "reasoning_content", scratch)) |rc| {
                 if (rc.len > 0) {
+                    has_reasoning = true;
                     out.append_slice(role_tok);
-                    if (name_opt) |nm| out.append_slice(nm);
+                    if (resolved_name) |nm| out.append_slice(nm);
                     out.append_slice("<|content_thinking|>");
                     out.append_slice(rc);
                     out.append_slice("<|end_message|>");
@@ -1131,16 +1228,21 @@ fn render_chat_template_zero_alloc(
             }
         }
 
+        const tc_raw_opt = if (is_assistant) extract_raw_field(msg_obj, "tool_calls") else null;
+        const has_tool_calls: bool = (tc_raw_opt != null and tc_raw_opt.?.len > 2 and tc_raw_opt.?[0] == '[');
+
         // Content (string or array of text parts)
         if (extract_raw_field(msg_obj, "content")) |c_raw| {
             if (c_raw.len > 0 and c_raw[0] == '"') {
                 var cp: usize = 0;
                 if (tokenizer_mod.parse_json_string(c_raw, &cp, scratch)) |cs| {
-                    out.append_slice(role_tok);
-                    if (name_opt) |nm| out.append_slice(nm);
-                    out.append_slice("<|content_text|>");
-                    out.append_slice(cs);
-                    out.append_slice("<|end_message|>");
+                    if (cs.len > 0 or !(is_assistant and (has_tool_calls or has_reasoning))) {
+                        out.append_slice(role_tok);
+                        if (resolved_name) |nm| out.append_slice(nm);
+                        out.append_slice("<|content_text|>");
+                        out.append_slice(cs);
+                        out.append_slice("<|end_message|>");
+                    }
                 }
             } else if (c_raw.len > 0 and c_raw[0] == '[') {
                 var ap: usize = 1;
@@ -1151,6 +1253,7 @@ fn render_chat_template_zero_alloc(
                     if (c_raw[ap] == '"') {
                         if (tokenizer_mod.parse_json_string(c_raw, &ap, scratch)) |ps| {
                             out.append_slice(role_tok);
+                            if (resolved_name) |nm| out.append_slice(nm);
                             out.append_slice("<|content_text|>");
                             out.append_slice(ps);
                             out.append_slice("<|end_message|>");
@@ -1161,6 +1264,7 @@ fn render_chat_template_zero_alloc(
                         const part_obj = c_raw[ps_start..ap];
                         if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             out.append_slice(role_tok);
+                            if (resolved_name) |nm| out.append_slice(nm);
                             out.append_slice("<|content_text|>");
                             out.append_slice(ts);
                             out.append_slice("<|end_message|>");
@@ -1174,8 +1278,53 @@ fn render_chat_template_zero_alloc(
             }
         }
 
-        if (std.mem.eql(u8, role, "assistant")) {
+        // Render prior assistant tool_calls in Inkling's native tool_invoke format
+        if (has_tool_calls) {
+            const tc_arr = tc_raw_opt.?;
+            var tcp: usize = 1;
+            var tc_iter: u32 = 0;
+            while (tcp < tc_arr.len and tc_iter < 32) : (tc_iter += 1) {
+                tokenizer_mod.skip_ws(tc_arr, &tcp);
+                if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
+                const tc_start = tcp;
+                tokenizer_mod.skip_json_value(tc_arr, &tcp);
+                const tc_obj = tc_arr[tc_start..tcp];
+                if (extract_raw_field(tc_obj, "function")) |fn_obj| {
+                    var fname_buf: [256]u8 = undefined;
+                    if (extract_string_field(fn_obj, "name", &fname_buf)) |fname| {
+                        out.append_slice("<|message_model|>");
+                        out.append_slice(fname);
+                        out.append_slice("<|content_invoke_tool_json|>{\"name\":");
+                        out.append_json_escaped(fname);
+                        out.append_slice(",\"args\":");
+                        if (extract_raw_field(fn_obj, "arguments")) |args_raw| {
+                            if (args_raw.len > 0 and args_raw[0] == '"') {
+                                var ap2: usize = 0;
+                                if (tokenizer_mod.parse_json_string(args_raw, &ap2, scratch)) |args_str| {
+                                    const trimmed = trim_ascii_ws(args_str);
+                                    out.append_slice(if (trimmed.len > 0) trimmed else "{}");
+                                } else {
+                                    out.append_slice("{}");
+                                }
+                            } else {
+                                out.append_slice(args_raw);
+                            }
+                        } else {
+                            out.append_slice("{}");
+                        }
+                        out.append_slice("}<|end_message|>");
+                    }
+                }
+                tokenizer_mod.skip_ws(tc_arr, &tcp);
+                if (tcp < tc_arr.len and tc_arr[tcp] == ',') tcp += 1;
+            }
+        }
+
+        if (is_assistant) {
             out.append_slice("<|content_model_end_sampling|>");
+        }
+        if (is_sys and !effort_emitted) {
+            system_prefix_bytes = out.length;
         }
 
         tokenizer_mod.skip_ws(messages_json, &pos);
@@ -1184,7 +1333,51 @@ fn render_chat_template_zero_alloc(
 
     if (!effort_emitted) {
         tokenizer_mod.Tokenizer.emit_thinking_effort(out, effort);
+        system_prefix_bytes = out.length;
     }
+    return system_prefix_bytes;
+}
+
+fn resolve_tool_name_by_id(prior_messages_prefix: []const u8, target_id: []const u8, out_buf: []u8) ?[]const u8 {
+    if (prior_messages_prefix.len < 2 or target_id.len == 0) return null;
+    var pos: usize = 1;
+    var msg_iter: u32 = 0;
+    while (pos < prior_messages_prefix.len and msg_iter < 1024) : (msg_iter += 1) {
+        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
+        if (pos >= prior_messages_prefix.len or prior_messages_prefix[pos] != '{') {
+            if (pos < prior_messages_prefix.len) pos += 1;
+            continue;
+        }
+        const obj_start = pos;
+        tokenizer_mod.skip_json_value(prior_messages_prefix, &pos);
+        const msg_obj = prior_messages_prefix[obj_start..pos];
+        if (extract_raw_field(msg_obj, "tool_calls")) |tc_arr| {
+            if (tc_arr.len > 2 and tc_arr[0] == '[') {
+                var tcp: usize = 1;
+                var tc_iter: u32 = 0;
+                while (tcp < tc_arr.len and tc_iter < 32) : (tc_iter += 1) {
+                    tokenizer_mod.skip_ws(tc_arr, &tcp);
+                    if (tcp >= tc_arr.len or tc_arr[tcp] == ']') break;
+                    const tc_start = tcp;
+                    tokenizer_mod.skip_json_value(tc_arr, &tcp);
+                    const tc_obj = tc_arr[tc_start..tcp];
+                    var id_buf: [128]u8 = undefined;
+                    if (extract_string_field(tc_obj, "id", &id_buf)) |id_val| {
+                        if (std.mem.eql(u8, id_val, target_id)) {
+                            if (extract_raw_field(tc_obj, "function")) |fn_obj| {
+                                return extract_string_field(fn_obj, "name", out_buf);
+                            }
+                        }
+                    }
+                    tokenizer_mod.skip_ws(tc_arr, &tcp);
+                    if (tcp < tc_arr.len and tc_arr[tcp] == ',') tcp += 1;
+                }
+            }
+        }
+        tokenizer_mod.skip_ws(prior_messages_prefix, &pos);
+        if (pos < prior_messages_prefix.len and prior_messages_prefix[pos] == ',') pos += 1;
+    }
+    return null;
 }
 
 // --- Low-Level Socket, UTF-8 & Iterative JSON Field Helpers ---

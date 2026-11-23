@@ -446,4 +446,107 @@ void launch_spec_verify(
     int32_t* d_next_anchor,        // [1] = accepted[num_accepted - 1]
     cudaStream_t stream);
 
+// Fast Batched Prefill Kernels (B <= 256): cuBLAS FP16 TC GEMM + Blackwell TC MoE + Batched sconv/ctrl
+void launch_prefill_warmup_cublas(cudaStream_t stream);
+
+void launch_prefill_f32_to_f16(const float* src, __half* dst, int count, cudaStream_t stream);
+
+void launch_prefill_gemm_h(
+    const LinearWeight& w,
+    const __half* x_h,
+    float* y,
+    __half* w_f16_scratch,
+    int B,
+    cudaStream_t stream);
+
+void launch_prefill_sconv_post_res(
+    const float* src_or_slots,
+    int is_slotted,
+    const __nv_bfloat16* sconv_w,
+    float* ring,
+    const float* residual,
+    float* out_res,
+    float* pre_tap_out,
+    float* blocks,
+    const float* partial,
+    int block_idx,
+    int is_boundary,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
+void launch_prefill_copy_taps(
+    const float* src,
+    float* dst_taps,
+    int tap_slot,
+    int B,
+    cudaStream_t stream);
+
+void launch_prefill_local_sconv_prep_store(
+    float* qrgs,
+    float* k_proj,
+    float* v_proj,
+    const __nv_bfloat16* k_sconv_w,
+    const __nv_bfloat16* v_sconv_w,
+    float* k_ring,
+    float* v_ring,
+    const __nv_bfloat16* q_clip_scale,
+    const __nv_bfloat16* rel_clip_scale,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int kv_cap,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
+void launch_prefill_controller_one(
+    const float* x,
+    const float* saved,
+    const float* prior_last,
+    const float* cp_q,
+    const ControllerWeights& cw,
+    const __nv_bfloat16* post_norm,
+    float* out,
+    __half* out_h,
+    float* scratch_msg,
+    __half* scratch_cat_h,
+    float* scratch_d,
+    __half* scratch_d_h,
+    float* scratch_f,
+    float* scratch_g,
+    __half* w_f16_scratch,
+    int B,
+    cudaStream_t stream);
+
+void launch_prefill_route_and_sort(
+    const float* router_logits,
+    const float* router_bias,
+    int32_t* route_ids,
+    float* route_w,
+    int32_t* expert_offsets,
+    int32_t* sorted_tok,
+    int32_t* sorted_slot,
+    float* sorted_w,
+    int B,
+    cudaStream_t stream);
+
+void launch_prefill_moe_gate_up_h(
+    const ExpertBank& w13,
+    const __half* x_h,
+    const int32_t* expert_offsets,
+    const int32_t* sorted_tok,
+    const int32_t* sorted_slot,
+    __half* out_act_h,
+    cudaStream_t stream);
+
+void launch_prefill_moe_down_h(
+    const ExpertBank& w2,
+    const __half* act_h,
+    const int32_t* expert_offsets,
+    const int32_t* sorted_tok,
+    const int32_t* sorted_slot,
+    const float* sorted_w,
+    float* out_slots,
+    cudaStream_t stream);
+
 } // namespace squid

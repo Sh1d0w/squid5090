@@ -309,7 +309,7 @@ pub extern "c" fn squid_launch_relative_attention_gated(
     k_scale: ?*const anyopaque,
     v_scale: ?*const anyopaque,
     kv_fmt: u8,
-    split_buf: [*]f32,
+    split_buf: ?[*]f32,
     out_gated: ?[*]f32,
     out_gated_h: ?*anyopaque,
     kv_cap: i32,
@@ -504,3 +504,118 @@ pub extern "c" fn squid_launch_assemble_verify_tokens(
 ) void;
 
 pub extern "c" fn squid_sizeof_expert_groups() usize;
+
+pub extern "c" fn squid_launch_prefill_warmup_cublas(stream: ?*anyopaque) void;
+
+pub extern "c" fn squid_launch_prefill_f32_to_f16(
+    src: [*]const f32,
+    dst_h: *anyopaque,
+    count: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_gemm_h(
+    w: *const CLinearWeight,
+    x_h: *const anyopaque,
+    y: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_sconv_post_res(
+    src_or_slots: [*]const f32,
+    is_slotted: i32,
+    sconv_w: *const anyopaque,
+    ring: [*]f32,
+    residual: [*]const f32,
+    out_res: [*]f32,
+    pre_tap_out: ?[*]f32,
+    blocks: ?[*]f32,
+    partial: ?[*]const f32,
+    block_idx: i32,
+    is_boundary: i32,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_copy_taps(
+    src: [*]const f32,
+    dst_taps: [*]f32,
+    tap_slot: i32,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_local_sconv_prep_store(
+    qrgs: [*]f32,
+    k_proj: [*]f32,
+    v_proj: [*]f32,
+    k_sw: *const anyopaque,
+    v_sw: *const anyopaque,
+    k_ring: [*]f32,
+    v_ring: [*]f32,
+    q_cs: *const anyopaque,
+    r_cs: *const anyopaque,
+    k_cache: *anyopaque,
+    v_cache: *anyopaque,
+    kv_cap: i32,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_controller_one(
+    x: [*]const f32,
+    saved: [*]const f32,
+    prior_last: [*]const f32,
+    cp_q: [*]const f32,
+    cw: *const CControllerWeights,
+    post_norm: *const anyopaque,
+    out: [*]f32,
+    out_h: ?*anyopaque,
+    scratch_msg: [*]f32,
+    scratch_cat_h: *anyopaque,
+    scratch_d: [*]f32,
+    scratch_d_h: *anyopaque,
+    scratch_f: [*]f32,
+    scratch_g: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_route_and_sort(
+    router_logits: [*]const f32,
+    router_bias: [*]const f32,
+    route_ids: [*]i32,
+    route_w: [*]f32,
+    expert_offsets: [*]i32,
+    sorted_tok: [*]i32,
+    sorted_slot: [*]i32,
+    sorted_w: [*]f32,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
+    w13: *const CExpertBank,
+    x_h: *const anyopaque,
+    expert_offsets: [*]const i32,
+    sorted_tok: [*]const i32,
+    sorted_slot: [*]const i32,
+    out_act_h: *anyopaque,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_moe_down_h(
+    w2: *const CExpertBank,
+    act_h: *const anyopaque,
+    expert_offsets: [*]const i32,
+    sorted_tok: [*]const i32,
+    sorted_slot: [*]const i32,
+    sorted_w: [*]const f32,
+    out_slots: [*]f32,
+    stream: ?*anyopaque,
+) void;

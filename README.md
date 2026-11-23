@@ -6,12 +6,13 @@
 
 `squid5090` is a **single-binary, zero-Python** TigerStyle Zig + CUDA engine (`zig-out/bin/squid5090`, built purely with `zig build`) that handles safetensors loading, tokenization, chat templating, GPU inference, and OpenAI-compatible HTTP/SSE serving in one process — zero PyTorch, zero vLLM, zero CMake/Make, zero Python wrappers, zero IPC:
 
-- **100% Native Blackwell GPU Hot Path (`cuda/`):** Implements every specialized Inkling-2-Mini architecture op directly in `sm_120a` CUDA (`cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** speculative decoding — all captured in persistent **CUDA Graphs**.
+- **100% Native Blackwell GPU Hot Path (`cuda/`):** Implements every specialized Inkling-2-Mini architecture op directly in `sm_120a` CUDA (`cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** speculative decoding — all captured in persistent **CUDA Graphs** for decode, paired with **batched `B=512` Tensor Core prefill** (cuBLAS FP16 TC dense/router/controller GEMMs + flat-tile grouped-GEMM NVFP4/MXFP8 Tensor Core MoE hitting **~3,400–5,000 tok/s** prefill).
+- **Multi-Checkpoint Host-RAM Prefix KV Cache & Side-Request Shield:** Keeps 4 host-RAM local-state checkpoints (`system_prefix`, 2K boundary, `prefill_end`, `decode_end` — **0 MiB extra VRAM**, ~833 MiB host RAM) plus a 4,096-token global-KV side-request shield so multi-turn coding harnesses (`omp`, Claude/OpenAI agents) reuse 10K–1M-token prefixes in **52–115 ms** (**100–217× faster**) without short title/classifier side requests evicting the active session.
 - **TigerStyle Systems Architecture (`src/`):** Written in [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) Zig with **243 always-on release assertions** (active even in `-Doptimize=fast`), `comptime` geometry invariants, strictly bounded loops, zero recursion, and **zero dynamic memory allocation post-`init()`**.
-- **Two-Pass Single-Arena VRAM Allocator:** Computes exact 256-byte-aligned VRAM requirements upfront and allocates the entire model & runtime in **2 contiguous `cudaMalloc` bump arenas** (1 for all 1,000 weight tensors + 1 for all 359 KV/runtime slices), verified by paired `arena.assert_exact_fill()` postconditions.
-- **Ultra-Fast Native Zig BPE Tokenizer & Chat Template:** Memory-maps `tokenizer.json` directly into flat open-addressed hash tables + a 1.20 MiB contiguous byte arena in **~135 ms**, encodes at **32.8M tokens/sec** with zero per-request `malloc`s and 100% exact token-for-token parity against Hugging Face `tokenizers`, and renders Inkling-2-Mini's official chat/tool template natively.
-- **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **22.47 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
-- **Built-In Zero-Malloc OpenAI API Server (`squid5090 serve`):** Pure POSIX HTTP/1.1 + SSE server backed by static startup-allocated `ServerBuffers` — streams tokens directly from the GPU callback to the socket with zero per-token heap allocation (and aborts GPU generation immediately on client disconnect or stop-sequence match), exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and `/health`.
+- **Two-Pass Single-Arena VRAM Allocator:** Computes exact 256-byte-aligned VRAM requirements upfront and allocates the entire model & runtime in **2 contiguous `cudaMalloc` bump arenas** (1 for all 1,000 weight tensors + 1 for all 397 KV/runtime slices), verified by paired `arena.assert_exact_fill()` postconditions.
+- **Ultra-Fast Native Zig BPE Tokenizer & Chat Template:** Memory-maps `tokenizer.json` directly into flat open-addressed hash tables + a 1.20 MiB contiguous byte arena in **~130 ms**, encodes at **32.8M tokens/sec** with zero per-request `malloc`s and 100% exact token-for-token parity against Hugging Face `tokenizers`, and renders Inkling-2-Mini's full chat/tool template (`developer`/`system`/`user`/`assistant.tool_calls`/`tool` with `tool_call_id` resolution).
+- **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **22.68 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
+- **Built-In Zero-Malloc OpenAI API Server (`squid5090 serve`):** Pure POSIX HTTP/1.1 + SSE server backed by static startup-allocated `ServerBuffers` — streams `content`, `reasoning_content`, and `delta.tool_calls` directly from the GPU callback to the socket with zero per-token heap allocation (and reports `usage.prompt_tokens_details.cached_tokens`), exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and `/health`.
 
 ---
 
@@ -44,7 +45,19 @@ Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`
 | **64K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **285.58 tok/s** *(prefill 75–84 s)* | **15.92 GiB** | Verbatim retrieval PASS |
 | **256K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **199.0–202.3 tok/s** *(`B=1`: 105–115)* | **17.2 GiB** | 0 host spill |
 | **512K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **151.4 tok/s** *(`B=1`: 72.7)* | **19.8 GiB** | 0 host spill |
-| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **100.6 tok/s** *(`B=1`: 46.3)* | **22.47 GiB** | Full 1M context alongside 8.1 GiB Frigate |
+| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **100.6 tok/s** *(`B=1`: 46.3)* | **22.68 GiB** | Full 1M context alongside 8.1 GiB Frigate |
+
+### Real-World Multi-Turn Agent & Tool-Calling Latency (`omp` Workload, Live 1M Context)
+
+Measured live against `squid5090 serve --mode nvfp4 --kv q4 --ctx 1048576 --mtp 3` with a ~10K–13K-token coding-agent system prompt + OpenAI `tools` + streaming SSE:
+
+| Agent Turn | Prompt (`cached`) | Original Prefill | Current Prefill | End-to-End TTFT | Decode Speed | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| **Turn 1 — Cold 10.2K + streaming tool call** | 10,164 (`0`) | ~11,300 ms | **2,764.2 ms** *(3,677 tok/s)* | 2,810.5 ms | **440.5 tok/s** (`dl=3.24`) | **4.1× faster cold** |
+| **Turn 2 — Warm tool result (`+89` tok)** | 10,253 (`10,164`) | ~11,400 ms | **86.3–115.0 ms** | **148.8 ms** | **348.6 tok/s** (`dl=2.57`) | **~100–130× faster** |
+| **Turn 3 — Interleaved side request (46 tok)** | 46 (`0`, shielded) | — | **45.8 ms** | **66.1 ms** | **403.3–485.4 tok/s** | **0 cache eviction** |
+| **Turn 4 — Resume 10.4K session post-side** | 10,350 (`10,253`) | ~11,500 ms | **89.5 ms** | **133.5 ms** | **328.0 tok/s** (`dl=2.38`) | **128× faster** |
+| **Turn 5 — Branched turn (shared sys+tools)** | 10,160 (`10,139`) | ~11,300 ms | **52.0 ms** | **99.6 ms** | **336.4 tok/s** (`dl=2.40`) | **217× faster** |
 
 ---
 
@@ -70,7 +83,7 @@ Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`
 git clone git@github.com:tensorfish/squid5090.git
 cd squid5090
 
-# Build zig-out/bin/squid5090 (compiles all 4 sm_120a CUDA units in parallel + ReleaseFast Zig)
+# Build zig-out/bin/squid5090 (compiles all 5 sm_120a CUDA units in parallel + ReleaseFast Zig)
 zig build
 ```
 
