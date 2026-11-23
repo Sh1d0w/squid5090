@@ -1,5 +1,8 @@
 #include "config.hpp"
 #include "engine.hpp"
+#include "json.hpp"
+#include "server.hpp"
+#include "tokenizer.hpp"
 #include "weights.hpp"
 
 #include <algorithm>
@@ -35,10 +38,15 @@ static QuantMode parse_mode(const std::string& s) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
+            "squid5090 — Native C++/CUDA Blackwell Inference Engine & OpenAI Server for Inkling-2-Mini\n\n"
             "Usage:\n"
-            "  squid5090 generate <model_dir> --tokens 1,2,3 [--mode exact|fp8|nvfp4] [--mtp 0..7] [--max-tokens 128] [--ctx 8192] [--no-graph]\n"
-            "  squid5090 bench    <model_dir> --tokens 1,2,3 [--mode exact|fp8|nvfp4] [--mtp 0..7] [--max-tokens 128] [--runs 6] [--ctx 8192] [--no-graph]\n"
-            "  squid5090 verify   <model_dir> --tokens 1,2,3 [--mode exact|fp8|nvfp4]\n");
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 3] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
+            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--ctx 8192]\n"
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--runs 6] [--ctx 8192]\n"
+            "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n"
+            "  squid5090 profile  <model_dir> [--mode nvfp4] [--kv auto] [--mtp 3] [--ctx 8192] [--sim-pos 0]\n"
+            "  squid5090 verify   <model_dir> --tokens 1,2,3 [--mode exact|fp8|nvfp4]\n"
+            "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n");
         return 1;
     }
 
@@ -46,22 +54,37 @@ int main(int argc, char** argv) {
     std::string model_dir = argv[2];
     std::string tokens_str = "1,2,3";
     std::string tokens_file;
-    std::string mode_str = "exact";
+    std::string prompt_text;
+    std::string mode_str = (cmd == "serve") ? "nvfp4" : "exact";
     std::string kv_str = "auto";
-    int mtp = 0;
+    std::string host = "0.0.0.0";
+    std::string model_name = "inkling-2-mini";
+    std::string effort = "none";
+    std::string api_key = std::getenv("SQUID_API_KEY") ? std::getenv("SQUID_API_KEY") : "";
+    int port = 8000;
+    int mtp = (cmd == "serve") ? 3 : 0;
     int max_tokens = 128;
     int runs = 6;
-    int ctx = 8192;
+    int ctx = (cmd == "serve") ? 65536 : 8192;
     int sim_pos = 0;
     bool use_graphs = true;
     bool embed_on_host = false;
+    bool raw_prompt = false;
+    bool raw_thinking = false;
+    bool has_tokens_arg = false;
 
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--tokens" && i + 1 < argc) tokens_str = argv[++i];
-        else if (a == "--tokens-file" && i + 1 < argc) tokens_file = argv[++i];
+        if (a == "--tokens" && i + 1 < argc) { tokens_str = argv[++i]; has_tokens_arg = true; }
+        else if (a == "--tokens-file" && i + 1 < argc) { tokens_file = argv[++i]; has_tokens_arg = true; }
+        else if (a == "--prompt" && i + 1 < argc) prompt_text = argv[++i];
         else if (a == "--mode" && i + 1 < argc) mode_str = argv[++i];
         else if (a == "--kv" && i + 1 < argc) kv_str = argv[++i];
+        else if (a == "--host" && i + 1 < argc) host = argv[++i];
+        else if (a == "--port" && i + 1 < argc) port = std::atoi(argv[++i]);
+        else if (a == "--model-name" && i + 1 < argc) model_name = argv[++i];
+        else if (a == "--effort" && i + 1 < argc) effort = argv[++i];
+        else if (a == "--api-key" && i + 1 < argc) api_key = argv[++i];
         else if (a == "--mtp" && i + 1 < argc) mtp = std::atoi(argv[++i]);
         else if (a == "--max-tokens" && i + 1 < argc) max_tokens = std::atoi(argv[++i]);
         else if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
@@ -69,6 +92,35 @@ int main(int argc, char** argv) {
         else if (a == "--sim-pos" && i + 1 < argc) sim_pos = std::atoi(argv[++i]);
         else if (a == "--embed-host") embed_on_host = true;
         else if (a == "--no-graph") use_graphs = false;
+        else if (a == "--raw") raw_prompt = true;
+        else if (a == "--raw-thinking") raw_thinking = true;
+    }
+
+    // Fast tokenizer-only diagnostic command (no GPU allocation needed)
+    if (cmd == "tokenize") {
+        Tokenizer tok;
+        if (!tok.load(model_dir)) return 1;
+        std::string input = prompt_text;
+        if (!raw_prompt) {
+            Json msgs = Json::array();
+            Json m = Json::object();
+            m["role"] = "user";
+            m["content"] = prompt_text;
+            msgs.push_back(std::move(m));
+            Json eff(effort);
+            input = tok.render_chat_template(msgs, nullptr, &eff);
+        }
+        auto ids = tok.encode(input, true);
+        printf("IDS:");
+        for (size_t i = 0; i < ids.size(); ++i) printf("%s%d", i ? "," : " ", ids[i]);
+        printf("\n");
+        return 0;
+    }
+
+    bool need_tokenizer = (cmd == "serve" || !prompt_text.empty());
+    Tokenizer tokenizer;
+    if (need_tokenizer && !tokenizer.load(model_dir)) {
+        return 1;
     }
 
     QuantMode qmode = parse_mode(mode_str);
@@ -87,86 +139,53 @@ int main(int argc, char** argv) {
         embed_on_host = true;
     }
 
-    if (!tokens_file.empty()) {
-        std::ifstream ifs(tokens_file);
-        if (!ifs) {
-            fprintf(stderr, "Failed to open --tokens-file '%s'\n", tokens_file.c_str());
-            return 1;
+    std::vector<int32_t> prompt;
+    if (!prompt_text.empty() && !has_tokens_arg) {
+        std::string rendered = prompt_text;
+        if (!raw_prompt) {
+            Json msgs = Json::array();
+            Json m = Json::object();
+            m["role"] = "user";
+            m["content"] = prompt_text;
+            msgs.push_back(std::move(m));
+            Json eff(effort);
+            rendered = tokenizer.render_chat_template(msgs, nullptr, &eff);
         }
-        std::stringstream ss;
-        ss << ifs.rdbuf();
-        tokens_str = ss.str();
+        prompt = tokenizer.encode(rendered, true);
+    } else {
+        if (!tokens_file.empty()) {
+            std::ifstream ifs(tokens_file);
+            if (!ifs) {
+                fprintf(stderr, "Failed to open --tokens-file '%s'\n", tokens_file.c_str());
+                return 1;
+            }
+            std::stringstream ss;
+            ss << ifs.rdbuf();
+            tokens_str = ss.str();
+        }
+        prompt = parse_csv_tokens(tokens_str);
     }
-    auto prompt = parse_csv_tokens(tokens_str);
 
     ModelWeights weights;
-    if (!weights.load(model_dir, qmode,
-                      /*load_mtp=*/mtp > 0 || cmd == "bench" || cmd == "longctx" || cmd == "serve-stdio",
-                      embed_on_host)) {
+    bool load_mtp = (mtp > 0 || cmd == "bench" || cmd == "longctx" || cmd == "serve");
+    if (!weights.load(model_dir, qmode, load_mtp, embed_on_host)) {
         return 1;
     }
 
     Engine engine;
     if (!engine.init(&weights, ctx, use_graphs, kv_fmt)) return 1;
 
-    if (cmd == "serve-stdio") {
-        // Warm up CUDA graphs once before signaling READY
-        std::vector<int32_t> warm = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-        (void)engine.generate(warm, 8, mtp);
-        printf("READY max_ctx=%d mode=%s kv=%s mtp=%d vram_gib=%.2f\n",
-               ctx, mode_str.c_str(),
-               kv_fmt == KVFormat::FP8 ? "fp8" : (kv_fmt == KVFormat::Q4 ? "q4" : "bf16"),
-               mtp,
-               (weights.total_vram_bytes + engine.runtime_vram_bytes()) / (1024.0 * 1024.0 * 1024.0));
-        fflush(stdout);
-
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            if (line.empty()) continue;
-            if (line == "QUIT") break;
-            if (line.rfind("GEN ", 0) == 0) {
-                std::istringstream iss(line.substr(4));
-                int req_max = 256;
-                int req_mtp = mtp;
-                std::string tok_csv;
-                iss >> req_max >> req_mtp >> tok_csv;
-                auto req_prompt = parse_csv_tokens(tok_csv);
-                if (req_prompt.empty()) {
-                    printf("ERR empty_prompt\n");
-                    fflush(stdout);
-                    continue;
-                }
-                if ((int)req_prompt.size() >= ctx) {
-                    printf("ERR prompt_exceeds_ctx prompt=%zu max_ctx=%d\n", req_prompt.size(), ctx);
-                    fflush(stdout);
-                    continue;
-                }
-                if (req_mtp < 0) req_mtp = 0;
-                if (req_mtp > MTP_MAX_DRAFTS) req_mtp = MTP_MAX_DRAFTS;
-                if (req_max <= 0) req_max = 1;
-                if ((int)req_prompt.size() + req_max > ctx) {
-                    req_max = ctx - (int)req_prompt.size();
-                }
-
-                auto st = engine.generate(req_prompt, req_max, req_mtp, [&](int32_t tok) -> bool {
-                    printf("T %d\n", tok);
-                    fflush(stdout);
-                    return true;
-                });
-                double dec_toks = std::max(0, st.gen_tokens - 1);
-                double acc = (st.total_drafts > 0) ? (100.0 * st.total_accepted / st.total_drafts) : 0.0;
-                double dl = (st.spec_steps > 0) ? (dec_toks / st.spec_steps) : 1.0;
-                bool hit_eos = (!st.tokens.empty() && st.tokens.back() == EOS_TOKEN);
-                printf("DONE %d %d %.2f %.2f %.1f %.2f %s\n",
-                       st.prompt_tokens, st.gen_tokens, st.prefill_ms, st.decode_ms, acc, dl,
-                       hit_eos ? "stop" : "length");
-                fflush(stdout);
-            } else {
-                printf("ERR unknown_command\n");
-                fflush(stdout);
-            }
-        }
-        return 0;
+    if (cmd == "serve") {
+        ServerConfig scfg;
+        scfg.host = host;
+        scfg.port = port;
+        scfg.model_name = model_name;
+        scfg.api_key = api_key;
+        scfg.default_effort = effort;
+        scfg.default_mtp = mtp;
+        scfg.max_ctx = ctx;
+        scfg.raw_thinking = raw_thinking;
+        return run_openai_server(engine, tokenizer, scfg);
     }
 
     if (cmd == "profile") {
@@ -219,6 +238,10 @@ int main(int argc, char** argv) {
             printf("%s%d", i ? "," : " ", st.tokens[i]);
         }
         printf("\n");
+        if (need_tokenizer) {
+            std::string decoded = tokenizer.decode(st.tokens, false);
+            printf("\n--- DECODED OUTPUT ---\n%s\n----------------------\n", decoded.c_str());
+        }
         return 0;
     }
 
@@ -253,6 +276,10 @@ int main(int argc, char** argv) {
         printf("TOKENS:");
         for (size_t i = 0; i < sample_toks.size(); ++i) printf("%s%d", i ? "," : " ", sample_toks[i]);
         printf("\n");
+        if (need_tokenizer) {
+            std::string decoded = tokenizer.decode(sample_toks, false);
+            printf("\n--- DECODED OUTPUT ---\n%s\n----------------------\n", decoded.c_str());
+        }
         return 0;
     }
 

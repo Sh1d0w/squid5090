@@ -13,12 +13,16 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(squid5090
     src/main.cpp
     src/safetensors.cpp
+    src/tokenizer.cpp
+    src/server.cpp
     src/weights.cu
     src/kernels_gemv.cu
     src/kernels_inkling.cu
     src/kernels_dspark.cu
     src/engine.cu
 )
+
+find_package(Threads REQUIRED)
 
 target_include_directories(squid5090 PRIVATE src)
 
@@ -30,4 +34,5 @@ target_compile_options(squid5090 PRIVATE
 target_link_libraries(squid5090 PRIVATE
     CUDA::cudart
     CUDA::cublas
+    Threads::Threads
 )

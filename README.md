@@ -4,12 +4,13 @@
 
 ## What This Repo Does
 
-`squid5090` replaces heavy Python/PyTorch/vLLM inference stacks with a dedicated, hand-tuned native C++/CUDA binary (`build/squid5090`) and a lightweight OpenAI-compatible HTTP/SSE server (`tools/server.py`):
+`squid5090` is a **single-binary, zero-Python** native C++20/CUDA engine (`build/squid5090`) that handles tokenization, chat templating, GPU inference, and OpenAI-compatible HTTP/SSE serving in one process — zero PyTorch, zero vLLM, zero Python wrappers, zero IPC:
 
 - **100% Native GPU Hot Path:** Implements every specialized Inkling-2-Mini architecture op directly in CUDA (`sm_120a` PTX `cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** speculative decoding — all captured in persistent **CUDA Graphs**.
+- **Native C++ BPE Tokenizer & Chat Template:** Parses `tokenizer.json` directly in ~260 ms with 100% exact token-for-token parity against Hugging Face `tokenizers`, and implements Inkling-2-Mini's official chat/tool template natively in C++.
 - **Load-Time Quantization & Static VRAM Arena:** Loads the official `safetensors` directly to VRAM in ~2.15 s with zero pre-conversion step, supporting `exact` (official BF16 + NVFP4/MXFP8), `fp8`, and `nvfp4` (all-linear NVFP4, **15.05 GiB** total VRAM, zero host-RAM spilling).
 - **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **22.47 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
-- **Drop-In OpenAI API Server:** Exposes `/v1/chat/completions` (streaming SSE + non-streaming, `reasoning_content` parsing, tool calling), `/v1/completions`, `/v1/models`, and `/health` so any agent framework, UI, or eval harness integrates out of the box.
+- **Built-In Native C++ OpenAI API Server (`squid5090 serve`):** Pure POSIX HTTP/1.1 + SSE server compiled directly into `build/squid5090` — streams tokens directly from the GPU callback to the socket (and aborts GPU generation immediately on client disconnect or stop-sequence match), exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and `/health`.
 
 ---
 
@@ -44,17 +45,9 @@ All `squid5090` short-context numbers are **6-run medians** (512 generated token
 ### System Packages (Debian / Ubuntu)
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-  build-essential cmake make git curl python3 python3-venv
+  build-essential cmake make git curl
 ```
-*(Ensure CUDA Toolkit is installed so `/usr/local/cuda/bin/nvcc` is available — `Makefile` automatically prepends `/usr/local/cuda/bin` to `PATH`.)*
-
-### Python Packages (only for `tools/server.py`, `tools/chat.py`, and model downloads)
-Listed in [requirements.txt](requirements.txt) and installed automatically by `make venv`:
-- `tokenizers>=0.20.0`
-- `jinja2>=3.1.0`
-- `huggingface_hub>=0.25.0`
-
-*(The compiled `build/squid5090` engine itself links only against `libcudart` and `libcublas` — zero Python/PyTorch dependencies.)*
+*(Ensure CUDA Toolkit is installed so `/usr/local/cuda/bin/nvcc` is available — `Makefile` automatically prepends `/usr/local/cuda/bin` to `PATH`. `build/squid5090` links **only** against `libcudart`, `libcublas`, and `pthreads` — **zero** Python, Boost, OpenSSL, or third-party C++ libraries required to build, run, or serve!)*
 
 ---
 
@@ -65,9 +58,8 @@ Listed in [requirements.txt](requirements.txt) and installed automatically by `m
 git clone git@github.com:tensorfish/squid5090.git
 cd squid5090
 
-# Build the C++/CUDA binary (build/squid5090) + set up Python .venv
+# Build the single C++/CUDA binary (build/squid5090)
 make build
-make venv
 ```
 Or build directly with CMake:
 ```bash
@@ -81,53 +73,50 @@ Run `make help` to see all targets and override variables.
 Download [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (~20.2 GB total) into any local directory (default `./models/inkling-2-mini`, or e.g. `/opt/models/inkling-2-mini`):
 
 ```bash
-# Default location: ./models/inkling-2-mini
-make download
+# Using huggingface-cli (install with: pip install huggingface_hub)
+huggingface-cli download thinkingmachines/Inkling-2-Mini --local-dir ./models/inkling-2-mini
 
-# Or specify a custom directory:
+# Or via Makefile:
 make download MODEL_DIR=/opt/models/inkling-2-mini
 ```
-*(Or using Hugging Face CLI directly: `huggingface-cli download thinkingmachines/Inkling-2-Mini --local-dir /opt/models/inkling-2-mini`.)*
 
 Expected files inside `<MODEL_DIR>`:
 ```text
 <MODEL_DIR>/
 ├── model-00001-of-00001.safetensors   # Main Inkling-2-Mini weights (~19.5 GB)
 ├── mtp.safetensors                    # Built-in DSpark MTP drafter weights (~0.64 GB)
-├── tokenizer.json                     # BPE tokenizer
-├── chat_template.jinja                # Official Inkling-2-Mini chat & tool template
+├── tokenizer.json                     # BPE tokenizer (parsed natively in C++)
 ├── config.json                        # Model config
 └── draft_vocab_32k.bin                # (Optional) Pruned 32K draft vocab IDs for faster MTP
 ```
 
-### 3. How to Point the Binary & Server to Your Model
+### 3. How to Point the Binary to Your Model
 
-Every command takes `<MODEL_DIR>` as its **first positional argument** (or `MODEL_DIR=...` when using `make`):
+Every subcommand takes `<MODEL_DIR>` as its **first positional argument** (or `MODEL_DIR=...` via `make`):
 
 ```bash
-# Via Makefile (pass MODEL_DIR=/your/path if not using ./models/inkling-2-mini):
+# Start the native C++ OpenAI API server directly:
+./build/squid5090 serve /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
+
+# Or via Makefile:
 make serve MODEL_DIR=/opt/models/inkling-2-mini PORT=8000 CTX=65536
 
-# Via OpenAI API server directly:
-.venv/bin/python tools/server.py /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
-
-# Via standalone CLI wrapper directly:
-.venv/bin/python tools/chat.py /opt/models/inkling-2-mini "Hello!" --mode nvfp4 --mtp 3
-
-# Via raw C++/CUDA binary directly (zero Python):
-./build/squid5090 generate /opt/models/inkling-2-mini --tokens 1,2,3 --mode nvfp4 --mtp 3 --max-tokens 128
+# One-shot native CLI generation (zero Python):
+./build/squid5090 generate /opt/models/inkling-2-mini \
+  --prompt "Write a Python binary search function with type hints." \
+  --mode nvfp4 --mtp 3 --max-tokens 512
 ```
 
-### 4. Run the OpenAI-Compatible API Server
+### 4. Run the Native C++ OpenAI-Compatible API Server
 
-`tools/server.py` keeps a persistent `squid5090 serve-stdio` GPU worker resident in VRAM so subsequent requests have **zero reload overhead**, sub-40 ms TTFT, and live Server-Sent Events (`stream: true`):
+`./build/squid5090 serve` loads weights, `tokenizer.json`, KV caches, and captured CUDA Graphs directly into the server process — delivering **~408 tok/s** with sub-30 ms TTFT and live Server-Sent Events (`stream: true`):
 
 ```bash
 # 64K context server (~15.9 GiB VRAM, FP8 KV)
-make serve MODEL_DIR=/opt/models/inkling-2-mini CTX=65536
+./build/squid5090 serve /opt/models/inkling-2-mini --host 0.0.0.0 --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
 
 # 256K context server (~19.4 GiB VRAM, FP8 KV)
-make serve MODEL_DIR=/opt/models/inkling-2-mini CTX=262144 KV=fp8
+./build/squid5090 serve /opt/models/inkling-2-mini --host 0.0.0.0 --port 8000 --mode nvfp4 --kv fp8 --ctx 262144 --mtp 3
 
 # Full 1M (1,048,576) context server (~22.5 GiB VRAM, Q4 KV + auto host-pinned embed)
 make serve-1m MODEL_DIR=/opt/models/inkling-2-mini
@@ -206,7 +195,7 @@ make longctx MODEL_DIR=/opt/models/inkling-2-mini KV=q4  CTX=1048576
 | `--no-graph` | flag | Disable CUDA Graph capture (for debugging) |
 | `SQUID_DRAFT_VOCAB` | `32k` (default) \| `49k` \| `full` | Draft head vocabulary size (optional `draft_vocab_32k.bin`; falls back cleanly to full 200K if absent) |
 | `SQUID_MTP_BF16` | `1` | Force DSpark drafter weights to BF16 (for A/B testing) |
-| `SQUID_API_KEY` | string | Require `Authorization: Bearer <key>` on `tools/server.py` |
+| `SQUID_API_KEY` | string | Require `Authorization: Bearer <key>` on `squid5090 serve` |
 
 ---
 
@@ -246,18 +235,19 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 
 ```text
 squid5090/
-├── Makefile                 # One-command build, venv, model download, serve, bench, longctx
-├── CMakeLists.txt           # C++20 / CUDA sm_120a build configuration
-├── requirements.txt         # Minimal Python deps (tokenizers, jinja2, huggingface_hub)
+├── Makefile                 # One-command build, model download, native serve, bench, longctx
+├── CMakeLists.txt           # C++20 / CUDA sm_120a build configuration (zero third-party libs)
 ├── README.md                # Quickstart, OpenAI server guide & optimization walkthrough
 ├── THEORY.md                # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                  # Optimization roadmap & full experiment table
 ├── ledger.jsonl             # Structured JSONL log of every experiment & gate
 ├── tools/
-│   ├── server.py            # OpenAI-compatible HTTP/SSE API server (/v1/chat/completions, /v1/completions, /v1/models)
-│   └── chat.py              # Thin Jinja chat-template & tokenizer CLI wrapper
+│   └── chat.py              # Optional legacy Python tokenizer wrapper
 └── src/
     ├── config.hpp           # Inkling-2-Mini & DSpark geometry, KV format constants
+    ├── json.hpp             # Self-contained header-only RFC 8259 JSON parser & serializer
+    ├── tokenizer.{hpp,cpp}  # Native C++20 o200k_base BPE tokenizer & Inkling chat template renderer
+    ├── server.{hpp,cpp}     # Native C++20 POSIX HTTP/1.1 + SSE OpenAI-compatible API server
     ├── safetensors.{hpp,cpp}# Zero-copy mmap safetensors loader
     ├── weights.{hpp,cu}     # Direct-to-VRAM loader + load-time NVFP4/FP8 quantization & zero-copy host embed
     ├── kernels_common.cuh   # Blackwell PTX (e2m1, e4m3, m16n8k16, ldmatrix), KV pack/unpack, TC Split-K engine
@@ -265,5 +255,5 @@ squid5090/
     ├── kernels_inkling.cu   # Mega-fused depth-attn/sconv, 1-launch controllers, router, TC local/global attention
     ├── kernels_dspark.cu    # DSpark 3-layer block drafter, TC global layer 1, folded Markov RNN head
     ├── engine.{hpp,cu}      # Static VRAM arena, CUDA Graph capture (decode/spec/prefill), streaming callback, aux_stream overlap
-    └── main.cpp             # CLI entry point (generate, bench, verify, profile, longctx, serve-stdio)
+    └── main.cpp             # Single-binary CLI entry point (serve, generate, bench, verify, profile, longctx, tokenize)
 ```
