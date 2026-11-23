@@ -20,9 +20,9 @@
 
 ## Speedup Comparison: `squid5090` vs. RTX 5090 Inference Engines (`Inkling-2-Mini`)
 
-Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on an **NVIDIA RTX 5090** (32 GiB GDDR7). `squid5090` numbers are **6-run medians** (512 generated tokens, coding prompt P1) measured on an RTX 5090 with **23.4–24.0 GiB free VRAM** alongside Frigate (`~8.1 GiB`):
+Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single **NVIDIA RTX 5090** (32 GiB GDDR7). `squid5090` numbers are **6-run medians** (512 generated tokens, coding prompt P1):
 
-| Inference Engine | Precision / Format | Native DSpark MTP | Decode Speed (`c=1`) | `squid5090` Speedup (`mtp=3`: **369.6 tok/s**) | `squid5090` Speedup (`mtp=0`: **243.8 tok/s**) | Max Context (32 GB / 23.4 GB free) | VRAM Footprint | Source |
+| Inference Engine | Precision / Format | Native DSpark MTP | Decode Speed (`c=1`) | `squid5090` Speedup (`mtp=3`: **369.6 tok/s**) | `squid5090` Speedup (`mtp=0`: **243.8 tok/s**) | Max Context (32 GiB 5090) | VRAM Footprint | Source |
 |---|---|---|---:|---:|---:|---:|---|---|
 | **PyTorch / HF Transformers** | BF16 eager | No | ~10–15 tok/s | **~25–37×** | **~16–24×** | ~64K | >24 GiB | Roofline est. |
 | **Apple Silicon `nanoattention`** *(M3 Ultra ref)* | Q4 | No | ~39 tok/s | **~9.5×** | **~6.3×** | — | Unified | Inspiration ref |
@@ -31,11 +31,11 @@ Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`
 | **`llama.cpp` / Unsloth** (`llama-server`) | GGUF (`IQ4_NL` / `UD-IQ4_XS`) | No | ~93–97 tok/s | **~3.8–4.0×** | **~2.5–2.6×** | ~256K | ~18–22 GiB | Published 5090 ref |
 | **vLLM** (`vllm serve`) | Native NVFP4/MXFP8 + FP8 KV | Yes | ~190–250 tok/s | **~1.5–1.9×** | **~1.0–1.3×** | ~256K–512K | ~22–28 GiB | Published ref *(Python overhead at `c=1`)* |
 | **SGLang** | Native NVFP4/MXFP8 + FP8 KV | Yes | ~250–350 tok/s | **~1.06–1.48×** | 0.70–0.98× | ~256K–512K | ~22–28 GiB | Published 5090 ref |
-| **Basalt** *(same RTX 5090, chat/coding)* | Native NVFP4 + Q8, `spec=8` | Yes | **261–325 tok/s** *(prose/chat: 287–350\*)* | **1.14–1.42×** | 0.75–0.93× | 262,144 (256K) | 22.9 GiB + **8.9 GiB RAM spill** | **Measured (same 5090, CT 107)** |
+| **Basalt** *(same RTX 5090, chat/coding)* | Native NVFP4 + Q8, `spec=8` | Yes | **261–325 tok/s** *(prose/chat: 287–350\*)* | **1.14–1.42×** | 0.75–0.93× | 262,144 (256K) | 22.9 GiB + **8.9 GiB RAM spill** | **Measured (same 5090)** |
 | **`squid5090` (Zig + CUDA, `mtp=0`)** | All-`nvfp4`, `fp8` KV, Graphed | Off (`mtp=0`) | **243.79 tok/s** *(max 244.0)* | — | 1.00× | **1,048,576 (1M)** | **14.92 GiB** (0 spill) | **Measured (6-run median)** |
 | **`squid5090` (Zig + CUDA, `mtp=3`)** | All-`nvfp4`, `fp8`/`q4` KV, Graphed | **On (`mtp=3`)** | **369.6 tok/s** *(peak 379.2 / 408.1 HTTP)* | **1.00×** | **1.52×** | **1,048,576 (1M)** | **14.85–14.92 GiB** (0 spill) | **Measured (6-run median)** |
 
-*\*Methodology note: `llama.cpp` / Ollama / vLLM / SGLang rows reflect published RTX 5090 / community single-user numbers because GGUF runtimes do not support Inkling-2-Mini's native NVFP4 Blackwell PTX or DSpark MTP speculator, and Python-orchestrated servers (`vLLM` / `SGLang`) optimize primarily for batched multi-user throughput. Basalt was measured directly on the same RTX 5090 (CT 107) on general chat/coding prompts (**261–325 tok/s**); on highly repetitive structured/JSON outputs where draft acceptance approaches 100%, published Basalt runs reach ~613–645 tok/s. `squid5090` fits in **14.9 GiB VRAM with zero host-RAM spilling** (8 GiB less than Basalt) and scales to **4× Basalt's max context (1M tokens)**.*
+*\*Methodology note: `llama.cpp` / Ollama / vLLM / SGLang rows reflect published RTX 5090 / community single-user numbers because GGUF runtimes do not support Inkling-2-Mini's native NVFP4 Blackwell PTX or DSpark MTP speculator, and Python-orchestrated servers (`vLLM` / `SGLang`) optimize primarily for batched multi-user throughput. Basalt was measured directly on the same RTX 5090 on general chat/coding prompts (**261–325 tok/s**); on highly repetitive structured/JSON outputs where draft acceptance approaches 100%, published Basalt runs reach ~613–645 tok/s. `squid5090` fits in **14.9 GiB VRAM with zero host-RAM spilling** (8 GiB less than Basalt) and scales to **4× Basalt's max context (1M tokens)**.*
 
 ### `squid5090` Long-Context Scaling (Up to 1,048,576 Tokens on One RTX 5090)
 
@@ -47,7 +47,7 @@ Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`
 | **64K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **285.58 tok/s** *(prefill 75–84 s)* | **15.92 GiB** | Verbatim retrieval PASS |
 | **256K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **199.0–202.3 tok/s** *(`B=1`: 105–115)* | **17.2 GiB** | 0 host spill |
 | **512K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **151.4 tok/s** *(`B=1`: 72.7)* | **19.8 GiB** | 0 host spill |
-| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **100.6 tok/s** *(`B=1`: 46.3)* | **22.68 GiB** | Full 1M context alongside 8.1 GiB Frigate |
+| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **100.6 tok/s** *(`B=1`: 46.3)* | **22.68 GiB** | Full 1M context in 22.7 GiB (0 host spill) |
 
 ### Real-World Multi-Turn Agent & Tool-Calling Latency (`omp` Workload, Live 1M Context)
 

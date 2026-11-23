@@ -1,8 +1,8 @@
 # squid5090 — Optimization Plan & Experiment Ledger
 
-**Target:** `thinkingmachines/Inkling-2-Mini` (text + built-in DSpark MTP) on NVIDIA RTX 5090 (`sm_120a`, CT 108 `squid5090`, 23.43 GiB free VRAM alongside Frigate on CT 100).
+**Target:** `thinkingmachines/Inkling-2-Mini` (text + built-in DSpark MTP) on NVIDIA RTX 5090 (`sm_120a`, 32 GiB GDDR7).
 **Primary Metric:** Single-user (`c=1`) decode tok/s (median of 6 runs, 512 generated tokens), with aggressive quantization + DSpark MTP enabled, verified for bitwise token parity (`mtp=0` == `mtp=K`), coherent output, and 8K/16K long-context needle retrieval.
-**Reference Point:** CT 107 `basalt.service` on the same RTX 5090 logged `~261–325 tok/s` (`spec=8`, `acc=48–77%`, `dl=1.8–2.9`, using 22.9 GiB VRAM + 8.9 GiB host-RAM expert spill).
+**Reference Point:** Basalt on the same RTX 5090 logged `~261–325 tok/s` (`spec=8`, `acc=48–77%`, `dl=1.8–2.9`, using 22.9 GiB VRAM + 8.9 GiB host-RAM expert spill).
 
 ## Completed Optimization Levers
 
@@ -34,7 +34,7 @@
 
 6. **Lever 7 (7A/7B/7C) — Maximum Context Capacity (up to 1,048,576 = 1M!) + Unified Blackwell Tensor Core (`m16n8k16` + `ldmatrix`) Split-K FlashDecoding**
    - Multi-precision global KV cache (`--kv bf16|fp8|q4`):
-     - `fp8` (E4M3 + per-head FP16 scale, `1.016 B/elem`, default for `nvfp4`/`fp8`): fits up to **442,368 (432K)** tokens in **22.48 GiB** VRAM alongside Frigate.
+     - `fp8` (E4M3 + per-head FP16 scale, `1.016 B/elem`, default for `nvfp4`/`fp8`): fits up to **442,368 (432K)** tokens in **22.48 GiB** VRAM.
      - `q4` (symmetric `[-7..7]` INT4 + group-64 FP16 scale, `0.531 B/elem`, fast exact FP16 magic-bias nibble unpack) + zero-copy mapped host `embed` (`--embed-host`, auto-enabled `>512K`, frees `0.86 GiB` VRAM in full BF16): fits the **full official `1,048,576` (1M) context** in **22.47 GiB** VRAM!
    - Unified Blackwell FP16 Tensor Core (`mma.sync.aligned.m16n8k16` + `ldmatrix.x4` + `ldmatrix.x2.trans`, 2-sync `17.4 KB` SMEM) Split-K FlashDecoding across **ALL 48 visits** (64 bulk splits = 512 CTAs + 17 local/tail splits = 136 CTAs) + DSpark global layer 1 (24× HBM traffic reduction!).
    - Captured `prefill_b8_graph_exec_` (skips intermediate `lm_head_argmax`) + `--tokens-file` for arbitrarily long prompts (32K–1M+).
@@ -44,7 +44,7 @@
 
 | Run | Date | Version / Change | Mode | Prompt | `mtp` | Median tok/s | Min–Max tok/s | `acc` / `dl` | VRAM (GiB) | Verdict |
 |---|---|---|---|---|---:|---:|---|---:|---:|---|
-| Ref | 2026-11-23 | CT 107 Basalt (`spec=8`, RAM spill) | NVFP4+Q8 | Mixed | 7 | ~261–325 | — | 48–77% / 1.8–2.9 | 22.9 (+8.9 RAM) | Reference |
+| Ref | 2026-11-23 | Basalt (`spec=8`, RAM spill) | NVFP4+Q8 | Mixed | 7 | ~261–325 | — | 48–77% / 1.8–2.9 | 22.9 (+8.9 RAM) | Reference |
 | v0a | 2026-11-23 | Baseline native C++/CUDA (no graph) | `exact` | P1 | 0 | 76.63 | — | 0% / 1.00 | 18.76 | Baseline |
 | v0b | 2026-11-23 | + CUDA Graph capture | `exact` | P1 | 0 | 95.83 | — | 0% / 1.00 | 18.76 | Keep |
 | v0c | 2026-11-23 | + Initial NVFP4 all-linear | `nvfp4` | P1 | 0 | 114.34 | — | 0% / 1.00 | 15.05 | Keep |
@@ -84,4 +84,4 @@
 - **16K Real Needle Retrieval (`prompt=15177`, `ctx=16384`):** `exact/bf16` **PASS** (`277.30 tok/s`), `nvfp4/fp8` **PASS** (`338.43 tok/s`), `nvfp4/q4` **PASS** (`323.02 tok/s`).
 - **32K Real Needle Retrieval (`prompt=30467`, `ctx=32768`):** `nvfp4/fp8` **PASS** (`302.66 tok/s`), `nvfp4/q4` **PASS** (`280.96 tok/s`).
 - **64K Real Needle Retrieval (`prompt=60937`, `ctx=65536`):** `nvfp4/fp8` **PASS** (`285.58 tok/s`), `nvfp4/q4` **PASS** (`278.95 tok/s`).
-- **1M Context Allocation & Execution (`ctx=1048576`):** `nvfp4/q4` + zero-copy host `embed` allocates and runs cleanly in **22.47 GiB** VRAM alongside Frigate (**96.1 tok/s @ dl=2.5** at `pos=1,048,000`).
+- **1M Context Allocation & Execution (`ctx=1048576`):** `nvfp4/q4` + zero-copy host `embed` allocates and runs cleanly in **22.47 GiB** VRAM (**96.1 tok/s @ dl=2.5** at `pos=1,048,000`).

@@ -1,19 +1,19 @@
 # squid5090 — Theoretical Performance Ceilings (`Inkling-2-Mini` on RTX 5090)
 
-## 1. Measured Hardware (`CT 108` on `pve.lan`)
+## 1. Measured Hardware (NVIDIA RTX 5090)
 
-Measured directly with `/tmp/hw_probe` on 2026-11-23 while CT 100 (`frigate`, ~8.1 GiB VRAM) is running concurrently:
+Measured directly with a custom CUDA microbenchmark on 2026-11-23:
 
 | Metric | Value | Notes |
 |---|---:|---|
 | GPU | NVIDIA GeForce RTX 5090 (`sm_120`, Blackwell) | 170 SMs, 96.0 MiB L2, 100 KiB SMEM/SM |
-| Memory | 32,607 MiB GDDR7 (512-bit, 14,001 MHz DDR) | **23,997 MiB (23.43 GiB) free** (Frigate uses 8,116 MiB) |
+| Memory | 32,607 MiB GDDR7 (512-bit, 14,001 MHz DDR) | 32 GiB GDDR7 (tested under a 23.4 GiB budget) |
 | Spec Peak Bandwidth | 1,792.1 GB/s | Theoretical bus rate |
 | **Measured Pure Read BW (1 GiB, `__ldg`)** | **1,512.9 GB/s** | **Decode bandwidth ceiling reference** |
 | Measured D2D Copy BW (1 GiB) | 1,235.1 GB/s | Read + write |
 | Measured BF16 Tensor Core GEMM (4096³) | 176.2 TFLOPS | 0.78 ms/iter |
 | Measured BF16 Tensor Core GEMM (8192³) | 174.3 TFLOPS | 6.31 ms/iter (sustained) |
-| Host CPU / RAM | Threadripper PRO 7975WX (16 vCPU in CT 108) / 64 GiB | NVMe thin-LVM rootfs |
+| Host CPU / RAM | Threadripper PRO 7975WX (16 vCPU) / 64 GiB | NVMe storage |
 | CUDA Toolkit / Driver | CUDA 13.1 (`V13.1.115`) / Driver `590.48.01` | Native `sm_120` NVFP4/FP8/PDL support |
 
 ## 2. Inkling-2-Mini Architecture & Exact Weight Footprint
@@ -45,7 +45,7 @@ Checkpoint: `thinkingmachines/Inkling-2-Mini` (`model-00001-of-00001.safetensors
 | **Total Resident Weights** | **19.524 GB (18.18 GiB)** | **18.091 GB (16.85 GiB)** | **15.612 GB (14.54 GiB)** |
 | **Headroom in 23.43 GiB Free VRAM** | **5.25 GiB** | **6.58 GiB** | **8.89 GiB** |
 
-**Key structural win vs Basalt (CT 107):** 100% of weights stay resident in RTX 5090 GDDR7 with **5.2–8.9 GiB** headroom for KV cache + workspace (zero host-RAM expert spilling).
+**Key structural win vs Basalt:** 100% of weights stay resident in RTX 5090 GDDR7 with **5.2–8.9 GiB+** headroom for KV cache + workspace (zero host-RAM expert spilling).
 
 ## 3. Single-User (`c=1`) Decode Theoretical Ceilings (at 1,512.9 GB/s Measured Read BW)
 
