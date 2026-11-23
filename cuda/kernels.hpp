@@ -499,6 +499,47 @@ void launch_prefill_local_sconv_prep_store(
     const int32_t* d_pos,
     cudaStream_t stream);
 
+void launch_prefill_global_sconv_prep_store(
+    float* qrgs,
+    float* k_proj,
+    float* v_proj,
+    const __half* in_k_h,
+    const __half* in_v_h,
+    const __nv_bfloat16* k_sconv_w,
+    const __nv_bfloat16* v_sconv_w,
+    const __nv_bfloat16* k_sconv_proj,
+    const __nv_bfloat16* v_sconv_proj,
+    float* k_ring,
+    float* v_ring,
+    const __nv_bfloat16* q_clip_scale,
+    const __nv_bfloat16* rel_clip_scale,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
+    int kv_cap,
+    float* scratch_taps,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
+void launch_prefill_flash_attn_tc(
+    const float* qrgs,
+    const __nv_bfloat16* rel_proj,
+    const void* k_cache,
+    const void* v_cache,
+    const __half* k_scale,
+    const __half* v_scale,
+    KVFormat kv_fmt,
+    __half* out_gated_h,
+    int kv_cap,
+    int window,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
 void launch_prefill_controller_one(
     const float* x,
     const float* saved,

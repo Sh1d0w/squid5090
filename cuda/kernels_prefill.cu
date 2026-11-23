@@ -1038,6 +1038,423 @@ p_moe_down_mxfp8_tc_kernel(
     }
 }
 
+// 1-launch batched B<=512 global dynamic short conv for BOTH K (blockIdx.y=0) and V (blockIdx.y=1) in-place!
+__global__ void p_dynamic_sconv_kv_inplace_kernel(
+    float* __restrict__ k_proj,
+    float* __restrict__ v_proj,
+    const __nv_bfloat16* __restrict__ k_sw,
+    const __nv_bfloat16* __restrict__ v_sw,
+    const float* __restrict__ k_taps,
+    const float* __restrict__ v_taps,
+    float* __restrict__ k_ring,
+    float* __restrict__ v_ring,
+    int B,
+    const int32_t* __restrict__ d_pos) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= KV_DIM) return;
+    int is_v = blockIdx.y;
+    float* x = is_v ? v_proj : k_proj;
+    const __nv_bfloat16* sw = is_v ? v_sw : k_sw;
+    const float* taps = is_v ? v_taps : k_taps;
+    float* ring = is_v ? v_ring : k_ring;
+
+    int head = c / HEAD_DIM;
+    int pos0 = *d_pos;
+    float sw0 = __bfloat162float(sw[0 * KV_DIM + c]);
+    float sw1 = __bfloat162float(sw[1 * KV_DIM + c]);
+    float sw2 = __bfloat162float(sw[2 * KV_DIM + c]);
+    float sw3 = __bfloat162float(sw[3 * KV_DIM + c]);
+
+    float h1 = (pos0 >= 1) ? ring[((pos0 - 1) & 15) * KV_DIM + c] : 0.0f;
+    float h2 = (pos0 >= 2) ? ring[((pos0 - 2) & 15) * KV_DIM + c] : 0.0f;
+    float h3 = (pos0 >= 3) ? ring[((pos0 - 3) & 15) * KV_DIM + c] : 0.0f;
+
+    for (int b = 0; b < B; ++b) {
+        float cur = x[(size_t)b * KV_DIM + c];
+        int p = pos0 + b;
+        if (b >= B - 16) {
+            ring[(p & 15) * KV_DIM + c] = cur;
+        }
+        const float* dt = taps + (size_t)b * 32 + head * 4;
+        float acc = cur * (sw0 + dt[0])
+                  + h1  * (sw1 + dt[1])
+                  + h2  * (sw2 + dt[2])
+                  + h3  * (sw3 + dt[3]);
+        x[(size_t)b * KV_DIM + c] = (acc + cur) * INV_SQRT_9;
+        h3 = h2; h2 = h1; h1 = cur;
+    }
+}
+
+// 1-launch batched B<=512 global Q/R/K clip (with log-pos tau) + V RMSNorm + KV store (BF16/FP8/Q4)!
+// Grid = dim3(64, B), Block = 128
+template <int KV_FMT>
+__global__ void __launch_bounds__(128)
+p_global_attn_prep_store_kernel(
+    float* __restrict__ qrgs,
+    const float* __restrict__ ck,
+    const float* __restrict__ cv,
+    const __nv_bfloat16* __restrict__ q_clip_scale,
+    const __nv_bfloat16* __restrict__ rel_clip_scale,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
+    int kv_cap,
+    const int32_t* __restrict__ d_pos) {
+    int kind_id = blockIdx.x;
+    int b = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int p = (*d_pos) + b;
+    float ratio = fmaxf(float(p + 1) / float(LOG_SCALE_FLOOR), 1.0f);
+    float tau = 1.0f + LOG_SCALE_ALPHA * logf(ratio);
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+    __shared__ float sm[4];
+    __shared__ float factor;
+
+    if (kind_id < 24) {
+        int h = kind_id;
+        float* qp = qrgs + (size_t)b * QRGS_STRIDE + h * HEAD_DIM;
+        float val = qp[tid] * __bfloat162float(q_clip_scale[h * HEAD_DIM + tid]);
+        float sq = warp_sum(val * val);
+        if (lane == 0) sm[warp] = sq;
+        __syncthreads();
+        if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f) * tau;
+        __syncthreads();
+        qp[tid] = val * factor;
+    } else if (kind_id < 48) {
+        if (tid >= D_REL) return;
+        int h = kind_id - 24;
+        float* rp = qrgs + (size_t)b * QRGS_STRIDE + Q_DIM + h * D_REL;
+        float val = rp[tid] * __bfloat162float(rel_clip_scale[h * D_REL + tid]);
+        float sq = val * val;
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1) sq += __shfl_xor_sync(0xFFFFu, sq, off);
+        rp[tid] = val * fminf(REL_CLIP / (sqrtf(sq) + 1e-6f), 1.0f) * tau;
+    } else if (kind_id < 56) {
+        int h = kind_id - 48;
+        int c = h * HEAD_DIM + tid;
+        float val = ck[(size_t)b * KV_DIM + c];
+        float sq = warp_sum(val * val);
+        if (lane == 0) sm[warp] = sq;
+        __syncthreads();
+        if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
+        __syncthreads();
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
+    } else {
+        int h = kind_id - 56;
+        int c = h * HEAD_DIM + tid;
+        float val = cv[(size_t)b * KV_DIM + c];
+        float sq = warp_sum(val * val);
+        if (lane == 0) sm[warp] = sq;
+        __syncthreads();
+        if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
+        __syncthreads();
+        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
+    }
+}
+
+// BLACKWELL TENSOR CORE FLASHATTENTION PREFILL (Global Q4/FP8/BF16 & Local SWA BF16!)
+// Each CTA owns 1 KV head x Q_TOK tokens (GQA_RATIO * Q_TOK queries = NUM_WARPS x 16 exact!).
+// Every KV tile (32 tokens) is loaded ONCE into SMEM and shared across 48 (local) or 96 (global) queries!
+// Bulk global tiles (dist >= 1024) skip rel-bias + causal masking completely (pure TC FlashAttention!).
+// Zero SMEM output reduction: each warp owns 16 queries end-to-end and writes directly to out_gated_h!
+template <int KV_FMT, int Q_TOK>
+__global__ void __launch_bounds__((Q_TOK * GQA_RATIO / 16) * 32)
+p_flash_attn_prefill_tc_kernel(
+    const float* __restrict__ qrgs,
+    const __nv_bfloat16* __restrict__ rel_proj,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
+    const __half* __restrict__ k_scale,
+    const __half* __restrict__ v_scale,
+    __half* __restrict__ out_gated_h,
+    int kv_cap,
+    int window,
+    int B,
+    const int32_t* __restrict__ d_pos) {
+    constexpr int Q_MAX = Q_TOK * GQA_RATIO;     // 96 (global) or 48 (local)
+    constexpr int NUM_WARPS = Q_MAX / 16;        // 6 or 3
+    constexpr int THREADS = NUM_WARPS * 32;      // 192 or 96
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+
+    int kvh = blockIdx.x;
+    int b_start = blockIdx.y * Q_TOK;
+    int q_tok_cnt = min(Q_TOK, B - b_start);
+    if (q_tok_cnt <= 0) return;
+    int q_cnt = q_tok_cnt * GQA_RATIO;
+
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int grp = lane >> 2;
+    int tid4 = lane & 3;
+
+    int pos0 = *d_pos;
+    int q_pos_min = pos0 + b_start;
+    int q_pos_max = q_pos_min + q_tok_cnt - 1;
+
+    // 22.0 KB SMEM (Q_TOK=32) / 20.5 KB SMEM (Q_TOK=16) -> 4 blocks/SM on RTX 5090!
+    __shared__ __half s_k[32][HEAD_DIM + 8]; // 8,704 B
+    __shared__ __half s_v[32][HEAD_DIM + 8]; // 8,704 B
+    __shared__ __half s_r[Q_MAX][D_REL];     // 3,072 B (Q_TOK=32) / 1,536 B (Q_TOK=16)
+    __shared__ __half s_rp[64][D_REL];       // 2,048 B
+
+    // 1. Load R[0..q_cnt-1][0..15] into SMEM once for all KV tiles
+    for (int i = tid; i < q_cnt * D_REL; i += THREADS) {
+        int qi = i >> 4;
+        int k = i & 15;
+        int h = kvh * GQA_RATIO + (qi % GQA_RATIO);
+        int b = b_start + (qi / GQA_RATIO);
+        s_r[qi][k] = __float2half(qrgs[(size_t)b * QRGS_STRIDE + Q_DIM + h * D_REL + k]);
+    }
+
+    // 2. Load this warp's 16 queries (q0, q1) into registers + initialize softmax with attention sink!
+    int q0 = warp * 16 + grp;
+    int q1 = warp * 16 + grp + 8;
+    const float* qp0 = nullptr;
+    const float* qp1 = nullptr;
+    const float* gp0 = nullptr;
+    const float* gp1 = nullptr;
+    int b0 = 0, h0 = 0, pos_q0 = q_pos_min;
+    int b1 = 0, h1 = 0, pos_q1 = q_pos_min;
+    float m0 = 0.0f, m1 = 0.0f;
+    float d0 = 1.0f, d1 = 1.0f;
+
+    if (q0 < q_cnt) {
+        h0 = kvh * GQA_RATIO + (q0 % GQA_RATIO);
+        b0 = b_start + (q0 / GQA_RATIO);
+        pos_q0 = pos0 + b0;
+        const float* base0 = qrgs + (size_t)b0 * QRGS_STRIDE;
+        qp0 = base0 + h0 * HEAD_DIM;
+        gp0 = base0 + Q_DIM + R_DIM + h0 * HEAD_DIM;
+        m0 = base0[Q_DIM + R_DIM + Q_DIM + h0];
+    }
+    if (q1 < q_cnt) {
+        h1 = kvh * GQA_RATIO + (q1 % GQA_RATIO);
+        b1 = b_start + (q1 / GQA_RATIO);
+        pos_q1 = pos0 + b1;
+        const float* base1 = qrgs + (size_t)b1 * QRGS_STRIDE;
+        qp1 = base1 + h1 * HEAD_DIM;
+        gp1 = base1 + Q_DIM + R_DIM + h1 * HEAD_DIM;
+        m1 = base1[Q_DIM + R_DIM + Q_DIM + h1];
+    }
+
+    uint32_t q_reg[8][4];
+    #pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+        int k_off = kt * 16;
+        if (qp0) {
+            __half2 h_a = __floats2half2_rn(qp0[k_off + tid4 * 2] * INV_SQRT_HEAD_DIM,
+                                            qp0[k_off + tid4 * 2 + 1] * INV_SQRT_HEAD_DIM);
+            __half2 h_c = __floats2half2_rn(qp0[k_off + tid4 * 2 + 8] * INV_SQRT_HEAD_DIM,
+                                            qp0[k_off + tid4 * 2 + 9] * INV_SQRT_HEAD_DIM);
+            q_reg[kt][0] = *reinterpret_cast<const uint32_t*>(&h_a);
+            q_reg[kt][2] = *reinterpret_cast<const uint32_t*>(&h_c);
+        } else {
+            q_reg[kt][0] = 0u;
+            q_reg[kt][2] = 0u;
+        }
+        if (qp1) {
+            __half2 h_b = __floats2half2_rn(qp1[k_off + tid4 * 2] * INV_SQRT_HEAD_DIM,
+                                            qp1[k_off + tid4 * 2 + 1] * INV_SQRT_HEAD_DIM);
+            __half2 h_d = __floats2half2_rn(qp1[k_off + tid4 * 2 + 8] * INV_SQRT_HEAD_DIM,
+                                            qp1[k_off + tid4 * 2 + 9] * INV_SQRT_HEAD_DIM);
+            q_reg[kt][1] = *reinterpret_cast<const uint32_t*>(&h_b);
+            q_reg[kt][3] = *reinterpret_cast<const uint32_t*>(&h_d);
+        } else {
+            q_reg[kt][1] = 0u;
+            q_reg[kt][3] = 0u;
+        }
+    }
+
+    float o[16][4];
+    #pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
+    }
+
+    int c0 = tid4 * 2;
+    int c1 = tid4 * 2 + 1;
+    int c4 = tid4 * 2 + 8;
+    int c5 = tid4 * 2 + 9;
+    int k_ld_col = (lane & 8);
+
+    int t_start = (window > 0) ? max(0, q_pos_min + 1 - window) : 0;
+    int t_end = q_pos_max + 1;
+
+    for (int t0 = t_start; t0 < t_end; t0 += 32) {
+        int tile_len = min(32, t_end - t0);
+        bool is_bulk = (window == 0) && (tile_len == 32) && (t0 + 31 <= q_pos_min - REL_EXTENT);
+
+        // Cooperatively load K[32, 128] and V[32, 128] into SMEM ONCE for all 48/96 queries!
+        #pragma unroll
+        for (int idx = tid; idx < 512; idx += THREADS) {
+            int t_loc = idx >> 4;
+            int sub = idx & 15;
+            if (t_loc < tile_len) {
+                int slot = (t0 + t_loc) % kv_cap;
+                *reinterpret_cast<uint4*>(&s_k[t_loc][sub * 8]) =
+                    load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
+                *reinterpret_cast<uint4*>(&s_v[t_loc][sub * 8]) =
+                    load_kv_8elems_h2x4<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
+            } else {
+                *reinterpret_cast<uint4*>(&s_k[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(&s_v[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+            }
+        }
+
+        int d_min = 0;
+        if (!is_bulk) {
+            d_min = max(0, q_pos_min - (t0 + tile_len - 1));
+            int d_max = min(REL_EXTENT - 1, q_pos_max - t0);
+            int d_span = (d_max >= d_min) ? (d_max - d_min + 1) : 0;
+            for (int i = tid; i < d_span * D_REL; i += THREADS) {
+                int di = i >> 4;
+                int k = i & 15;
+                int dist = d_min + di;
+                s_rp[di][k] = __float2half(__bfloat162float(__ldg(&rel_proj[k * REL_EXTENT + dist])));
+            }
+        }
+        __syncthreads();
+
+        // Process the 32 KV tokens in 2 Tensor Core sub-tiles of 16 keys each
+        #pragma unroll
+        for (int kv_sub = 0; kv_sub < 2; ++kv_sub) {
+            int t_base = kv_sub * 16;
+            int w_len = min(16, max(0, tile_len - t_base));
+            if (w_len <= 0) break;
+
+            int k_ld_row = t_base + ((lane & 16) >> 1) + (lane & 7);
+            int v_ld_row = t_base + (lane & 15);
+
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt) {
+                uint32_t kb0, kb1, kb2, kb3;
+                ldmatrix_x4(kb0, kb1, kb2, kb3, &s_k[k_ld_row][kt * 16 + k_ld_col]);
+                mma_m16n8k16_f32_f16(s0, s1, s2, s3,
+                                     q_reg[kt][0], q_reg[kt][1], q_reg[kt][2], q_reg[kt][3],
+                                     kb0, kb1, s0, s1, s2, s3);
+                mma_m16n8k16_f32_f16(s4, s5, s6, s7,
+                                     q_reg[kt][0], q_reg[kt][1], q_reg[kt][2], q_reg[kt][3],
+                                     kb2, kb3, s4, s5, s6, s7);
+            }
+
+            if (!is_bulk) {
+                auto apply_rel = [&](float& s, int col, int qi, int pos_q) {
+                    if (qi >= q_cnt || col >= w_len) { s = -1e30f; return; }
+                    int t = t0 + t_base + col;
+                    if (t > pos_q || (window > 0 && t < pos_q + 1 - window)) { s = -1e30f; return; }
+                    int dist = pos_q - t;
+                    if (dist < REL_EXTENT) {
+                        const __half2* rh = reinterpret_cast<const __half2*>(&s_r[qi][0]);
+                        const __half2* ph = reinterpret_cast<const __half2*>(&s_rp[dist - d_min][0]);
+                        __half2 a0 = __hmul2(rh[0], ph[0]), a1 = __hmul2(rh[1], ph[1]);
+                        a0 = __hfma2(rh[2], ph[2], a0); a1 = __hfma2(rh[3], ph[3], a1);
+                        a0 = __hfma2(rh[4], ph[4], a0); a1 = __hfma2(rh[5], ph[5], a1);
+                        a0 = __hfma2(rh[6], ph[6], a0); a1 = __hfma2(rh[7], ph[7], a1);
+                        float2 f = __half22float2(__hadd2(a0, a1));
+                        s += (f.x + f.y);
+                    }
+                };
+                apply_rel(s0, c0, q0, pos_q0);
+                apply_rel(s1, c1, q0, pos_q0);
+                apply_rel(s4, c4, q0, pos_q0);
+                apply_rel(s5, c5, q0, pos_q0);
+                apply_rel(s2, c0, q1, pos_q1);
+                apply_rel(s3, c1, q1, pos_q1);
+                apply_rel(s6, c4, q1, pos_q1);
+                apply_rel(s7, c5, q1, pos_q1);
+            }
+
+            float rmax0 = fmaxf(fmaxf(s0, s1), fmaxf(s4, s5));
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 1));
+            rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 2));
+            float rmax1 = fmaxf(fmaxf(s2, s3), fmaxf(s6, s7));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 1));
+            rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 2));
+
+            float m0_new = fmaxf(m0, rmax0);
+            float m1_new = fmaxf(m1, rmax1);
+            float alpha0 = __expf(m0 - m0_new);
+            float alpha1 = __expf(m1 - m1_new);
+
+            #pragma unroll
+            for (int nt = 0; nt < 16; ++nt) {
+                o[nt][0] *= alpha0;
+                o[nt][1] *= alpha0;
+                o[nt][2] *= alpha1;
+                o[nt][3] *= alpha1;
+            }
+
+            float ps0 = (is_bulk || s0 > -1e29f) ? __expf(s0 - m0_new) : 0.0f;
+            float ps1 = (is_bulk || s1 > -1e29f) ? __expf(s1 - m0_new) : 0.0f;
+            float ps4 = (is_bulk || s4 > -1e29f) ? __expf(s4 - m0_new) : 0.0f;
+            float ps5 = (is_bulk || s5 > -1e29f) ? __expf(s5 - m0_new) : 0.0f;
+            float ps2 = (is_bulk || s2 > -1e29f) ? __expf(s2 - m1_new) : 0.0f;
+            float ps3 = (is_bulk || s3 > -1e29f) ? __expf(s3 - m1_new) : 0.0f;
+            float ps6 = (is_bulk || s6 > -1e29f) ? __expf(s6 - m1_new) : 0.0f;
+            float ps7 = (is_bulk || s7 > -1e29f) ? __expf(s7 - m1_new) : 0.0f;
+
+            float rsum0 = ps0 + ps1 + ps4 + ps5;
+            rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 1);
+            rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 2);
+            float rsum1 = ps2 + ps3 + ps6 + ps7;
+            rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 1);
+            rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 2);
+            d0 = d0 * alpha0 + rsum0; m0 = m0_new;
+            d1 = d1 * alpha1 + rsum1; m1 = m1_new;
+
+            __half2 hp0 = __floats2half2_rn(ps0, ps1);
+            __half2 hp1 = __floats2half2_rn(ps2, ps3);
+            __half2 hp2 = __floats2half2_rn(ps4, ps5);
+            __half2 hp3 = __floats2half2_rn(ps6, ps7);
+            uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&hp0);
+            uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&hp1);
+            uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&hp2);
+            uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&hp3);
+
+            #pragma unroll
+            for (int nt = 0; nt < 16; ++nt) {
+                uint32_t vb0, vb1;
+                ldmatrix_x2_trans(vb0, vb1, &s_v[v_ld_row][nt * 8]);
+                mma_m16n8k16_f32_f16(o[nt][0], o[nt][1], o[nt][2], o[nt][3],
+                                     pa0, pa1, pa2, pa3,
+                                     vb0, vb1,
+                                     o[nt][0], o[nt][1], o[nt][2], o[nt][3]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 3. Direct gated FP16 writeback (zero SMEM reduction!)
+    if (q0 < q_cnt) {
+        float inv_d0 = 1.0f / d0;
+        __half* dst0 = out_gated_h + (size_t)b0 * Q_DIM + h0 * HEAD_DIM;
+        #pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            int col0 = nt * 8 + c0;
+            int col1 = nt * 8 + c1;
+            dst0[col0] = __float2half((o[nt][0] * inv_d0) * fast_sigmoid(gp0[col0]));
+            dst0[col1] = __float2half((o[nt][1] * inv_d0) * fast_sigmoid(gp0[col1]));
+        }
+    }
+    if (q1 < q_cnt) {
+        float inv_d1 = 1.0f / d1;
+        __half* dst1 = out_gated_h + (size_t)b1 * Q_DIM + h1 * HEAD_DIM;
+        #pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            int col0 = nt * 8 + c0;
+            int col1 = nt * 8 + c1;
+            dst1[col0] = __float2half((o[nt][2] * inv_d1) * fast_sigmoid(gp1[col0]));
+            dst1[col1] = __float2half((o[nt][3] * inv_d1) * fast_sigmoid(gp1[col1]));
+        }
+    }
+}
+
 } // namespace
 
 void launch_prefill_warmup_cublas(cudaStream_t stream) {
@@ -1132,6 +1549,70 @@ void launch_prefill_local_sconv_prep_store(
     launch_attn_prep_store(
         qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale,
         k_cache, v_cache, kv_cap, false, B, d_pos, stream);
+}
+
+void launch_prefill_global_sconv_prep_store(
+    float* qrgs, float* k_proj, float* v_proj,
+    const __half* in_k_h, const __half* in_v_h,
+    const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
+    const __nv_bfloat16* k_sconv_proj, const __nv_bfloat16* v_sconv_proj,
+    float* k_ring, float* v_ring,
+    const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
+    void* k_cache, void* v_cache, __half* k_scale, __half* v_scale,
+    KVFormat kv_fmt, int kv_cap,
+    float* scratch_taps, __half* w_f16_scratch,
+    int B, const int32_t* d_pos, cudaStream_t stream) {
+    // 1. Batched cuBLAS FP16 TC dynamic tap projections ([32, 2304] x [B, 2304])
+    float* k_taps = scratch_taps;
+    float* v_taps = scratch_taps + (size_t)B * 32;
+    LinearWeight kw = {WeightKind::BF16, 32, HIDDEN, const_cast<__nv_bfloat16*>(k_sconv_proj), nullptr, nullptr, 1.0f};
+    LinearWeight vw = {WeightKind::BF16, 32, HIDDEN, const_cast<__nv_bfloat16*>(v_sconv_proj), nullptr, nullptr, 1.0f};
+    launch_prefill_gemm_h(kw, in_k_h, k_taps, w_f16_scratch, B, stream);
+    launch_prefill_gemm_h(vw, in_v_h, v_taps, w_f16_scratch, B, stream);
+
+    // 2. 1-launch causal dynamic sconv for K & V in-place
+    p_dynamic_sconv_kv_inplace_kernel<<<dim3(KV_DIM / 256, 2), 256, 0, stream>>>(
+        k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring, B, d_pos);
+
+    // 3. 1-launch Q/R/K clip (with log-pos tau) + V RMSNorm + quantized KV store
+    dim3 grid(64, B);
+    if (kv_fmt == KVFormat::FP8) {
+        p_global_attn_prep_store_kernel<1><<<grid, 128, 0, stream>>>(
+            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else if (kv_fmt == KVFormat::Q4) {
+        p_global_attn_prep_store_kernel<2><<<grid, 128, 0, stream>>>(
+            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    } else {
+        p_global_attn_prep_store_kernel<0><<<grid, 128, 0, stream>>>(
+            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    }
+}
+
+void launch_prefill_flash_attn_tc(
+    const float* qrgs, const __nv_bfloat16* rel_proj,
+    const void* k_cache, const void* v_cache,
+    const __half* k_scale, const __half* v_scale,
+    KVFormat kv_fmt, __half* out_gated_h,
+    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
+    if (window > 0) {
+        // Local SWA (BF16): Q_TOK=16 (48 queries/CTA, 3 warps=96 threads -> 128 CTAs for B=256 = 1 wave!)
+        dim3 grid(NUM_KV_HEADS, (B + 15) / 16);
+        p_flash_attn_prefill_tc_kernel<0, 16><<<grid, 96, 0, stream>>>(
+            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+    } else {
+        // Global (BF16/FP8/Q4): Q_TOK=32 (96 queries/CTA, 6 warps=192 threads -> 128 CTAs for B=512 = 1 wave!)
+        dim3 grid(NUM_KV_HEADS, (B + 31) / 32);
+        if (kv_fmt == KVFormat::FP8) {
+            p_flash_attn_prefill_tc_kernel<1, 32><<<grid, 192, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+        } else if (kv_fmt == KVFormat::Q4) {
+            p_flash_attn_prefill_tc_kernel<2, 32><<<grid, 192, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+        } else {
+            p_flash_attn_prefill_tc_kernel<0, 32><<<grid, 192, 0, stream>>>(
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+        }
+    }
 }
 
 void launch_prefill_controller_one(

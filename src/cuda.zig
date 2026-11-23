@@ -566,6 +566,49 @@ pub extern "c" fn squid_launch_prefill_local_sconv_prep_store(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_prefill_global_sconv_prep_store(
+    qrgs: [*]f32,
+    k_proj: [*]f32,
+    v_proj: [*]f32,
+    in_k_h: *const anyopaque,
+    in_v_h: *const anyopaque,
+    k_sw: *const anyopaque,
+    v_sw: *const anyopaque,
+    k_sp: *const anyopaque,
+    v_sp: *const anyopaque,
+    k_ring: [*]f32,
+    v_ring: [*]f32,
+    q_cs: *const anyopaque,
+    r_cs: *const anyopaque,
+    k_cache: *anyopaque,
+    v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    kv_fmt: u8,
+    kv_cap: i32,
+    scratch_taps: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_flash_attn_tc(
+    qrgs: [*]const f32,
+    rel_proj: *const anyopaque,
+    k_cache: *const anyopaque,
+    v_cache: *const anyopaque,
+    k_scale: ?*const anyopaque,
+    v_scale: ?*const anyopaque,
+    kv_fmt: u8,
+    out_gated_h: *anyopaque,
+    kv_cap: i32,
+    window: i32,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_prefill_controller_one(
     x: [*]const f32,
     saved: [*]const f32,

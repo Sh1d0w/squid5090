@@ -26,7 +26,7 @@ pub const GenerateStats = struct {
 const prefix_checkpoint_count: usize = 4;
 const side_shield_max_tokens: u32 = 4096;
 const prefill_batch_max: u32 = 512;
-const prefill_local_attn_sub: u32 = 64;
+const prefill_local_attn_sub: u32 = 256;
 const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 64
 
 inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
@@ -699,11 +699,10 @@ pub const Engine = struct {
                 self.copy_global_kv_shield(shield_tokens, true);
                 self.reset();
             } else if (common > 0 and use_mtp == self.prefix_cache.session_use_mtp) {
-                const ds_limit: u32 = if (use_mtp and self.prefix_cache.session_len > @as(u32, @intCast(self.ds_kv_cap[1])))
-                    @intCast(self.ds_kv_cap[1])
-                else
-                    self.context_tokens_max;
-                const reusable_limit: u32 = @min(common, ds_limit);
+                // Target global KV caches hold full `context_tokens_max` (up to 1M) without wrapping.
+                // DSpark's global KV ring (64K at 1M ctx) only proposes draft tokens that are strictly
+                // verified by the target model, so never clamp target prefix reuse at 65,536!
+                const reusable_limit: u32 = common;
 
                 // Check 1: exact live GPU match (0 ms restore!)
                 var matched_live: bool = false;
@@ -1211,63 +1210,51 @@ pub const Engine = struct {
                 t_mark = now;
             }
 
-            // 3. Causal sconv + KV store + Relative-Bias Attention
-            // Local layers: batched B_sub<=64 inline attention (6x fewer launches, 100% ring-safe with kv_cap=1088).
-            // Global layers: B=8 Split-K TC FlashDecoding (scales cleanly to 1M context!).
+            // 3. BATCHED Causal sconv + KV store + Blackwell Tensor Core FlashAttention!
+            // Global layers: 1-shot batched B<=512 (Q_TOK=32 -> 96 queries/CTA, 128 CTAs = 1 wave!).
+            // Local layers: B_sub<=256 (Q_TOK=16 -> 48 queries/CTA, 128 CTAs = 1 wave, 100% ring-safe with kv_cap=1280!).
             if (v.is_global) {
-                s = 0;
-                while (s < n_sub) : (s += 1) {
-                    const off: usize = s * 8;
-                    const d_pos_sub: *const i32 = &self.p_pos_vec[s];
-                    const qrgs_sub = self.p_qrgs + off * constants.qrgs_out_dim;
-                    const k_sub = self.p_k_proj + off * constants.kv_dim;
-                    const v_sub = self.p_v_proj + off * constants.kv_dim;
-                    const in_k_sub = (if (distinct_inputs) self.p_attn_in[1] else self.p_attn_in[0]) + off * constants.hidden_dim;
-                    const in_v_sub = (if (distinct_inputs) self.p_attn_in[2] else self.p_attn_in[0]) + off * constants.hidden_dim;
-
-                    cuda.squid_launch_mega_global_sconv_prep_store(
-                        qrgs_sub,
-                        k_sub,
-                        v_sub,
-                        in_k_sub,
-                        in_v_sub,
-                        lw.k_sconv_w.?,
-                        lw.v_sconv_w.?,
-                        lw.k_sconv_proj.?,
-                        lw.v_sconv_proj.?,
-                        self.k_ring[vi],
-                        self.v_ring[vi],
-                        lw.q_clip_scale.?,
-                        lw.rel_clip_scale.?,
-                        self.k_cache[vi].?,
-                        self.v_cache[vi].?,
-                        self.k_scale[vi],
-                        self.v_scale[vi],
-                        @intFromEnum(self.kv_format),
-                        self.kv_cap[vi],
-                        8,
-                        d_pos_sub,
-                        self.stream,
-                    );
-
-                    cuda.squid_launch_relative_attention_gated(
-                        qrgs_sub,
-                        lw.rel_logits_proj.?,
-                        self.k_cache[vi].?,
-                        self.v_cache[vi].?,
-                        self.k_scale[vi],
-                        self.v_scale[vi],
-                        @intFromEnum(self.kv_format),
-                        self.split_buf,
-                        null,
-                        offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
-                        self.kv_cap[vi],
-                        0,
-                        8,
-                        d_pos_sub,
-                        self.stream,
-                    );
-                }
+                cuda.squid_launch_prefill_global_sconv_prep_store(
+                    self.p_qrgs,
+                    self.p_k_proj,
+                    self.p_v_proj,
+                    in_kh,
+                    in_vh,
+                    lw.k_sconv_w.?,
+                    lw.v_sconv_w.?,
+                    lw.k_sconv_proj.?,
+                    lw.v_sconv_proj.?,
+                    self.k_ring[vi],
+                    self.v_ring[vi],
+                    lw.q_clip_scale.?,
+                    lw.rel_clip_scale.?,
+                    self.k_cache[vi].?,
+                    self.v_cache[vi].?,
+                    self.k_scale[vi],
+                    self.v_scale[vi],
+                    @intFromEnum(self.kv_format),
+                    self.kv_cap[vi],
+                    self.p_ctrl_d,
+                    self.p_w_f16,
+                    b_i32,
+                    &self.p_pos_vec[0],
+                    self.stream,
+                );
+                cuda.squid_launch_prefill_flash_attn_tc(
+                    self.p_qrgs,
+                    lw.rel_logits_proj.?,
+                    self.k_cache[vi].?,
+                    self.v_cache[vi].?,
+                    self.k_scale[vi],
+                    self.v_scale[vi],
+                    @intFromEnum(self.kv_format),
+                    self.p_attn_gated_h,
+                    self.kv_cap[vi],
+                    0,
+                    b_i32,
+                    &self.p_pos_vec[0],
+                    self.stream,
+                );
             } else {
                 var off_u32: u32 = 0;
                 while (off_u32 < chunk_len) {
@@ -1296,7 +1283,7 @@ pub const Engine = struct {
                         self.stream,
                     );
 
-                    cuda.squid_launch_relative_attention_gated(
+                    cuda.squid_launch_prefill_flash_attn_tc(
                         qrgs_sub,
                         lw.rel_logits_proj.?,
                         self.k_cache[vi].?,
@@ -1304,8 +1291,6 @@ pub const Engine = struct {
                         null,
                         null,
                         @intFromEnum(constants.KVFormat.bf16),
-                        null,
-                        null,
                         offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
                         self.kv_cap[vi],
                         constants.swa_window_tokens,

@@ -786,6 +786,43 @@ void squid_launch_prefill_local_sconv_prep_store(
         kv_cap, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_prefill_global_sconv_prep_store(
+    float* qrgs, float* k_proj, float* v_proj,
+    const void* in_k_h, const void* in_v_h,
+    const void* k_sw, const void* v_sw,
+    const void* k_sp, const void* v_sp,
+    float* k_ring, float* v_ring,
+    const void* q_cs, const void* r_cs,
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale,
+    uint8_t kv_fmt, int32_t kv_cap,
+    float* scratch_taps, void* w_f16_scratch,
+    int32_t B, const int32_t* d_pos, void* stream) {
+    launch_prefill_global_sconv_prep_store(
+        qrgs, k_proj, v_proj,
+        static_cast<const __half*>(in_k_h), static_cast<const __half*>(in_v_h),
+        static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
+        static_cast<const __nv_bfloat16*>(k_sp), static_cast<const __nv_bfloat16*>(v_sp),
+        k_ring, v_ring,
+        static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), kv_cap,
+        scratch_taps, static_cast<__half*>(w_f16_scratch),
+        B, d_pos, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_prefill_flash_attn_tc(
+    const float* qrgs, const void* rel_proj,
+    const void* k_cache, const void* v_cache,
+    const void* k_scale, const void* v_scale,
+    uint8_t kv_fmt, void* out_gated_h,
+    int32_t kv_cap, int32_t window, int32_t B, const int32_t* d_pos, void* stream) {
+    launch_prefill_flash_attn_tc(
+        qrgs, static_cast<const __nv_bfloat16*>(rel_proj),
+        k_cache, v_cache, static_cast<const __half*>(k_scale), static_cast<const __half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), static_cast<__half*>(out_gated_h),
+        kv_cap, window, B, d_pos, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_prefill_controller_one(
     const float* x, const float* saved, const float* prior_last, const float* cp_q,
     const CControllerWeights* cw_in, const void* post_norm,
