@@ -2,10 +2,10 @@
 // Zero C++ heap allocations or host orchestration — all memory management, safetensors loading,
 // tokenization, graph orchestration, and HTTP/SSE serving live in pure TigerStyle Zig.
 
-#include "../../src/config.hpp"
-#include "../../src/kernels.hpp"
-#include "../../src/kernels_common.cuh"
-#include "../../src/weights.hpp"
+#include "config.hpp"
+#include "kernels.hpp"
+#include "kernels_common.cuh"
+#include "weights.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -16,12 +16,6 @@
 #include <cstdio>
 
 using namespace squid;
-
-// weights.cu is intentionally excluded from the TigerStyle Zig build; provide a no-op
-// destructor for the transient ModelWeights view used in squid_launch_dspark_draft.
-namespace squid {
-ModelWeights::~ModelWeights() = default;
-}
 
 namespace {
 

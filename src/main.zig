@@ -375,12 +375,12 @@ fn print_decoded(tok: *const tokenizer_mod.Tokenizer, tokens: []const i32) void 
 
 fn print_usage() void {
     tiger.write_fd_all(2,
-        "squid5090-zig — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
+        "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090-zig serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 3]\n" ++
-            "  squid5090-zig generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--ctx 8192]\n" ++
-            "  squid5090-zig bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
-            "  squid5090-zig longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
-            "  squid5090-zig tokenize <model_dir> --prompt TEXT [--raw]\n",
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 3] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
+            "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
     );
 }

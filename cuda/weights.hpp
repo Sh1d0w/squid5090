@@ -1,11 +1,8 @@
 #pragma once
 
 #include "config.hpp"
-#include "safetensors.hpp"
 #include <cuda_bf16.h>
 #include <cstdint>
-#include <string>
-#include <vector>
 
 namespace squid {
 
@@ -150,15 +147,6 @@ struct ModelWeights {
 
     LayerWeights layers[NUM_LAYERS];
     DsparkWeights dspark;
-
-    // Memory tracking
-    std::vector<void*> allocations;
-    std::vector<void*> host_allocations;
-    size_t total_vram_bytes = 0;
-
-    ~ModelWeights();
-    void* alloc_dev(size_t bytes);
-    bool load(const std::string& model_dir, QuantMode quant_mode, bool load_mtp = true, bool embed_on_host = false);
 };
 
 } // namespace squid

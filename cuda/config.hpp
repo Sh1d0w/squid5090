@@ -4,8 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
-#include <stdexcept>
-#include <string>
 
 namespace squid {
 
