@@ -46,6 +46,19 @@ pub const LayerWeights = struct {
     w2: cuda.CExpertBank = .{},
 };
 
+pub const AblationWeights = struct {
+    active: bool = false,
+    has_detectors: bool = false,
+    attn_dirs: ?[*]f32 = null, // [48 * 2304] unit directions r_v
+    mlp_dirs: ?[*]f32 = null, // [48 * 2304] unit directions r_v
+    attn_det: ?[*]f32 = null, // [48 * 2304] Fisher-LDA detectors d_v (optional)
+    mlp_det: ?[*]f32 = null, // [48 * 2304] Fisher-LDA detectors d_v (optional)
+    attn_params: ?[*]f32 = null, // [48 * 4] {weight, offset, floor, threshold}
+    mlp_params: ?[*]f32 = null, // [48 * 4] {weight, offset, floor, threshold}
+    attn_nonzero: [constants.visit_count]bool = @splat(false),
+    mlp_nonzero: [constants.visit_count]bool = @splat(false),
+};
+
 pub const ModelWeights = struct {
     mode: constants.QuantMode = .nvfp4,
     arena: vram_arena.VRAMArena = .{},
@@ -64,6 +77,7 @@ pub const ModelWeights = struct {
 
     layers: [constants.layer_count]LayerWeights = @splat(.{}),
     dspark: cuda.CDsparkWeights = .{},
+    ablation: AblationWeights = .{},
 
     pub fn deinit(self: *ModelWeights) void {
         self.arena.deinit();
@@ -80,6 +94,7 @@ pub const ModelWeights = struct {
         quant_mode: constants.QuantMode,
         load_mtp: bool,
         embed_on_host: bool,
+        ablation_path: []const u8,
     ) bool {
         tiger.assert(model_directory.len > 0);
         tiger.assert(self.arena.base_ptr == null);
@@ -101,6 +116,25 @@ pub const ModelWeights = struct {
         var sf_mtp: safetensors.SafetensorsFile = .{};
         const has_mtp: bool = load_mtp and sf_mtp.open_file(mtp_path_z);
         defer if (has_mtp) sf_mtp.close_file();
+
+        var abl_path_buf: [1024]u8 = undefined;
+        var sf_abl: safetensors.SafetensorsFile = .{};
+        var has_ablation: bool = false;
+        var has_ablation_detectors: bool = false;
+        if (ablation_path.len > 0) {
+            tiger.assert(ablation_path.len < abl_path_buf.len);
+            @memcpy(abl_path_buf[0..ablation_path.len], ablation_path);
+            abl_path_buf[ablation_path.len] = 0;
+            const abl_path_z: [*:0]const u8 = @ptrCast(abl_path_buf[0..ablation_path.len :0]);
+            if (!sf_abl.open_file(abl_path_z)) {
+                tiger.print_stderr("[weights] Failed to open ablation safetensors: {s}\n", .{ablation_path});
+                return false;
+            }
+            has_ablation = true;
+            const plain_layout: bool = sf_abl.lookup_optional("attn_w") != null;
+            has_ablation_detectors = !plain_layout and sf_abl.lookup_optional("attn_det") != null;
+        }
+        defer if (has_ablation) sf_abl.close_file();
 
         const dense_kind: constants.WeightKind = switch (quant_mode) {
             .exact => .bf16,
@@ -133,6 +167,8 @@ pub const ModelWeights = struct {
             has_mtp,
             has_pruned_draft_vocab,
             draft_vocab_count,
+            has_ablation,
+            has_ablation_detectors,
         );
         self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
 
@@ -339,6 +375,10 @@ pub const ModelWeights = struct {
             );
         }
 
+        if (has_ablation) {
+            self.load_ablation(&sf_abl, has_ablation_detectors);
+        }
+
         tiger.assert_cuda(cuda.squid_cuda_device_sync());
         // Paired TigerStyle invariant: Pass 1 predicted byte total == Pass 2 exact arena usage!
         self.arena.assert_exact_fill();
@@ -346,8 +386,15 @@ pub const ModelWeights = struct {
         const elapsed_sec: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - start_ns)) / 1_000_000_000.0;
         const vram_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s}\n",
-            .{ quant_mode.name(), elapsed_sec, vram_gib, self.arena.allocation_count, if (self.dspark.loaded != 0) "on" else "off" },
+            "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s} | Ablation={s}\n",
+            .{
+                quant_mode.name(),
+                elapsed_sec,
+                vram_gib,
+                self.arena.allocation_count,
+                if (self.dspark.loaded != 0) "on" else "off",
+                if (!self.ablation.active) "off" else if (self.ablation.has_detectors) "gated-lda" else "plain",
+            },
         );
         return true;
     }
@@ -658,7 +705,115 @@ pub const ModelWeights = struct {
         }
         self.dspark.loaded = 1;
     }
+
+    fn load_ablation(self: *ModelWeights, sf_abl: *const safetensors.SafetensorsFile, has_detectors: bool) void {
+        const visits: usize = constants.visit_count;
+        const hidden: usize = constants.hidden_dim;
+        const dir_elems: usize = visits * hidden;
+        const plain_layout: bool = sf_abl.lookup_optional("attn_w") != null;
+
+        const dir_host = tiger.alloc_host_zeroed(f32, dir_elems);
+        defer tiger.free_host_slice(f32, dir_host);
+
+        var w_host: [constants.visit_count]f32 = @splat(0.0);
+        var c_host: [constants.visit_count]f32 = @splat(0.0);
+        var tau_host: [constants.visit_count]f32 = @splat(0.0);
+        var params_host: [constants.visit_count * 4]f32 = @splat(0.0);
+
+        var gate_val: [1]f32 = .{0.0};
+        if (!plain_layout) {
+            read_f32_or_bf16(sf_abl, "gate", &gate_val);
+        }
+        const floor_val: f32 = if (!plain_layout and gate_val[0] != 0.0) 0.0 else -std.math.floatMax(f32);
+
+        // Attention ablation
+        read_f32_or_bf16(sf_abl, "attn_dirs", dir_host);
+        normalize_rows_f32(dir_host, visits, hidden);
+        self.ablation.attn_dirs = self.arena.alloc_many(f32, dir_elems);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.attn_dirs.?), @ptrCast(dir_host.ptr), dir_elems * 4));
+
+        read_f32_or_bf16(sf_abl, if (plain_layout) "attn_w" else "attn_weight", &w_host);
+        if (plain_layout) @memset(&c_host, 0.0) else read_f32_or_bf16(sf_abl, "attn_offset", &c_host);
+        if (has_detectors) {
+            read_f32_or_bf16(sf_abl, "attn_det", dir_host);
+            self.ablation.attn_det = self.arena.alloc_many(f32, dir_elems);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.attn_det.?), @ptrCast(dir_host.ptr), dir_elems * 4));
+            read_f32_or_bf16(sf_abl, "attn_threshold", &tau_host);
+        } else {
+            @memset(&tau_host, 0.0);
+        }
+        for (0..visits) |v| {
+            self.ablation.attn_nonzero[v] = (w_host[v] != 0.0);
+            params_host[4 * v + 0] = w_host[v];
+            params_host[4 * v + 1] = c_host[v];
+            params_host[4 * v + 2] = floor_val;
+            params_host[4 * v + 3] = tau_host[v];
+        }
+        self.ablation.attn_params = self.arena.alloc_many(f32, visits * 4);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.attn_params.?), @ptrCast(&params_host), visits * 4 * 4));
+
+        // MLP ablation
+        read_f32_or_bf16(sf_abl, "mlp_dirs", dir_host);
+        normalize_rows_f32(dir_host, visits, hidden);
+        self.ablation.mlp_dirs = self.arena.alloc_many(f32, dir_elems);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.mlp_dirs.?), @ptrCast(dir_host.ptr), dir_elems * 4));
+
+        read_f32_or_bf16(sf_abl, if (plain_layout) "mlp_w" else "mlp_weight", &w_host);
+        if (plain_layout) @memset(&c_host, 0.0) else read_f32_or_bf16(sf_abl, "mlp_offset", &c_host);
+        if (has_detectors) {
+            read_f32_or_bf16(sf_abl, "mlp_det", dir_host);
+            self.ablation.mlp_det = self.arena.alloc_many(f32, dir_elems);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.mlp_det.?), @ptrCast(dir_host.ptr), dir_elems * 4));
+            read_f32_or_bf16(sf_abl, "mlp_threshold", &tau_host);
+        } else {
+            @memset(&tau_host, 0.0);
+        }
+        for (0..visits) |v| {
+            self.ablation.mlp_nonzero[v] = (w_host[v] != 0.0);
+            params_host[4 * v + 0] = w_host[v];
+            params_host[4 * v + 1] = c_host[v];
+            params_host[4 * v + 2] = floor_val;
+            params_host[4 * v + 3] = tau_host[v];
+        }
+        self.ablation.mlp_params = self.arena.alloc_many(f32, visits * 4);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(self.ablation.mlp_params.?), @ptrCast(&params_host), visits * 4 * 4));
+
+        self.ablation.active = true;
+        self.ablation.has_detectors = has_detectors;
+    }
 };
+
+fn read_f32_or_bf16(sf: *const safetensors.SafetensorsFile, name: []const u8, dst: []f32) void {
+    const info = sf.lookup(name);
+    const raw = sf.data_slice(info);
+    if (info.byte_length == dst.len * 4) {
+        for (0..dst.len) |i| {
+            const bits = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+            dst[i] = @bitCast(bits);
+        }
+    } else if (info.byte_length == dst.len * 2) {
+        for (0..dst.len) |i| {
+            const b16: u32 = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+            dst[i] = @bitCast(b16 << 16);
+        }
+    } else {
+        tiger.print_stderr("[ablation] Unexpected byte_length for {s}: got {d}, expected {d} or {d}\n", .{ name, info.byte_length, dst.len * 4, dst.len * 2 });
+        @panic("Invalid ablation tensor size");
+    }
+}
+
+fn normalize_rows_f32(buf: []f32, rows: usize, cols: usize) void {
+    for (0..rows) |r| {
+        const row = buf[r * cols .. (r + 1) * cols];
+        var ss: f64 = 0.0;
+        for (row) |v| {
+            const d: f64 = v;
+            ss += d * d;
+        }
+        const norm: f32 = @max(@as(f32, @floatCast(@sqrt(ss))), 1e-12);
+        for (row) |*v| v.* /= norm;
+    }
+}
 
 fn upload_raw(sf: *const safetensors.SafetensorsFile, name: []const u8, dst_dev: *anyopaque, expected_bytes: u64) void {
     const info = sf.lookup(name);
@@ -722,6 +877,8 @@ fn compute_total_vram_bytes(
     has_mtp: bool,
     has_pruned_draft_vocab: bool,
     draft_vocab_count: u32,
+    has_ablation: bool,
+    has_ablation_detectors: bool,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -840,6 +997,17 @@ fn compute_total_vram_bytes(
             total += constants.linear_weight_vram_bytes(2 * constants.mtp_intermediate_dim, constants.hidden_dim, mtp_kind);
             total += constants.linear_weight_vram_bytes(constants.hidden_dim, constants.mtp_intermediate_dim, mtp_kind);
             total += constants.linear_weight_vram_bytes(2 * constants.kv_dim, constants.hidden_dim, mtp_kind);
+        }
+    }
+
+    if (has_ablation) {
+        const dir_bytes: u64 = @as(u64, constants.visit_count) * constants.hidden_dim * 4;
+        const param_bytes: u64 = @as(u64, constants.visit_count) * 4 * 4;
+        // attn_dirs, attn_det?, attn_params, mlp_dirs, mlp_det?, mlp_params
+        total += 2 * tiger.align_up_u64(dir_bytes, a);
+        total += 2 * tiger.align_up_u64(param_bytes, a);
+        if (has_ablation_detectors) {
+            total += 2 * tiger.align_up_u64(dir_bytes, a);
         }
     }
 

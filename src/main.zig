@@ -29,12 +29,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var kv_str: []const u8 = "auto";
     var host: []const u8 = "0.0.0.0";
     var model_name: []const u8 = "inkling-2-mini";
+    var model_name_explicit: bool = false;
+    var ablation_path: []const u8 = "";
     var effort: []const u8 = "none";
     var api_key: []const u8 = "";
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
 
     var port: u16 = 8000;
-    var mtp: u32 = if (std.mem.eql(u8, command, "serve")) 3 else 0;
+    var mtp: u32 = if (std.mem.eql(u8, command, "serve")) 7 else 0;
+    var spec_threshold: f32 = 0.80;
     var max_tokens: u32 = 128;
     var runs: u32 = 6;
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
@@ -73,6 +76,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--model-name") and arg_i + 1 < argv.len) {
             arg_i += 1;
             model_name = std.mem.span(argv[arg_i]);
+            model_name_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--ablation") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            ablation_path = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--effort") and arg_i + 1 < argv.len) {
             arg_i += 1;
             effort = std.mem.span(argv[arg_i]);
@@ -82,6 +89,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--mtp") and arg_i + 1 < argv.len) {
             arg_i += 1;
             mtp = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--spec-threshold") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            spec_threshold = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.80;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
             max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
@@ -186,13 +196,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    if (ablation_path.len > 0 and !model_name_explicit) {
+        model_name = "inkling-2-mini-abliterated";
+    }
+
     var model_weights: weights_mod.ModelWeights = .{};
     const load_mtp: bool = (mtp > 0 or std.mem.eql(u8, command, "bench") or std.mem.eql(u8, command, "longctx") or std.mem.eql(u8, command, "serve"));
-    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host)) return 1;
+    if (!model_weights.load(model_directory, quant_mode, load_mtp, embed_on_host, ablation_path)) return 1;
     defer model_weights.deinit();
 
     var engine: engine_mod.Engine = .{};
     engine.init(&model_weights, ctx, use_graphs, kv_format);
+    engine.spec_threshold = spec_threshold;
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
@@ -377,9 +392,9 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 3] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 3] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
             "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
     );

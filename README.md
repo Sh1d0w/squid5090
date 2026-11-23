@@ -8,60 +8,63 @@
 
 `squid5090` is a **single-binary, zero-Python** TigerStyle Zig + CUDA engine (`zig-out/bin/squid5090`, built purely with `zig build`) that handles safetensors loading, tokenization, chat templating, GPU inference, and OpenAI-compatible HTTP/SSE serving in one process — zero PyTorch, zero vLLM, zero CMake/Make, zero Python wrappers, zero IPC:
 
-- **100% Native Blackwell GPU Hot Path (`cuda/`):** Implements every specialized Inkling-2-Mini architecture op directly in `sm_120a` CUDA (`cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** speculative decoding — all captured in persistent **CUDA Graphs** for decode, paired with **batched `B=512` Blackwell Tensor Core prefill** (cuBLAS FP16 TC dense/router/controller GEMMs, flat-tile grouped-GEMM NVFP4/MXFP8 Tensor Core MoE, and unified **Tensor Core FlashAttention prefill** hitting **~5,077 tok/s** at 11K and **~4,630 tok/s** sustained at 67.5K!).
-- **Multi-Checkpoint Host-RAM Prefix KV Cache & Side-Request Shield:** Keeps 4 host-RAM local-state checkpoints (`system_prefix`, 2K boundary, `prefill_end`, `decode_end` — **0 MiB extra VRAM**, ~953 MiB host RAM) plus a 4,096-token global-KV side-request shield so multi-turn coding harnesses (`omp`, Claude/OpenAI agents) reuse 10K–1M-token prefixes in **21–115 ms** (**100–800× faster**, verified at 82.5K tokens) without short title/classifier side requests evicting the active session.
-- **TigerStyle Systems Architecture (`src/`):** Written in [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) Zig with **243 always-on release assertions** (active even in `-Doptimize=fast`), `comptime` geometry invariants, strictly bounded loops, zero recursion, and **zero dynamic memory allocation post-`init()`**.
-- **Two-Pass Single-Arena VRAM Allocator:** Computes exact 256-byte-aligned VRAM requirements upfront and allocates the entire model & runtime in **2 contiguous `cudaMalloc` bump arenas** (1 for all 1,000 weight tensors + 1 for all 397 KV/runtime slices), verified by paired `arena.assert_exact_fill()` postconditions.
-- **Ultra-Fast Native Zig BPE Tokenizer & Chat Template:** Memory-maps `tokenizer.json` directly into flat open-addressed hash tables + a 1.20 MiB contiguous byte arena in **~130 ms**, encodes at **32.8M tokens/sec** with zero per-request `malloc`s and 100% exact token-for-token parity against Hugging Face `tokenizers`, and renders Inkling-2-Mini's full chat/tool template (`developer`/`system`/`user`/`assistant.tool_calls`/`tool` with `tool_call_id` resolution).
-- **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **22.68 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
+- **100% Native Blackwell GPU Hot Path (`cuda/`):** Implements every specialized Inkling-2-Mini architecture op directly in `sm_120a` CUDA (`cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`, **Programmatic Dependent Launch (PDL)** overlap, and register-permuted Tensor Core decode MoE & dense NVFP4 GEMVs) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** with **device-side adaptive `{2, 4, 8}` speculative verify via CUDA Graph Conditional Switch** (`cudaGraphCondTypeSwitch`) + overlapped next-round drafting — paired with **batched `B=2048` multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 2D-tiled short-conv + Tensor Core FlashAttention prefill** hitting **9,181 tok/s chunk peak** (**8,755 tok/s** at 20K, **7,742 tok/s** at 64K, **6,509 tok/s** at 131K!).
+- **Optional Runtime-Gated Directional Ablation (`--ablation`):** Supports optional 1.8 MB Fisher-LDA directional ablation safetensors (such as [`satellitedown/Inkling-2-Mini-abliterated-ingine`](https://huggingface.co/satellitedown/Inkling-2-Mini-abliterated-ingine)) fused directly into post-attention and post-MLP residual kernels in both decode and prefill — zero weight modification, zero divergence on harmless prompts, and **541.1 tok/s** code decode!
+- **Multi-Checkpoint Host-RAM Prefix KV Cache & Side-Request Shield:** Keeps 4 host-RAM local-state checkpoints (`system_prefix`, 2K boundary, `prefill_end`, `decode_end` — **0 MiB extra VRAM**, ~953 MiB host RAM) plus a 4,096-token global-KV side-request shield so multi-turn coding harnesses (`omp`, Claude/OpenAI agents) reuse 10K–1M-token prefixes in **21–72 ms** (**100–1,400× faster**, verified at 82.5K tokens) without short title/classifier side requests evicting the active session.
+- **TigerStyle Systems Architecture (`src/`):** Written in [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md) Zig with **243+ always-on release assertions** (active even in `-Doptimize=fast`), `comptime` geometry invariants, strictly bounded loops, zero recursion, and **zero dynamic memory allocation post-`init()`**.
+- **Two-Pass Single-Arena VRAM Allocator:** Computes exact 256-byte-aligned VRAM requirements upfront and allocates the entire model & runtime in **2 contiguous `cudaMalloc` bump arenas** (1 for all 1,000–1,006 weight/ablation tensors + 1 for all 399 KV/runtime slices), verified by paired `arena.assert_exact_fill()` postconditions.
+- **Ultra-Fast Native Zig BPE Tokenizer & Chat Template:** Memory-maps `tokenizer.json` directly into flat open-addressed hash tables + a 1.20 MiB contiguous byte arena in **~90–130 ms**, encodes at **32.8M tokens/sec** with zero per-request `malloc`s and 100% exact token-for-token parity against Hugging Face `tokenizers`, and renders Inkling-2-Mini's full chat/tool template (`developer`/`system`/`user`/`assistant.tool_calls`/`tool` with `tool_call_id` resolution).
+- **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **23.22 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
 - **Built-In Zero-Malloc OpenAI API Server (`squid5090 serve`):** Pure POSIX HTTP/1.1 + SSE server backed by static startup-allocated `ServerBuffers` — streams `content`, `reasoning_content`, and `delta.tool_calls` directly from the GPU callback to the socket with zero per-token heap allocation (and reports `usage.prompt_tokens_details.cached_tokens`), exposing `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and `/health`.
 
 ---
 
 ## Speedup Comparison: `squid5090` vs. RTX 5090 Inference Engines (`Inkling-2-Mini`)
 
-Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single **NVIDIA RTX 5090** (32 GiB GDDR7). `squid5090` numbers are **6-run medians** (512 generated tokens, coding prompt P1):
+Single-user (`c=1`) decode throughput, VRAM footprint, and context limits for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single **NVIDIA RTX 5090** (32 GiB GDDR7). `squid5090` numbers are **3-run medians** (1,024 generated tokens, coding prompt *"Write a Python LRU cache with tests."*, plus chat prompt *"Explain how hash maps handle collisions."*):
 
-| Inference Engine | Precision / Format | Native DSpark MTP | Decode Speed (`c=1`) | `squid5090` Speedup (`mtp=3`: **369.6 tok/s**) | `squid5090` Speedup (`mtp=0`: **243.8 tok/s**) | Max Context (32 GiB 5090) | VRAM Footprint | Source |
-|---|---|---|---:|---:|---:|---:|---|---|
-| **PyTorch / HF Transformers** | BF16 eager | No | ~10–15 tok/s | **~25–37×** | **~16–24×** | ~64K | >24 GiB | Roofline est. |
-| **Apple Silicon `nanoattention`** *(M3 Ultra ref)* | Q4 | No | ~39 tok/s | **~9.5×** | **~6.3×** | — | Unified | Inspiration ref |
-| **`squid5090` v0 Baseline** *(CUDA eager)* | `exact` (BF16+NVFP4/MXFP8) | No | **76.63 tok/s** | **4.82×** | **3.18×** | ~200K (`bf16`) | 18.76 GiB | **Measured (same 5090)** |
-| **Ollama** *(GGUF backend)* | GGUF 4-bit (`Q4`/`IQ4`) | No | ~90–97 tok/s | **~3.8–4.1×** | **~2.5–2.7×** | ~128K–256K | ~18–22 GiB | Published 5090 ref |
-| **`llama.cpp` / Unsloth** (`llama-server`) | GGUF (`IQ4_NL` / `UD-IQ4_XS`) | No | ~93–97 tok/s | **~3.8–4.0×** | **~2.5–2.6×** | ~256K | ~18–22 GiB | Published 5090 ref |
-| **vLLM** (`vllm serve`) | Native NVFP4/MXFP8 + FP8 KV | Yes | ~190–250 tok/s | **~1.5–1.9×** | **~1.0–1.3×** | ~256K–512K | ~22–28 GiB | Published ref *(Python overhead at `c=1`)* |
-| **SGLang** | Native NVFP4/MXFP8 + FP8 KV | Yes | ~250–350 tok/s | **~1.06–1.48×** | 0.70–0.98× | ~256K–512K | ~22–28 GiB | Published 5090 ref |
-| **Basalt** *(same RTX 5090, chat/coding)* | Native NVFP4 + Q8, `spec=8` | Yes | **261–325 tok/s** *(prose/chat: 287–350\*)* | **1.14–1.42×** | 0.75–0.93× | 262,144 (256K) | 22.9 GiB + **8.9 GiB RAM spill** | **Measured (same 5090)** |
-| **`squid5090` (Zig + CUDA, `mtp=0`)** | All-`nvfp4`, `fp8` KV, Graphed | Off (`mtp=0`) | **243.79 tok/s** *(max 244.0)* | — | 1.00× | **1,048,576 (1M)** | **14.92 GiB** (0 spill) | **Measured (6-run median)** |
-| **`squid5090` (Zig + CUDA, `mtp=3`)** | All-`nvfp4`, `fp8`/`q4` KV, Graphed | **On (`mtp=3`)** | **369.6 tok/s** *(peak 379.2 / 408.1 HTTP)* | **1.00×** | **1.52×** | **1,048,576 (1M)** | **14.85–14.92 GiB** (0 spill) | **Measured (6-run median)** |
+| Inference Engine | Precision / Format | Native DSpark MTP | Decode Speed (`c=1`) | `squid5090` Speedup (`mtp=7`: **585.9 tok/s**) | Max Context (32 GiB 5090) | VRAM Footprint | Source |
+|---|---|---|---:|---:|---:|---|---|
+| **PyTorch / HF Transformers** | BF16 eager | No | ~10–15 tok/s | **~39–59×** | ~64K | >24 GiB | Roofline est. |
+| **Ollama / `llama.cpp`** | GGUF (`IQ4_NL` / `UD-IQ4_XS`) | No | ~90–97 tok/s | **~6.0–6.5×** | ~256K | ~18–22 GiB | Published 5090 ref |
+| **vLLM** (`vllm serve`) | Native NVFP4/MXFP8 + FP8 KV | Yes | ~190–250 tok/s | **~2.3–3.1×** | ~256K–512K | ~22–28 GiB | Published ref *(Python overhead at `c=1`)* |
+| **SGLang** | Native NVFP4/MXFP8 + FP8 KV | Yes | ~250–350 tok/s | **~1.7–2.3×** | ~256K–512K | ~22–28 GiB | Published ref |
+| **Basalt** *(same RTX 5090)* | Native NVFP4 + Q8, `spec=8` | Yes | **261–325 tok/s** | **1.80–2.24×** | 262,144 (256K) | 22.9 GiB + **8.9 GiB RAM spill** | **Measured (same 5090)** |
+| **`ingine`** *(published same prompt)* | Native NVFP4 + Q8, switch `{2,4,8}` | **Adaptive `{2,4,8}`** | **561 tok/s** *(chat: 325)* | **1.04×** | 262,144 (256K) | ~18–22 GiB | Published 5090 ref |
+| **`squid5090` (`mtp=0`, PDL+TC)** | All-`nvfp4`, `q4` KV, Graphed | Off (`mtp=0`) | **259.0–262.8 tok/s** | — | **1,048,576 (1M)** | **15.59 GiB** (0 spill) | **Measured (3-run median)** |
+| **`squid5090` (`mtp=3`, PDL+TC)** | All-`nvfp4`, `q4` KV, Graphed | Fixed `B=4` | **470.2 tok/s** *(chat: 307.3)* | — | **1,048,576 (1M)** | **15.59 GiB** (0 spill) | **Measured (3-run median)** |
+| **`squid5090` (`mtp=7` + `--ablation`)** | All-`nvfp4` + 1.8 MB gated LDA | **Adaptive `{2,4,8}`** | **541.1 tok/s** (`acc=69.6%`) | — | **1,048,576 (1M)** | **15.59 GiB** (0 spill) | **Measured (3-run median)** |
+| **`squid5090` (`mtp=7` adaptive)** | All-`nvfp4`, `q4` KV, Switch Graph | **Adaptive `{2,4,8}`** | **585.9 tok/s** *(chat: **332.5**)* | **1.00×** | **1,048,576 (1M)** | **15.59 GiB** (0 spill) | **Measured (3-run median)** |
 
-*\*Methodology note: `llama.cpp` / Ollama / vLLM / SGLang rows reflect published RTX 5090 / community single-user numbers because GGUF runtimes do not support Inkling-2-Mini's native NVFP4 Blackwell PTX or DSpark MTP speculator, and Python-orchestrated servers (`vLLM` / `SGLang`) optimize primarily for batched multi-user throughput. Basalt was measured directly on the same RTX 5090 on general chat/coding prompts (**261–325 tok/s**); on highly repetitive structured/JSON outputs where draft acceptance approaches 100%, published Basalt runs reach ~613–645 tok/s. `squid5090` fits in **14.9 GiB VRAM with zero host-RAM spilling** (8 GiB less than Basalt) and scales to **4× Basalt's max context (1M tokens)**.*
+*Methodology note: `llama.cpp` / Ollama / vLLM / SGLang / `ingine` rows reflect published RTX 5090 single-user numbers (`ingine`'s published `561 tok/s` code / `325 tok/s` chat uses the exact same prompts). Basalt was measured directly on the same RTX 5090 on general chat/coding prompts (**261–325 tok/s**). `squid5090` runs in a single zero-Python Zig binary, fits in **15.6 GiB VRAM at 8K** (and **23.2 GiB at full 1M context**) with zero host-RAM spilling, and scales to **4× the max context (1M tokens)**.*
 
 ### `squid5090` Long-Context Scaling (Up to 1,048,576 Tokens on One RTX 5090)
 
 | Context Depth | Mode / KV Precision | Decode Speed (`c=1`) | Total VRAM (Weights + KV) | Notes |
 |---|---|---:|---:|---|
-| **Short context (P1, 512 tok)** | `nvfp4`, `mtp=3`, `fp8`/`q4` KV | **369.3–369.6 tok/s** *(peak 379.2)* | **14.85–14.92 GiB** | 6-run median, 2 `cudaMalloc` arenas |
-| **16K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **338.43 tok/s** *(prefill 17.9 s)* | **15.06 GiB** | Verbatim retrieval PASS |
-| **32K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **302.66 tok/s** *(prefill 36.3 s)* | **15.35 GiB** | Verbatim retrieval PASS |
-| **64K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **285.58 tok/s** *(prefill 75–84 s)* | **15.92 GiB** | Verbatim retrieval PASS |
-| **256K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **199.0–202.3 tok/s** *(`B=1`: 105–115)* | **17.2 GiB** | 0 host spill |
-| **512K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **151.4 tok/s** *(`B=1`: 72.7)* | **19.8 GiB** | 0 host spill |
-| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **100.6 tok/s** *(`B=1`: 46.3)* | **22.68 GiB** | Full 1M context in 22.7 GiB (0 host spill) |
+| **Short context (Code, 1,024 tok)** | `nvfp4`, adaptive `mtp=7`, `q4` KV | **585.9 tok/s** *(`acc=72.5%`, `dl=3.80`)* | **15.59 GiB** | 3-run median (`585.90–585.97`), 2 `cudaMalloc` arenas |
+| **Short context (Chat)** | `nvfp4`, adaptive `mtp=7`, `q4` KV | **332.5 tok/s** *(`acc=43.5%`, `dl=1.83`)* | **15.59 GiB** | Beats both `mtp=3` (307.3) & fixed `mtp=7` (270.1) |
+| **16K live HTTP/SSE** *(1M server)* | `nvfp4`, adaptive `mtp=7`, `q4` KV | **446.7 tok/s** *(warm prefill **71.9 ms**)* | **23.22 GiB** | 16,072 prompt (`16,033` cached), 1,600 gen tokens |
+| **64K real context** *(Needle PASS)* | `nvfp4`, adaptive `mtp=7`, `q4` KV | **317.6–331.0 tok/s** *(prefill **8.46 s** = 7,742 tok/s)* | **16.71 GiB** | Verbatim needle recall PASS (`B=2048` WGEMM) |
+| **131K real context** | `nvfp4`, adaptive `mtp=7`, `q4` KV | **236.4–284.8 tok/s** *(prefill **19.97 s** = 6,509 tok/s)* | **16.71 GiB** | Sustained >6.5K tok/s prefill at 130K tokens |
+| **256K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **228.1 tok/s** *(`B=1`: 119.8)* | **17.8 GiB** | 0 host spill |
+| **512K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **163.7 tok/s** *(`B=1`: 79.5)* | **20.4 GiB** | 0 host spill |
+| **1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **108.0 tok/s** *(`B=1`: 48.5)* | **23.22 GiB** | Full 1M context in 23.2 GiB (0 host spill) |
 
-### Real-World Multi-Turn Agent & Tool-Calling Latency (`omp` Workload, Live 1M Context)
+### Cold Prefill (`B=2048` WGEMM) & Live Multi-Turn Prefix Cache Latency (`ctx = 1,048,576`)
 
-Measured live against `squid5090 serve --mode nvfp4 --kv q4 --ctx 1048576 --mtp 3` with a ~10K–13K-token coding-agent system prompt + OpenAI `tools` + streaming SSE:
+Measured live with `B=2048` multi-stage `cp.async` `128×128×64` grouped MoE GEMM, 2D-tiled short-conv, and host-RAM prefix KV caching (`squid5090 serve --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --spec-threshold 0.80`):
 
-| Agent Turn | Prompt (`cached`) | Original Prefill | Current Prefill | End-to-End TTFT | Decode Speed | Speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| **Turn 1 — Cold 11.0K prompt** | 11,041 (`0`) | ~12,137 ms | **2,174.9 ms** *(5,077 tok/s)* | ~2,210 ms | **326.9–440.5 tok/s** | **5.6× faster cold** |
-| **Turn 2 — Warm tool result (`+89` tok)** | 10,253 (`10,164`) | ~11,400 ms | **86.3–115.0 ms** | **148.8 ms** | **348.6 tok/s** (`dl=2.57`) | **~100–130× faster** |
-| **Turn 3 — Interleaved side request (46 tok)** | 46 (`0`, shielded) | — | **45.8 ms** | **66.1 ms** | **403.3–485.4 tok/s** | **0 cache eviction** |
-| **Turn 4 — Resume 10.4K session post-side** | 10,350 (`10,253`) | ~11,500 ms | **89.5 ms** | **133.5 ms** | **328.0 tok/s** (`dl=2.38`) | **128× faster** |
-| **Turn 5 — Branched turn (shared sys+tools)** | 10,160 (`10,139`) | ~11,300 ms | **52.0 ms** | **99.6 ms** | **336.4 tok/s** (`dl=2.40`) | **217× faster** |
-| **Cold 67.5K Needle-in-a-Haystack (PASS)** | 67,555 (`0`) | ~74,000 ms | **14,569.5 ms** *(4,637 tok/s)* | — | **246.9 tok/s** (`dl=2.04`) | **5.1× faster cold** |
-| **Warm 82.5K turn (past 65K cap)** | 82,478 (`82,454`) | ~90,000 ms | **62.4 ms** | — | **237.5 tok/s** (`dl=2.14`) | **>1,400× faster** |
+| Workload / Turn | Prompt (`cached`) | Prefill Time | Prefill Throughput | Live Decode Speed | Notes |
+|---|---:|---:|---:|---:|---|
+| **Cold 20K prompt (`B=2048` chunk peak)** | 19,978 (`0`) | **2,281.9 ms** | **8,755 tok/s** *(9,181 chunk peak)* | **453.6 tok/s** | 1.72× faster than prior `B=512` prefill |
+| **Cold 64K Needle-in-a-Haystack (PASS)** | 65,530 (`0`) | **8,464.8 ms** | **7,742 tok/s** | **317.6 tok/s** | Verbatim needle recall PASS |
+| **Cold 131K prompt** | 129,984 (`0`) | **19,971.5 ms** | **6,509 tok/s** | **236.4 tok/s** | Sustained >6.5K tok/s across 130K tokens |
+| **Live 16.0K HTTP cold warm-up** | 16,039 (`0`) | **2,110.3 ms** | **7,600 tok/s** | **383.3 tok/s** | Full 1M-ctx server over HTTP SSE |
+| **Live 16.1K HTTP Turn 1 (warm prefix)** | 16,072 (`16,033`) | **71.9 ms** | — | **446.7 tok/s** (`dl=3.10`) | 107.4 ms end-to-end TTFT (1,600 gen tok) |
+| **Live 17.5K HTTP Turn 2 (+1,452 tok)** | 17,524 (`16,072`) | **260.1 ms** | — | **384.1 tok/s** (`dl=2.47`) | 307.9 ms end-to-end TTFT (1,100 gen tok) |
+| **Warm 82.5K turn (past 65K cap)** | 82,478 (`82,454`) | **62.4 ms** | — | **237.5 tok/s** | **>1,400× faster** than cold prefill |
+| **Interleaved side request (46 tok)** | 46 (`0`, shielded) | **45.8 ms** | — | **403–485 tok/s** | **0 cache eviction** (4K global KV shield) |
 
 ---
 
@@ -126,16 +129,16 @@ Expected files inside `<MODEL_DIR>`:
 Every subcommand takes `<MODEL_DIR>` as its **first positional argument**:
 
 ```bash
-# Start the native Zig OpenAI API server directly:
-./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
+# Start the native Zig OpenAI API server directly (adaptive {2,4,8} speculative verify):
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --spec-threshold 0.80
 
-# Or build & launch directly via `zig build`:
-zig build serve -- /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
+# Or with optional 1.8 MB runtime-gated Fisher-LDA ablation:
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --ablation /opt/models/inkling-2-mini/inkling-2-mini-abliterated.safetensors
 
 # One-shot native CLI generation:
 ./zig-out/bin/squid5090 generate /opt/models/inkling-2-mini \
-  --prompt "Write a Python binary search function with type hints." \
-  --mode nvfp4 --mtp 3 --max-tokens 512
+  --prompt "Write a Python LRU cache with tests." \
+  --mode nvfp4 --mtp 7 --spec-threshold 0.80 --max-tokens 1024
 ```
 
 ### 4. Run the OpenAI-Compatible HTTP/SSE API Server
@@ -240,7 +243,9 @@ zig build run -- tokenize /opt/models/inkling-2-mini --prompt "Hello, world!"
 |---|---|---|
 | `--mode` | `exact` \| `fp8` \| `nvfp4` | Weight precision (`nvfp4` quantizes dense/LM-head/L20–23 experts on load in ~2.15 s) |
 | `--kv` | `auto` \| `bf16` \| `fp8` \| `q4` | Global KV cache format (`auto`: `bf16` for `exact`, `fp8` up to 448K, `q4` above 448K) |
-| `--mtp` | `0..7` | Built-in DSpark MTP draft count (`0` = autoregressive, `3` = best all-around throughput) |
+| `--mtp` | `0..7` | Built-in DSpark MTP draft count (`0` = autoregressive, `7` = adaptive `{2, 4, 8}` switch verify, default for `serve`) |
+| `--spec-threshold` | float (`0.80` default) | Markov confidence threshold for adaptive `{2, 4, 8}` verify (`0.0` forces fixed `B=8`) |
+| `--ablation` | file path | Optional 1.8 MB runtime-gated Fisher-LDA ablation `.safetensors` (fused into decode & prefill; auto-sets model name to `inkling-2-mini-abliterated`) |
 | `--ctx` | integer (up to `1048576`) | Maximum context window to allocate |
 | `--embed-host` | flag | Pin BF16 embedding table (0.86 GiB) in zero-copy mapped host RAM (auto-enabled `>512K`) |
 | `--no-graph` | flag | Disable CUDA Graph capture (for debugging) |
@@ -286,6 +291,16 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 | **Lever 6 — Zero-`atomicAdd` Deterministic MoE + Global Mega-Fusion** | Replaced non-deterministic `atomicAdd` in `moe_down` with quarter-warp (`8 threads/row`) per-slot writes `[B, 8, 2304]` reduced inline (**91% peak BW** + **100% bitwise parity** across runs & `mtp=0..5`); fused all 5 global sconv/clip/store ops into `mega_global_sconv_prep_store`. | `nvfp4 mtp=3`: **372.80 tok/s** (100% deterministic) |
 | **Lever 7A–7C — 1M Context + Unified Blackwell Tensor Core Split-K** | Added `--kv fp8` (up to 432K) and `--kv q4` (group-64 INT4 + 2-op exact FP16 magic-bias nibble unpack) + zero-copy host-pinned `embed` (**full 1,048,576 context in 22.47 GiB**). Replaced scalar attention across **all 48 visits + DSpark global layer 1** with Blackwell FP16 Tensor Core (`m16n8k16` + `ldmatrix.x4` + `ldmatrix.x2.trans`) Split-K FlashDecoding + captured `prefill_b8_graph_exec`. | `nvfp4 mtp=0`: **243.79 tok/s**; **16K real: `145.7 → 338.4 tok/s` (2.32×!)**; **64K real: 285.6 tok/s**; **256K: 202.3 tok/s**; **1M: 100.6 tok/s** |
 | **Lever 8 — TigerStyle Zig Consolidation** | Rewrote the entire host engine, tokenizer, VRAM arena allocator, and OpenAI HTTP/SSE server in TigerStyle Zig with `build.zig`, eliminating CMake/Make/C++ host code and all per-request heap allocations. | Tokenizer load **1.84× faster**, **32.8M tok/s** BPE encode, **2** `cudaMalloc` arenas, **zero-malloc SSE** |
+| **Lever 9 — Blackwell PDL + TC `mma.m16n8k16` Decode MoE & Dense GEMVs** | Added Blackwell Programmatic Dependent Launch (`cudaLaunchAttributeProgrammaticStreamSerialization` + `pdl_wait_fenced`) across decode kernels and replaced CUDA-core MoE/multi-token GEMVs with register-permuted Tensor Core `mma.m16n8k16` (`moe_up_tc`, 144-CTA fused `moe_down_tc`, `qkvrg_fused_mma`, `linear_nvfp4_mma`, `lm_head_mma`). | `mtp=0`: **243.8 → 262.8 tok/s**; `mtp=3`: **369.6 → 470.2 tok/s** (code) |
+| **Lever 10 — Adaptive `{2, 4, 8}` Switch Graph + Overlapped Drafting** | Added online softmax confidence scoring in the DSpark Markov head, device-side `{2, 4, 8}` branch selection via CUDA 13.1 Graph Conditional Switch (`cudaGraphCondTypeSwitch`), and next-round draft overlap during host D2H/SSE sync. | **Code: `585.9 tok/s`** (`acc=72.5%`, `dl=3.80`); **Chat: `332.5 tok/s`**; **16K live HTTP: `446.7 tok/s`** |
+| **Lever 11 — `128×128×64` Multi-Stage `cp.async` Prefill MoE + 2D-Tiled Short Conv** | Replaced `B=512` prefill MoE with `B=2048` multi-stage `cp.async` Blackwell WGEMM (`cvt.rn.f16x2.e2m1x2` + FP16 MMA) and parallelized the 4-tap FIR short-conv across 32-token time tiles (`576 CTAs` vs `9`). | **Chunk peak: `9,181 tok/s`**; **20K: `8,755 tok/s`**; **64K Needle PASS: `7,742 tok/s`**; **131K: `6,509 tok/s`** |
+| **Lever 12 — Runtime-Gated Fisher-LDA Ablation (`--ablation`)** | Fused optional 1.8 MB directional ablation tensors into post-attention and post-MLP residual kernels in both decode and prefill inside the single weight `VRAMArena`. | **0 divergence** on harmless prompts, **541.1 tok/s** ablated code decode |
+
+---
+
+## Attribution & License
+
+See [`NOTICE`](NOTICE) for full Apache-2.0 attributions, including kernel designs and runtime-gated ablation schema adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0) and the [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) architecture specification.
 
 ---
 

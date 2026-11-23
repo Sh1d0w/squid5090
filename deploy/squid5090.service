@@ -10,16 +10,19 @@ Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64"
 # Optional: require Authorization: Bearer <key>
 # Environment="SQUID_API_KEY=your-secret-key"
 
-# Default: full 1M (1,048,576) context with Q4 KV + auto zero-copy host-pinned embed (~22.5 GiB VRAM).
-# For 256K FP8 KV (~19.4 GiB VRAM): --kv fp8 --ctx 262144
-# For  64K FP8 KV (~15.9 GiB VRAM): --kv fp8 --ctx 65536
+# Default: full 1M (1,048,576) context with Q4 KV + auto zero-copy host-pinned embed (~23.2 GiB VRAM)
+# and adaptive {2, 4, 8} DSpark speculative verify via CUDA Graph conditional switch.
+# For 256K FP8 KV (~20.1 GiB VRAM): --kv fp8 --ctx 262144
+# For  64K FP8 KV (~16.6 GiB VRAM): --kv fp8 --ctx 65536
+# Optional runtime-gated Fisher-LDA ablation: --ablation /opt/models/inkling-2-mini/inkling-2-mini-abliterated.safetensors
 ExecStart=/opt/squid5090/zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
     --host 0.0.0.0 \
     --port 8000 \
     --mode nvfp4 \
     --kv q4 \
     --ctx 1048576 \
-    --mtp 3
+    --mtp 7 \
+    --spec-threshold 0.80
 
 Restart=on-failure
 RestartSec=3

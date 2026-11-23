@@ -344,6 +344,9 @@ void launch_mega_mlp_post_next_depth_norm(
     int n_out,
     int B,
     const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -379,6 +382,9 @@ void launch_mega_attn_post_mlp_in(
     float* mlp_out,            // [B, HIDDEN]
     __half* mlp_out_h,         // optional [B, HIDDEN]
     int B, const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // MEGA-FUSION 4: mlp_sconv + residual add -> hidden (supports deterministic 8-slot reduction when B>1!)
@@ -390,6 +396,9 @@ void launch_mega_mlp_post_res(
     const float* residual,
     float* hidden_out,
     int B, const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 // Simple vector ops
@@ -432,6 +441,7 @@ void launch_dspark_draft(
     const float* f_ring,           // [16, HIDDEN], reads (pos - 1) & 15
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
+    float* out_draft_conf,         // optional [num_drafts] max softmax probability
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
@@ -473,6 +483,9 @@ void launch_prefill_sconv_post_res(
     int is_boundary,
     int B,
     const int32_t* d_pos,
+    const float* abl_r,
+    const float* abl_d,
+    const float* abl_p,
     cudaStream_t stream);
 
 void launch_prefill_copy_taps(
@@ -578,6 +591,7 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* sorted_tok,
     const int32_t* sorted_slot,
     __half* out_act_h,
+    int B,
     cudaStream_t stream);
 
 void launch_prefill_moe_down_h(
@@ -588,6 +602,7 @@ void launch_prefill_moe_down_h(
     const int32_t* sorted_slot,
     const float* sorted_w,
     float* out_slots,
+    int B,
     cudaStream_t stream);
 
 } // namespace squid
