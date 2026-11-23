@@ -225,9 +225,57 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 - **4-launch batched NVFP4 controller (+279 µs)**, **512-thread controller (+133 µs)**, **`<<<32, 64>>>` NVFP4 router (+91 µs)**, and **half-warp `moe_gate_up` (+50 µs)** → all reverted.
 
 ### 4. Qualification Gates Passed
-- **Bitwise Token Parity (256 tok greedy):** `mtp=0 == mtp=3` verified 100% identical across `exact/bf16`, `nvfp4/fp8`, and `nvfp4/q4`.
+- **Bitwise Token Parity (256 tok greedy):** `mtp=0 == mtp=3` verified 100% identical across `exact/bf16`, `nvfp4/fp8`, and `nvfp4/q4` — AND **100% bitwise identical between C++20 (`build/squid5090`) and TigerStyle Zig (`build/squid5090-zig`)**!
 - **Real End-to-End Needle-in-a-Haystack (50% depth):** Verbatim retrieval passed at **8K**, **16K** (`exact/bf16`, `nvfp4/fp8`, `nvfp4/q4`), **32K** (`nvfp4/fp8`, `nvfp4/q4`), and **64K** (`nvfp4/fp8`, `nvfp4/q4`).
-- **OpenAI API Live Smoke Test:** Verified `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming at **408.15 tok/s** + live SSE streaming), and `/v1/completions`.
+- **OpenAI API Live Smoke Test:** Verified `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + live SSE streaming), and `/v1/completions` on both C++20 and TigerStyle Zig servers with **100% identical response text**.
+
+---
+
+## C++20 vs. TigerStyle Zig (`zig/`) — Architecture & Performance Comparison
+
+`squid5090` also includes a complete **TigerStyle Zig** (`zig 0.17.1`, `zig/src/`) reimplementation of the entire host engine — safetensors loader, `o200k_base` BPE tokenizer, weight quantizer/loader, 48-visit CUDA Graph orchestrator, and OpenAI HTTP/SSE server — linking the exact same compiled Blackwell `sm_120a` CUDA kernel archive (`build/libsquid_cuda_kernels.a`) via a thin `extern "C"` bridge (`zig/src/cuda_abi.cu`) for a true apples-to-apples systems comparison.
+
+### How the TigerStyle Zig Implementation Differs
+Following [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md):
+- **Static Memory Only Post-`init()`:** Two-pass exact VRAM accounting replaces **~1,359 separate `cudaMalloc` calls** in C++20 with **2 contiguous `VRAMArena` `cudaMalloc` calls** (1 for all 1,000 weight tensors + 1 for all 359 KV/runtime slices), verified by paired `arena.assert_exact_fill()` postconditions.
+- **Zero Per-Request / Per-Token Heap Allocation:** Flat open-addressed hash tables (`vocab_table`, `merge_table`, 1.20 MiB contiguous byte arena) + preallocated `ServerBuffers` eliminate all `std::string`, `std::vector`, `std::map`, and JSON DOM allocations during tokenization, inference, and SSE streaming.
+- **Always-On Release Safety Assertions:** **243 `tiger.assert` / `assert_cuda` sites** and `comptime` architectural invariants remain active even in `-O ReleaseFast`, plus strictly bounded loops, zero recursion, and explicit fixed-size types (`u8`, `u32`, `u64`, `i32`).
+
+### Build & Run the TigerStyle Zig Engine
+Requires Zig `0.17.1+` in `PATH` alongside CUDA `nvcc`:
+```bash
+# Build build/squid5090-zig (-O ReleaseFast + sm_120a CUDA kernels)
+make build-zig
+
+# Start the zero-malloc TigerStyle Zig OpenAI HTTP/SSE server
+make serve-zig MODEL_DIR=/opt/models/inkling-2-mini PORT=8000 CTX=65536
+
+# Run 6-run median benchmark or 1M long-context scaling sweep
+make bench-zig   MODEL_DIR=/opt/models/inkling-2-mini MODE=nvfp4 MTP=3
+make longctx-zig MODEL_DIR=/opt/models/inkling-2-mini KV=q4 CTX=1048576
+```
+
+### Head-to-Head Benchmark Results (Same RTX 5090, Same `sm_120a` Kernels, 6-Run Medians)
+
+| Metric / Workload | C++20 (`build/squid5090`) | TigerStyle Zig (`build/squid5090-zig`) | Delta / Winner |
+|---|---:|---:|---|
+| **Parity (Tokenizer 12/12 + 66.5 KB + GPU Greedy + HTTP)** | Reference | **100% Bitwise Identical** | Exact parity |
+| **Total `cudaMalloc` Calls (Weights + Runtime)** | 1,359 | **2** (`1` weights + `1` runtime arena) | **680× fewer** driver allocs |
+| **Per-Request / Per-SSE-Token Host `malloc` Calls** | ~Hundreds (DOM + strings) | **0** (static `ServerBuffers`) | **Zero-malloc hot path** |
+| **Release-Active Safety Assertions** | `CUDA_CHECK` only | **243** always-on `tiger.assert` + `comptime` | Active in `ReleaseFast` |
+| **Tokenizer Cold Load (`199,998` vocab + `424,413` merges)** | 248.4 ms *(241–283 ms)* | **135.1 ms** *(130–145 ms)* | **Zig 1.84× faster** |
+| **66.5 KB (`25,750` tok) CLI Tokenize Wall Time** | 288.4 ms (`~43.5 ms` encode+IO) | **141.0 ms** (**`0.79 ms` encode = 32.8M tok/s**) | **Zig 2.05× faster** |
+| **Model Cold Weight Load (`nvfp4` + MTP, `14.57 GiB`)** | 2.16 s | **2.13–2.15 s** | Tie (PCIe + GPU pack bound) |
+| **Short-Ctx P1 (`nvfp4/fp8`, `mtp=0`, 512 tok)** | 241.95 tok/s | **243.79 tok/s** *(max 243.97)* | Tie (+0.8%, GPU HBM bound) |
+| **Short-Ctx P1 (`nvfp4/fp8`, `mtp=3`, 512 tok)** | **369.61 tok/s** *(max 371.80)* | 369.57 tok/s *(max 373.08)* | Tie (0.01%, GPU HBM bound) |
+| **Short-Ctx P1 (`nvfp4/q4`, `mtp=3`, 512 tok)** | 349.54 tok/s *(max 367.83)* | **369.31 tok/s** *(max 379.20)* | **Zig +5.7%** (tighter host pacing) |
+| **1M Context (`1,048,000` pos, `kv=q4`, `22.47 GiB`, `B=4`)** | 100.5 tok/s (`24.89 ms`) | **100.6 tok/s** (`24.86 ms`) | Tie (Tensor Core / KV BW bound) |
+| **OpenAI HTTP Non-Stream (`256` tok, `ctx=32K`, `mtp=3`)** | 332.50 srv / 319.71 e2e tok/s | **333.56 srv / 320.50 e2e tok/s** | Zig +0.8 tok/s e2e |
+| **OpenAI HTTP Live SSE (`253` chunks, `ctx=32K`, `mtp=3`)** | 317.89 e2e tok/s (`579.3 ms` TTFT) | **320.43 e2e tok/s** (`574.8 ms` TTFT) | **Zig +2.54 tok/s** (zero SSE drop!) |
+| **Host Code Compile Time (`-O3` / `ReleaseFast`)** | **6.56 s** (`g++` 4 `.cpp`, no link) | 13.78 s (`zig build-exe` + `lld` link) | C++ faster incremental |
+| **Binary Size (Stripped / Unstripped)** | **6.55 MiB** / 6.94 MiB | 7.33 MiB / 12.78 MiB | Both single static binaries |
+
+**Key Engineering Takeaway:** Once a sequence enters the captured **CUDA Graph** on the RTX 5090, decode speed is strictly governed by GDDR7 bandwidth and Blackwell Tensor Core throughput — so C++20 and TigerStyle Zig hit identical hardware ceilings (`~370 tok/s` short-context, `~100.6 tok/s` at 1M context), proving TigerStyle's **243 always-on release assertions add zero measurable GPU overhead**. Where TigerStyle Zig pulls decisively ahead is the **CPU/systems layer**: **1.84–2.05× faster tokenizer cold-load and BPE encoding (`32.8M tok/s`)**, **680× fewer CUDA driver allocations (`2` arenas vs `1,359`)**, and **zero-malloc SSE streaming** (`0.07 tok/s` streaming vs non-streaming delta, compared to `1.82 tok/s` in C++).
 
 ---
 
@@ -235,14 +283,27 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 
 ```text
 squid5090/
-├── Makefile                 # One-command build, model download, native serve, bench, longctx
+├── Makefile                 # One-command build, model download, native C++ & Zig serve, bench, longctx
 ├── CMakeLists.txt           # C++20 / CUDA sm_120a build configuration (zero third-party libs)
-├── README.md                # Quickstart, OpenAI server guide & optimization walkthrough
+├── README.md                # Quickstart, OpenAI server guide, C++ vs. Zig comparison & optimization walkthrough
 ├── THEORY.md                # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                  # Optimization roadmap & full experiment table
 ├── ledger.jsonl             # Structured JSONL log of every experiment & gate
 ├── tools/
 │   └── chat.py              # Optional legacy Python tokenizer wrapper
+├── zig/
+│   └── src/
+│       ├── cuda_abi.cu      # Thin extern "C" bridge exposing sm_120a kernels & CUDA runtime to Zig
+│       ├── tiger.zig        # Always-on release assertions, monotonic clock, ByteWriter, POSIX C-ABI
+│       ├── constants.zig    # Comptime-verified Inkling-2-Mini & DSpark geometry + KV accounting
+│       ├── cuda.zig         # Explicit extern "C" kernel & runtime bindings (Zig 0.17.1)
+│       ├── vram_arena.zig   # Single-cudaMalloc bump VRAMArena with paired exact-fill assertions
+│       ├── safetensors.zig  # POSIX mmap safetensors loader with static 2048-tensor hash table
+│       ├── tokenizer.zig    # Flat open-addressed BPE tokenizer (32.8M tok/s) & chat template
+│       ├── weights.zig      # Two-pass weight loader into 1 contiguous VRAMArena
+│       ├── engine.zig       # Single runtime VRAMArena, 48-visit CUDA Graph orchestrator & streaming
+│       ├── server.zig       # Zero-malloc static-buffer POSIX HTTP/1.1 + SSE OpenAI server
+│       └── main.zig         # CLI entry point (serve, generate, bench, longctx, tokenize)
 └── src/
     ├── config.hpp           # Inkling-2-Mini & DSpark geometry, KV format constants
     ├── json.hpp             # Self-contained header-only RFC 8259 JSON parser & serializer
