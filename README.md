@@ -180,7 +180,25 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-### 5. Run Benchmarks, Long-Context Sweeps & Tokenization
+### 5. Run Persistently as a `systemd` Service
+
+A ready-to-use `systemd` unit is provided at [`deploy/squid5090.service`](deploy/squid5090.service). `squid5090 serve` traps `SIGTERM` and `SIGINT` for graceful shutdown and clean VRAM release:
+
+```bash
+# Install and start on boot (edit paths/flags in the unit file first if needed)
+sudo cp deploy/squid5090.service /etc/systemd/system/squid5090.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now squid5090.service
+
+# Start / stop / restart / inspect
+sudo systemctl start squid5090
+sudo systemctl stop squid5090
+sudo systemctl restart squid5090
+sudo systemctl status squid5090
+journalctl -u squid5090 -f -n 100
+```
+
+### 6. Run Benchmarks, Long-Context Sweeps & Tokenization
 
 ```bash
 # 6-run median benchmark (512 tokens)
@@ -259,6 +277,8 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 ```text
 squid5090/
 ├── build.zig                 # Native Zig build system (parallel cached nvcc sm_120a + Zig ReleaseFast)
+├── deploy/
+│   └── squid5090.service     # Persistent systemd service unit for the OpenAI API server
 ├── README.md                 # Quickstart, OpenAI server guide & optimization walkthrough
 ├── THEORY.md                 # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                   # Optimization roadmap & full experiment table
