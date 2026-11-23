@@ -2,6 +2,8 @@
 
 **A custom, zero-dependency TigerStyle Zig + Blackwell CUDA (`sm_120a`) inference engine and OpenAI-compatible API server for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) — engineered for maximum single-user (`c=1`) decode tokens/sec and up to `1,048,576` (1M) context on a single NVIDIA RTX 5090.**
 
+![squid5090 RTX 5090 Benchmark & 1M Context Scaling](assets/benchmark.png)
+
 ## What This Repo Does
 
 `squid5090` is a **single-binary, zero-Python** TigerStyle Zig + CUDA engine (`zig-out/bin/squid5090`, built purely with `zig build`) that handles safetensors loading, tokenization, chat templating, GPU inference, and OpenAI-compatible HTTP/SSE serving in one process — zero PyTorch, zero vLLM, zero CMake/Make, zero Python wrappers, zero IPC:
