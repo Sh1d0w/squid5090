@@ -1,0 +1,5 @@
+# Minimal Python dependencies for tools/server.py, tools/chat.py, and model downloads.
+# Note: build/squid5090 itself has ZERO Python/PyTorch/vLLM dependencies.
+tokenizers>=0.20.0
+jinja2>=3.1.0
+huggingface_hub>=0.25.0

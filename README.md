@@ -1,0 +1,269 @@
+# squid5090
+
+**A custom, zero-dependency native C++/CUDA (`sm_120a` Blackwell) inference engine and OpenAI-compatible API server for [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) — engineered for maximum single-user (`c=1`) decode tokens/sec and up to `1,048,576` (1M) context on a single NVIDIA RTX 5090.**
+
+## What This Repo Does
+
+`squid5090` replaces heavy Python/PyTorch/vLLM inference stacks with a dedicated, hand-tuned native C++/CUDA binary (`build/squid5090`) and a lightweight OpenAI-compatible HTTP/SSE server (`tools/server.py`):
+
+- **100% Native GPU Hot Path:** Implements every specialized Inkling-2-Mini architecture op directly in CUDA (`sm_120a` PTX `cvt.rn.f16x2.e2m1x2`, `mma.sync.aligned.m16n8k16`, `ldmatrix.x4` / `ldmatrix.x2.trans`) — 48 logical visits (3× looped core), AttnRes depth-attention, cross-pass controllers, static + dynamic short convolutions, L2 Q/K/R clipping, relative-bias GQA with sinks, top-8 MoE, and built-in **DSpark MTP** speculative decoding — all captured in persistent **CUDA Graphs**.
+- **Load-Time Quantization & Static VRAM Arena:** Loads the official `safetensors` directly to VRAM in ~2.15 s with zero pre-conversion step, supporting `exact` (official BF16 + NVFP4/MXFP8), `fp8`, and `nvfp4` (all-linear NVFP4, **15.05 GiB** total VRAM, zero host-RAM spilling).
+- **1M-Token Context on One RTX 5090:** Combines Inkling-2-Mini's hybrid SWA/global layout (only 8 global visits) with `--kv fp8` (up to **432K** context) and `--kv q4` + zero-copy mapped host embeddings (full **1,048,576** context in **22.47 GiB** VRAM) plus unified Tensor Core Split-K FlashDecoding.
+- **Drop-In OpenAI API Server:** Exposes `/v1/chat/completions` (streaming SSE + non-streaming, `reasoning_content` parsing, tool calling), `/v1/completions`, `/v1/models`, and `/health` so any agent framework, UI, or eval harness integrates out of the box.
+
+---
+
+## Baseline vs. `squid5090` Inference Speed (NVIDIA RTX 5090)
+
+All `squid5090` short-context numbers are **6-run medians** (512 generated tokens, `c=1`) measured on an RTX 5090 with **23.43 GiB free VRAM** alongside Frigate (`~8.1 GiB`):
+
+| Engine / Stage | Mode / Precision | Decode Speed (`c=1`) | Max Context (23.4 GiB free) | VRAM (+ Host Spill) | Speedup vs. Baselines |
+|---|---|---:|---:|---:|---|
+| **Naive PyTorch / HF BF16** *(est. roofline)* | BF16 eager | ~10–15 tok/s | ~64K | >24 GiB | — |
+| **Apple Silicon `nanoattention`** *(inspiration ref)* | Q4 on M3 Ultra | ~39 tok/s | — | Unified | — |
+| **`squid5090` v0 Baseline** *(native CUDA eager)* | `exact`, `mtp=0`, no graph | **76.63 tok/s** | ~200K (`bf16` KV) | 18.76 GiB | 1.00× (v0 baseline) |
+| **CT 107 Basalt** *(same RTX 5090 ref)* | NVFP4+Q8, `spec=8` | **~261–325 tok/s** | 262,144 (256K) | 22.9 GiB + **8.9 GiB RAM spill** | 3.4–4.2× vs. v0 |
+| **`squid5090` (non-speculative)** | `nvfp4`, `mtp=0`, `fp8` KV | **239.41 tok/s** *(max 243.4)* | **1,048,576 (1M)** | **15.06 GiB** (0 spill) | **3.12×** vs. v0 (no MTP!) |
+| **`squid5090` (short-context, coding P1)** | `nvfp4`, `mtp=3`, `q4`/`fp8` KV | **368.6–372.8 tok/s** *(peak 408.2)* | **1,048,576 (1M)** | **14.9–15.1 GiB** (0 spill) | **4.86×** vs. v0, **~25–37×** vs. HF |
+| **`squid5090` @ 16K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **338.43 tok/s** *(prefill 17.9 s)* | 442,368 (FP8) | **15.06 GiB** | **2.32×** vs. `v6` @ 16K |
+| **`squid5090` @ 32K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **302.66 tok/s** *(prefill 36.3 s)* | 442,368 (FP8) | **15.35 GiB** | Verbatim retrieval PASS |
+| **`squid5090` @ 64K real context** *(Needle PASS)* | `nvfp4`, `mtp=3`, `fp8` KV | **285.58 tok/s** *(prefill 75–84 s)* | 442,368 (FP8) | **15.92 GiB** | Verbatim retrieval PASS |
+| **`squid5090` @ 256K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **202.3 tok/s** *(`B=1`: 109.8)* | **1,048,576 (1M)** | **17.2 GiB** (256K) | 0 spill |
+| **`squid5090` @ 512K** *(graphed `longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **144.4 tok/s** *(`B=1`: 75.9)* | **1,048,576 (1M)** | **19.8 GiB** (512K) | 0 spill |
+| **`squid5090` @ 1M (`1,048,000`)** *(`longctx`)* | `nvfp4`, `B=4 @dl=2.5`, `q4` KV | **96.1 tok/s** *(`B=1`: 45.0)* | **1,048,576 (1M)** | **22.47 GiB** (1M) | **4× Basalt max context** |
+
+---
+
+## Dependencies Needed to Build & Run
+
+### Hardware & Drivers
+- **GPU:** NVIDIA Blackwell GPU (`sm_120a`, e.g. RTX 5090) with ≥ 16 GiB free VRAM (≥ 22.5 GiB free for full 1M context).
+- **NVIDIA Driver:** 580+ (tested on `590.48.01`).
+- **CUDA Toolkit:** CUDA 13.0+ with `nvcc` and `cuBLAS` (tested on CUDA `13.1`).
+
+### System Packages (Debian / Ubuntu)
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  build-essential cmake make git curl python3 python3-venv
+```
+*(Ensure CUDA Toolkit is installed so `/usr/local/cuda/bin/nvcc` is available — `Makefile` automatically prepends `/usr/local/cuda/bin` to `PATH`.)*
+
+### Python Packages (only for `tools/server.py`, `tools/chat.py`, and model downloads)
+Listed in [requirements.txt](requirements.txt) and installed automatically by `make venv`:
+- `tokenizers>=0.20.0`
+- `jinja2>=3.1.0`
+- `huggingface_hub>=0.25.0`
+
+*(The compiled `build/squid5090` engine itself links only against `libcudart` and `libcublas` — zero Python/PyTorch dependencies.)*
+
+---
+
+## Quickstart (Build, Download Model, Point Binary, and Run)
+
+### 1. Clone & Build (`Makefile` or `CMake`)
+```bash
+git clone git@github.com:tensorfish/squid5090.git
+cd squid5090
+
+# Build the C++/CUDA binary (build/squid5090) + set up Python .venv
+make build
+make venv
+```
+Or build directly with CMake:
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCUDA_ARCH=120a
+cmake --build build -j $(nproc)
+```
+Run `make help` to see all targets and override variables.
+
+### 2. Download the Model & Where to Put It
+
+Download [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (~20.2 GB total) into any local directory (default `./models/inkling-2-mini`, or e.g. `/opt/models/inkling-2-mini`):
+
+```bash
+# Default location: ./models/inkling-2-mini
+make download
+
+# Or specify a custom directory:
+make download MODEL_DIR=/opt/models/inkling-2-mini
+```
+*(Or using Hugging Face CLI directly: `huggingface-cli download thinkingmachines/Inkling-2-Mini --local-dir /opt/models/inkling-2-mini`.)*
+
+Expected files inside `<MODEL_DIR>`:
+```text
+<MODEL_DIR>/
+├── model-00001-of-00001.safetensors   # Main Inkling-2-Mini weights (~19.5 GB)
+├── mtp.safetensors                    # Built-in DSpark MTP drafter weights (~0.64 GB)
+├── tokenizer.json                     # BPE tokenizer
+├── chat_template.jinja                # Official Inkling-2-Mini chat & tool template
+├── config.json                        # Model config
+└── draft_vocab_32k.bin                # (Optional) Pruned 32K draft vocab IDs for faster MTP
+```
+
+### 3. How to Point the Binary & Server to Your Model
+
+Every command takes `<MODEL_DIR>` as its **first positional argument** (or `MODEL_DIR=...` when using `make`):
+
+```bash
+# Via Makefile (pass MODEL_DIR=/your/path if not using ./models/inkling-2-mini):
+make serve MODEL_DIR=/opt/models/inkling-2-mini PORT=8000 CTX=65536
+
+# Via OpenAI API server directly:
+.venv/bin/python tools/server.py /opt/models/inkling-2-mini --port 8000 --mode nvfp4 --kv fp8 --ctx 65536 --mtp 3
+
+# Via standalone CLI wrapper directly:
+.venv/bin/python tools/chat.py /opt/models/inkling-2-mini "Hello!" --mode nvfp4 --mtp 3
+
+# Via raw C++/CUDA binary directly (zero Python):
+./build/squid5090 generate /opt/models/inkling-2-mini --tokens 1,2,3 --mode nvfp4 --mtp 3 --max-tokens 128
+```
+
+### 4. Run the OpenAI-Compatible API Server
+
+`tools/server.py` keeps a persistent `squid5090 serve-stdio` GPU worker resident in VRAM so subsequent requests have **zero reload overhead**, sub-40 ms TTFT, and live Server-Sent Events (`stream: true`):
+
+```bash
+# 64K context server (~15.9 GiB VRAM, FP8 KV)
+make serve MODEL_DIR=/opt/models/inkling-2-mini CTX=65536
+
+# 256K context server (~19.4 GiB VRAM, FP8 KV)
+make serve MODEL_DIR=/opt/models/inkling-2-mini CTX=262144 KV=fp8
+
+# Full 1M (1,048,576) context server (~22.5 GiB VRAM, Q4 KV + auto host-pinned embed)
+make serve-1m MODEL_DIR=/opt/models/inkling-2-mini
+```
+
+**Supported OpenAI Endpoints:**
+- `GET /health` — server health, active `max_context`, and VRAM/worker info
+- `GET /v1/models` — OpenAI model list (`id: "inkling-2-mini"`, override via `--model-name`)
+- `POST /v1/chat/completions` — streaming (`stream: true`, SSE + `stream_options.include_usage`) & non-streaming, multi-turn `messages`, `reasoning_content` separation (`<|content_thinking|>` vs `<|content_text|>`), OpenAI `tools` / `tool_calls`, `stop` sequences, `max_tokens` / `max_completion_tokens`, `reasoning_effort`, and per-request `timings`
+- `POST /v1/completions` — raw text completions (streaming & non-streaming, `stop`, `echo`) for eval harnesses (`lm-evaluation-harness`, etc.)
+- Optional `--api-key <secret>` (or `SQUID_API_KEY` env var) for `Authorization: Bearer <secret>` auth, plus full CORS headers.
+
+*(Note: `squid5090` runs deterministic greedy GPU argmax decoding — ideal for coding, agents, and reproducible evals; `temperature`/`top_p` fields are accepted gracefully for harness compatibility.)*
+
+**Test with `curl`:**
+```bash
+# Non-streaming chat completion
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inkling-2-mini",
+    "messages": [{"role": "user", "content": "Write a 1-line Python function to reverse a string."}],
+    "max_tokens": 160
+  }' | jq .
+
+# Streaming SSE
+curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inkling-2-mini",
+    "messages": [{"role": "user", "content": "Explain CUDA Graphs in 3 bullet points."}],
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+**Integrate with OpenAI Python SDK or Any Harness (Open WebUI, LiteLLM, Continue, Aider, `lm-evaluation-harness`):**
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+resp = client.chat.completions.create(
+    model="inkling-2-mini",
+    messages=[{"role": "user", "content": "Write a Python binary search with type hints."}],
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
+
+### 5. Run Benchmarks, Long-Context Sweeps & Profiling
+
+```bash
+# 6-run median benchmark (512 tokens)
+make bench MODEL_DIR=/opt/models/inkling-2-mini MODE=nvfp4 MTP=3
+
+# Long-context scaling sweep (e.g. 432K FP8 or 1M Q4)
+make longctx MODEL_DIR=/opt/models/inkling-2-mini KV=fp8 CTX=442368
+make longctx MODEL_DIR=/opt/models/inkling-2-mini KV=q4  CTX=1048576
+
+# Per-stage CUDA event profile at any simulated context position
+./build/squid5090 profile /opt/models/inkling-2-mini --mode nvfp4 --kv q4 --ctx 262144 --mtp 3 --sim-pos 262000
+
+# Pass very long prompts (32K–1M tokens) via file (avoids Linux 128 KB single-argv limit)
+./build/squid5090 generate /opt/models/inkling-2-mini --tokens-file prompt_ids.csv --mode nvfp4 --ctx 131072 --mtp 3
+```
+
+### CLI Flags & Environment Variables
+
+| Option | Values | Description |
+|---|---|---|
+| `--mode` | `exact` \| `fp8` \| `nvfp4` | Weight precision (`nvfp4` quantizes dense/LM-head/L20–23 experts on load in ~2.15 s) |
+| `--kv` | `auto` \| `bf16` \| `fp8` \| `q4` | Global KV cache format (`auto`: `bf16` for `exact`, `fp8` up to 448K, `q4` above 448K) |
+| `--mtp` | `0..7` | Built-in DSpark MTP draft count (`0` = autoregressive, `3` = best all-around throughput) |
+| `--ctx` | integer (up to `1048576`) | Maximum context window to allocate |
+| `--embed-host` | flag | Pin BF16 embedding table (0.86 GiB) in zero-copy mapped host RAM (auto-enabled `>512K`) |
+| `--no-graph` | flag | Disable CUDA Graph capture (for debugging) |
+| `SQUID_DRAFT_VOCAB` | `32k` (default) \| `49k` \| `full` | Draft head vocabulary size (optional `draft_vocab_32k.bin`; falls back cleanly to full 200K if absent) |
+| `SQUID_MTP_BF16` | `1` | Force DSpark drafter weights to BF16 (for A/B testing) |
+| `SQUID_API_KEY` | string | Require `Authorization: Bearer <key>` on `tools/server.py` |
+
+---
+
+## What We Did to Yield These Results
+
+We followed a hardware-first, roofline-driven hill-climbing methodology (full details in [THEORY.md](THEORY.md), [PLAN.md](PLAN.md), and [ledger.jsonl](ledger.jsonl)): measure real hardware ceilings first, optimize one lever at a time with 6-run medians, verify bitwise parity & long-context needle retrieval, and revert anything that regresses.
+
+### 1. Real Hardware Roofline Analysis ([THEORY.md](THEORY.md))
+- Measured pure GDDR7 read bandwidth directly on the RTX 5090 (`1,512.9 GB/s`, 170 SMs, 96 MiB L2, 100 KiB SMEM/SM).
+- **Key finding:** Because Inkling-2-Mini loops 24 physical layers into **48 logical visits**, the official checkpoint's BF16 attention projections (`2,616 MB/tok`) + BF16 LM head (`926 MB/tok`) made up **64.8% of all decode memory traffic**, dwarfing the NVFP4/MXFP8 MoE experts (`1,839 MB/tok`).
+
+### 2. Lever-by-Lever Optimization Progression
+
+| Lever | What Changed | Effect (P1, 512 tok, 6-run median unless noted) |
+|---|---|---|
+| **v0 — Native Baseline** | Implemented every Inkling-2-Mini op from scratch in C++/CUDA (48 visits, 3× looped core, depth-attn, cross-pass controllers, static + dynamic sconv, L2 Q/K/R clip, global log-pos scaling, rel-bias GQA + sinks, top-8 MoE, softcapped SwiGLU, final softcap30). | `exact mtp=0` eager: **76.63 tok/s** |
+| **v0 + CUDA Graphs** | Captured the full decode step into a persistent `cudaGraphExec_t`, removing ~600+ host launch overheads/token. | `exact mtp=0`: **76.63 → 95.83 tok/s** (+25%) |
+| **Levers 1–3 — Blackwell NVFP4 PTX & All-Linear Quant** | Native `sm_120a` PTX `cvt.rn.f16x2.e2m1x2` + `half2` FMA + 128-bit `uint4` loads; load-time NVFP4 quantization of dense/LM-head/L20–23 experts (cutting traffic `5.47 → 2.80 GB/tok`, VRAM **15.05 GiB**, zero RAM spill); fused Q+K+V+R+Gate+Sink projection. | `nvfp4 mtp=0`: **114.34 → 190.10 tok/s** |
+| **Lever 4 — DSpark MTP + Expert-Grouped Verify** | Full GPU DSpark 3-layer block drafter (NVFP4) + folded Markov RNN head captured inside per-`K` CUDA Graphs (`K = 1..7`), paired with an **expert-grouped deduplicated MoE verify kernel** (loads each unique routed expert across `B = K+1` tokens once). | `nvfp4 mtp=3`: **190.10 → 299.78 tok/s** |
+| **Lever 5 / 5.1 — Half-Warp GEMV, Mega-Fusions, 32K Draft Vocab & Overlap** | Half-warp (`16 threads/row`) NVFP4 GEMV (`lm_head` hit **1,497 GB/s = 99% of measured RTX 5090 BW**); 576-thread vectorized mega-kernels fusing `mlp_sconv + residual + depth_attn + norm + tap`; 1-launch 1024-thread NVFP4 controller; pruned 32K draft vocab (`dspark_draft 868 → 428 µs`); `aux_stream_` overlap of `dspark_commit` ∥ `lm_head_argmax`. | `nvfp4 mtp=0`: **221.39 tok/s**; `nvfp4 mtp=3`: **368.49 tok/s** (max 406.4) |
+| **Lever 6 — Zero-`atomicAdd` Deterministic MoE + Global Mega-Fusion** | Replaced non-deterministic `atomicAdd` in `moe_down` with quarter-warp (`8 threads/row`) per-slot writes `[B, 8, 2304]` reduced inline in `mega_mlp_post_next_depth_norm` (**91% peak BW** + **100% bitwise parity** across runs & `mtp=0..5`); fused all 5 global sconv/clip/store ops into `mega_global_sconv_prep_store` (`354 → 223 µs`). | `nvfp4 mtp=3`: **372.80 tok/s** (100% deterministic) |
+| **Lever 7A–7C — 1M Context + Unified Blackwell Tensor Core Split-K** | Added `--kv fp8` (up to 432K) and `--kv q4` (group-64 INT4 + 2-op exact FP16 magic-bias nibble unpack) + zero-copy host-pinned `embed` (**full 1,048,576 context in 22.47 GiB**). Replaced scalar attention across **all 48 visits + DSpark global layer 1** with Blackwell FP16 Tensor Core (`m16n8k16` + `ldmatrix.x4` + `ldmatrix.x2.trans`) Split-K FlashDecoding (512 bulk CTAs + 136 local/tail CTAs, 17.4 KB SMEM, 2 syncs/tile, up to 24× less KV traffic) + captured `prefill_b8_graph_exec_`. | `nvfp4 mtp=0`: **239.41 tok/s**; **16K real: `145.7 → 338.4 tok/s` (2.32×!)**; **64K real: 285.6 tok/s**; **256K: 202.3 tok/s**; **1M: 96.1 tok/s** |
+
+### 3. Reverted / Negative Experiments
+- **Full 200K vs 32K pruned draft vocab:** `351.5` vs `368.5 tok/s` at identical acceptance (`55.4%` vs `55.8%`) → kept 32K default.
+- **BF16 DSpark + NVFP4 target (`SQUID_MTP_BF16=1`):** `353.6` vs `367.5 tok/s` (+0.9% acc did not pay for BF16 draft BW) → kept NVFP4 DSpark.
+- **4-launch batched NVFP4 controller (+279 µs)**, **512-thread controller (+133 µs)**, **`<<<32, 64>>>` NVFP4 router (+91 µs)**, and **half-warp `moe_gate_up` (+50 µs)** → all reverted.
+
+### 4. Qualification Gates Passed
+- **Bitwise Token Parity (256 tok greedy):** `mtp=0 == mtp=3` verified 100% identical across `exact/bf16`, `nvfp4/fp8`, and `nvfp4/q4`.
+- **Real End-to-End Needle-in-a-Haystack (50% depth):** Verbatim retrieval passed at **8K**, **16K** (`exact/bf16`, `nvfp4/fp8`, `nvfp4/q4`), **32K** (`nvfp4/fp8`, `nvfp4/q4`), and **64K** (`nvfp4/fp8`, `nvfp4/q4`).
+- **OpenAI API Live Smoke Test:** Verified `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming at **408.15 tok/s** + live SSE streaming), and `/v1/completions`.
+
+---
+
+## Repository Structure
+
+```text
+squid5090/
+├── Makefile                 # One-command build, venv, model download, serve, bench, longctx
+├── CMakeLists.txt           # C++20 / CUDA sm_120a build configuration
+├── requirements.txt         # Minimal Python deps (tokenizers, jinja2, huggingface_hub)
+├── README.md                # Quickstart, OpenAI server guide & optimization walkthrough
+├── THEORY.md                # Measured RTX 5090 hardware & roofline ceilings
+├── PLAN.md                  # Optimization roadmap & full experiment table
+├── ledger.jsonl             # Structured JSONL log of every experiment & gate
+├── tools/
+│   ├── server.py            # OpenAI-compatible HTTP/SSE API server (/v1/chat/completions, /v1/completions, /v1/models)
+│   └── chat.py              # Thin Jinja chat-template & tokenizer CLI wrapper
+└── src/
+    ├── config.hpp           # Inkling-2-Mini & DSpark geometry, KV format constants
+    ├── safetensors.{hpp,cpp}# Zero-copy mmap safetensors loader
+    ├── weights.{hpp,cu}     # Direct-to-VRAM loader + load-time NVFP4/FP8 quantization & zero-copy host embed
+    ├── kernels_common.cuh   # Blackwell PTX (e2m1, e4m3, m16n8k16, ldmatrix), KV pack/unpack, TC Split-K engine
+    ├── kernels_gemv.cu      # Half-warp NVFP4/FP8/BF16 GEMV, 99%-BW lm_head, deduplicated zero-atomic MoE
+    ├── kernels_inkling.cu   # Mega-fused depth-attn/sconv, 1-launch controllers, router, TC local/global attention
+    ├── kernels_dspark.cu    # DSpark 3-layer block drafter, TC global layer 1, folded Markov RNN head
+    ├── engine.{hpp,cu}      # Static VRAM arena, CUDA Graph capture (decode/spec/prefill), streaming callback, aux_stream overlap
+    └── main.cpp             # CLI entry point (generate, bench, verify, profile, longctx, serve-stdio)
+```

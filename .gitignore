@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.out
+
+# Python virtualenvs & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Model weights & local data
+models/
+*.safetensors
+*.bin
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
