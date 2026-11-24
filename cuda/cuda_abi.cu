@@ -687,11 +687,16 @@ void squid_launch_moe_down_h(
 
 void squid_launch_mega_mlp_post_res(
     const float* moe_down_or_slots, uint8_t moe_is_slotted, const void* mlp_sw, float* mlp_ring,
-    const float* residual, float* hidden_out, int32_t B, const int32_t* d_pos,
+    const float* residual, float* hidden_out, float* loopcd_save_out, int32_t B, const int32_t* d_pos,
     const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
     launch_mega_mlp_post_res(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(mlp_sw),
-        mlp_ring, residual, hidden_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+        mlp_ring, residual, hidden_out, loopcd_save_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_loopcd_hidden_apply(
+    float* hidden, const float* ref_hidden, float omega, int32_t B, void* stream) {
+    launch_loopcd_hidden_apply(hidden, ref_hidden, omega, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_mega_mlp_post_next_depth_norm(
@@ -701,14 +706,15 @@ void squid_launch_mega_mlp_post_next_depth_norm(
     const void* n0, const void* n1, const void* n2,
     float* o0, float* o1, float* o2, void* oh0, void* oh1, void* oh2,
     int32_t n_out, int32_t B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, void* stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p,
+    const float* loopcd_h1, const float* loopcd_h2, const LoopCDConfig* loopcd_cfg, void* stream) {
     launch_mega_mlp_post_next_depth_norm(
         moe_down_or_slots, moe_is_slotted != 0, static_cast<const __nv_bfloat16*>(prev_mlp_sw),
         prev_mlp_ring, residual, hidden_out, pre_tap_out, post_tap_out, partial_out,
         blocks, n_blocks, queries,
         static_cast<const __nv_bfloat16*>(n0), static_cast<const __nv_bfloat16*>(n1), static_cast<const __nv_bfloat16*>(n2),
         o0, o1, o2, static_cast<__half*>(oh0), static_cast<__half*>(oh1), static_cast<__half*>(oh2),
-        n_out, B, d_pos, abl_r, abl_d, abl_p, static_cast<cudaStream_t>(stream));
+        n_out, B, d_pos, abl_r, abl_d, abl_p, loopcd_h1, loopcd_h2, loopcd_cfg, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_lm_head_argmax(

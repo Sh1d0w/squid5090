@@ -2082,6 +2082,7 @@ mega_mlp_post_res_kernel(
     float* __restrict__ mlp_ring,
     const float* __restrict__ residual,
     float* __restrict__ hidden_out,
+    float* __restrict__ loopcd_save_out,
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
@@ -2100,8 +2101,30 @@ mega_mlp_post_res_kernel(
     float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm_r, sm_d, &s_coeff);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
-    *reinterpret_cast<float4*>(hidden_out + (size_t)b * HIDDEN + c4) =
-        make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
+    float4 hv = make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
+    *reinterpret_cast<float4*>(hidden_out + (size_t)b * HIDDEN + c4) = hv;
+    if (loopcd_save_out) {
+        *reinterpret_cast<float4*>(loopcd_save_out + (size_t)b * HIDDEN + c4) = hv;
+    }
+}
+
+// LoopCD-Hidden (arXiv:2610.02185 Eq. 2) in-place update for batched prefill:
+//   h' = h_R + omega * (h_R - h_ref), bit-exact FP32 fmaf matching decode kernel.
+__global__ void __launch_bounds__(576)
+loopcd_hidden_apply_kernel(
+    float* __restrict__ hidden,
+    const float* __restrict__ ref_hidden,
+    float omega) {
+    int b = blockIdx.x;
+    int c4 = threadIdx.x << 2;
+    size_t off = (size_t)b * HIDDEN + c4;
+    float4 hv = *reinterpret_cast<const float4*>(hidden + off);
+    float4 rv = *reinterpret_cast<const float4*>(ref_hidden + off);
+    hv.x = fmaf(omega, hv.x - rv.x, hv.x);
+    hv.y = fmaf(omega, hv.y - rv.y, hv.y);
+    hv.z = fmaf(omega, hv.z - rv.z, hv.z);
+    hv.w = fmaf(omega, hv.w - rv.w, hv.w);
+    *reinterpret_cast<float4*>(hidden + off) = hv;
 }
 
 // ============================================================================
@@ -2327,7 +2350,10 @@ mega_mlp_post_next_depth_norm_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const float* __restrict__ loopcd_h1,
+    const float* __restrict__ loopcd_h2,
+    const LoopCDConfig* __restrict__ loopcd_cfg) {
     int b = blockIdx.x;
     int s = blockIdx.y;
     int tid = threadIdx.x; // 0..575
@@ -2349,6 +2375,19 @@ mega_mlp_post_next_depth_norm_kernel(
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     float4 hv = make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
+    // Optional LoopCD-Hidden (arXiv:2610.02185 Eq. 2) right at the Loop -> Coda boundary (vi == 42):
+    //   h' = h_R + omega * (h_R - h_ref) with 0 extra launches and bit-exact skip when omega == 0.0f.
+    if (loopcd_cfg) {
+        float omega = loopcd_cfg->omega;
+        if (omega != 0.0f) {
+            const float* ref_buf = (loopcd_cfg->ref_pass == 2) ? loopcd_h2 : loopcd_h1;
+            float4 rv = *reinterpret_cast<const float4*>(ref_buf + (size_t)b * HIDDEN + c4);
+            hv.x = fmaf(omega, hv.x - rv.x, hv.x);
+            hv.y = fmaf(omega, hv.y - rv.y, hv.y);
+            hv.z = fmaf(omega, hv.z - rv.z, hv.z);
+            hv.w = fmaf(omega, hv.w - rv.w, hv.w);
+        }
+    }
     if (s == 0) {
         if (hidden_out)  *reinterpret_cast<float4*>(hidden_out  + (size_t)b * HIDDEN + c4) = hv;
         if (pre_tap_out) *reinterpret_cast<float4*>(pre_tap_out + (size_t)b * HIDDEN + c4) = hv;
@@ -2787,14 +2826,16 @@ void launch_mega_mlp_post_next_depth_norm(
     const __nv_bfloat16* norm0, const __nv_bfloat16* norm1, const __nv_bfloat16* norm2,
     float* out0, float* out1, float* out2, __half* out_h0, __half* out_h1, __half* out_h2,
     int n_out, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p,
+    const float* loopcd_h1, const float* loopcd_h2, const LoopCDConfig* loopcd_cfg,
+    cudaStream_t stream) {
     BF16Ptr3 np{{norm0, norm1, norm2}};
     MutPtr3 op{{out0, out1, out2}};
     HalfPtr3 ohp{{out_h0, out_h1, out_h2}};
     launch_pdl(mega_mlp_post_next_depth_norm_kernel, dim3(B, n_out), 576, stream,
         moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, residual, hidden_out,
         pre_tap_out, post_tap_out, partial_out, blocks, n_blocks, queries, np, op, ohp, d_pos,
-        abl_r, abl_d, abl_p);
+        abl_r, abl_d, abl_p, loopcd_h1, loopcd_h2, loopcd_cfg);
 }
 
 void launch_mega_local_sconv_prep_store(
@@ -2821,11 +2862,17 @@ void launch_mega_attn_post_mlp_in(
 
 void launch_mega_mlp_post_res(
     const float* moe_down_or_slots, bool moe_is_slotted, const __nv_bfloat16* mlp_sconv_w, float* mlp_ring,
-    const float* residual, float* hidden_out, int B, const int32_t* d_pos,
+    const float* residual, float* hidden_out, float* loopcd_save_out, int B, const int32_t* d_pos,
     const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
     launch_pdl(mega_mlp_post_res_kernel, dim3(B), 576, stream,
-        moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, d_pos,
+        moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, loopcd_save_out, d_pos,
         abl_r, abl_d, abl_p);
+}
+
+void launch_loopcd_hidden_apply(
+    float* hidden, const float* ref_hidden, float omega, int B, cudaStream_t stream) {
+    if (B <= 0 || omega == 0.0f) return;
+    loopcd_hidden_apply_kernel<<<B, 576, 0, stream>>>(hidden, ref_hidden, omega);
 }
 
 void launch_vec_add(const float* a, const float* b, float* out, int n, cudaStream_t stream) {

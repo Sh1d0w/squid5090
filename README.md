@@ -48,6 +48,17 @@ Real prefilled single-needle passkey retrieval (planted at 50% prompt depth) is 
 | **1M** (`1,048,000` tok) | *Synthetic `longctx` (zeroed KV)* | — | **45.7 tok/s** (`B=1`, `21.86 ms/tok`)<br>*102.4 P1 / 108.0 P0 (`B=4 @dl=2.5`)* | **23.23 GiB** | Real KV allocation & step latency; `@dl=2.5` is synthetic multiplier |
 | **Warm 16K / 82.5K turn** | Real HTTP prefix cache | **`71.9 ms` / `62.4 ms`** | 446.7 / 237.5 tok/s | 23.2 GiB | Host-RAM local checkpoints (`0` extra VRAM); `32 MiB` static HTTP buffer |
 
+### 3. LoopCD-Hidden Contrastive Decoding ([`arXiv:2610.02185`](https://arxiv.org/abs/2610.02185))
+
+Inkling-2-Mini runs its 12-layer recurrent core (`L6..L17`) for $R = 3$ passes ($h_1 \to h_2 \to h_3$) before entering the 6-layer Coda (`L18..L23`). `squid5090` implements **LoopCD-Hidden** (Eq. 2 of Liu et al., 2026) directly inside the existing Loop→Coda mega-fusion kernel (`mega_mlp_post_next_depth_norm_kernel` at visit 42) with **zero extra CUDA kernel launches**, **zero extra KV cache**, **zero CUDA Graph rebuilds** on per-request changes, and automatic prefix-cache invalidation whenever `loopcd_omega` or `loopcd_ref` changes:
+
+$$h' = h_3 + \omega\,(h_3 - h_b), \qquad b \in \{1, 2\}$$
+
+- **Zero-overhead & lossless verification:** When $\omega = 0.0$ (default), the kernel skips the `fmaf` cleanly (`0.000000` delta vs. baseline; `fp8/q4` KLD stays `0.009574`). When $\omega > 0$, `exact` mode retains 100% bit-exact `mtp=0 == mtp=7` parity, and `fp8/q4` (`T=1.0`, `mtp=7`) decode throughput stays equal or slightly faster (`247.5 → 260.4 tok/s` at $\omega = 0.2$, `acc: 49.2% → 52.5%`).
+- **Empirical RTX 5090 sweep (`fp8/q4`, 30-task Math + Code + Logic benchmark & 7,784-tok KLD):**
+  - **Thinking mode (`enable_thinking=true`, default):** $\omega \in \{0.1, 0.2\}$ with $h_b = h_1$ (and $\omega = 0.3$ with $h_2$) lifts accuracy from **`25/30 (83.3%)` → `27/30 (90.0%, +6.7 pts)`** (`10/10` Math, `10/10` Logic, `7/10` Code), with $\omega = 0.1$ using **5.5% fewer thinking tokens** (`11,893` vs `12,584`) and raising 7,784-tok top-1 match (`96.93% → 96.96%`, `ΔPPL +0.0065`). Above $\omega \ge 0.5$, generation degrades (`24/30`), matching Appendix G.1 of the paper.
+  - **Direct mode (`enable_thinking=false`):** Unmodified baseline ($\omega = 0.0$) scores `29/30 (96.7%)` vs `27–28/30` at $\omega \in [0.2, 0.5]$, so `squid5090` keeps `--loopcd-omega 0.0` as the opt-in default and exposes `--loopcd-omega` / `--loopcd-ref` on both CLI and per-request HTTP JSON (`"loopcd_omega": 0.1, "loopcd_ref": 1`).
+
 ### Current Scope & Limitations
 - **Text-only:** No vision/image encoder yet.
 - **No constrained grammar / JSON-schema decoding** yet (standard OpenAI `tools` / `tool_calls` streaming is supported).
@@ -134,6 +145,7 @@ curl -s http://localhost:8000/health
 | `--mtp` | `7` (`serve`), `0` (CLI) | DSpark drafter (`0` = off, `7` = adaptive `{2,4,8}` CUDA Graph switch) |
 | `--spec-threshold` | `0.80` | Markov confidence threshold for `{2,4,8}` verify width (`0.0` = fixed `B=8`) |
 | `--temp` / `--top-p` / `--top-k` | `1.0` / `0.95` / `0` (`serve`), `0.0` (CLI) | GPU sampling & exact Leviathan/Chen rejection sampling defaults (overridable per-request) |
+| `--loopcd-omega` / `--loopcd-ref` | `0.0` / `1` | Opt-in LoopCD-Hidden ([arXiv:2610.02185](https://arxiv.org/abs/2610.02185)) strength $\omega \in [-1, 2]$ (try `0.1`–`0.2` for thinking) & ref pass `1` ($h_1$) or `2` ($h_2$); overridable per HTTP request |
 | `--max-tokens` | `128` (CLI), `16384` (HTTP fallback) | Max generated tokens per request |
 | `--keep-history-thinking` | off | Re-inject prior turns' `reasoning_content` (off by default to prevent multi-turn thinking copy loops) |
 | `--no-prompt-lookup` | off | Disable hybrid O(1) prompt-lookup drafter |

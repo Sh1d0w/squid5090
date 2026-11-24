@@ -236,6 +236,24 @@ uv run tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/ref
 
 ---
 
+## 5.5 LoopCD-Hidden Contrastive Decoding (`arXiv:2610.02185`)
+
+Inkling-2-Mini is a prelude-loop-coda recurrent transformer (`#P=6`, `#R=12`, `#C=6`, `R=3`, `L_eff=48`). Unlike `LoopCD-Logits` (which would require duplicating Inkling's stateful 6-layer Coda KV caches + sconv rings, adding ~3.4 GiB VRAM at 512K and ~16% compute overhead for a second Coda + 200K `lm_head` pass), **LoopCD-Hidden** (Eq. 2 of Liu et al., 2026) runs Coda **once** on the extrapolated loop-exit hidden state:
+
+$$h' = h_3 + \omega\,(h_3 - h_b), \qquad b \in \{1, 2\}$$
+
+- **Zero-launch CUDA Graph fusion:** `mega_mlp_post_res_kernel` saves `h_1` (`vi=17`) and `h_2` (`vi=29`) into two `[8, 2304]` FP32 buffers (`144 KiB` total in the runtime `VRAMArena`), and `mega_mlp_post_next_depth_norm_kernel` (`vi=42`, Loop→Coda boundary) reads an 8-byte device `LoopCDConfig { omega, ref_pass }` and applies `fmaf(omega, hv - rv, hv)` right before writing `hidden_out` and `partial_out = rmsnorm(h')` (so `h'` flows cleanly into both Coda's residual stream and AttnRes `blocks[3]`). Batched prefill applies the bit-identical `loopcd_hidden_apply_kernel` at `vi=42`.
+- **Invariants verified on RTX 5090:**
+  - `exact/bf16` greedy `mtp=0 == mtp=7` **100% bit-exact** at `omega=0.0`, `omega=0.3 (h_1)`, and `omega=0.3 (h_2)`.
+  - `omega=0.0` reproduces exact baseline `fp8/q4` 7,784-tok `mean_KLD=0.009574` (`ΔPPL=+0.0035`).
+  - Prefix cache keys on `(session_loopcd_omega, session_loopcd_ref)`, cleanly invalidating cached Coda KV when either changes per HTTP request (`315→0` cached on change, `319/326` cached when unchanged).
+  - `fp8/q4` (`T=1.0`, `mtp=7`) decode throughput: `247.5 tok/s` (`ω=0.0`, `acc=49.2%`) → `260.4 tok/s` (`ω=0.2`, `acc=52.5%`) / `253.1 tok/s` (`ω=0.3`, `acc=50.0%`).
+  - **30-task Math + Code + Logic eval (`fp8/q4`, `T=0.0`):**
+    - Thinking ON: baseline `25/30 (83.3%)` → **`27/30 (90.0%, +6.7 pts)`** at `ω=0.1 (h_1)` (`-5.5%` tokens, 7,784-tok `top1=96.96%`, `ΔPPL=+0.0065`), `ω=0.2 (h_1)`, and `ω=0.3 (h_2)`; degrades to `24/30 (80.0%)` at `ω=0.5 (h_1)` (matching Appendix G.1).
+    - Thinking OFF (direct): baseline `29/30 (96.7%)` vs `27–28/30` at `ω∈[0.2, 0.5]`. Default therefore remains `--loopcd-omega 0.0` (opt-in via CLI or per-request HTTP JSON `loopcd_omega` / `loopcd_ref`).
+
+---
+
 ## 6. Repository Map
 
 ```text

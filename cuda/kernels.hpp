@@ -357,6 +357,9 @@ void launch_mega_mlp_post_next_depth_norm(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* loopcd_h1,
+    const float* loopcd_h2,
+    const LoopCDConfig* loopcd_cfg,
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -405,10 +408,19 @@ void launch_mega_mlp_post_res(
     float* mlp_ring,
     const float* residual,
     float* hidden_out,
+    float* loopcd_save_out,      // optional [B, HIDDEN] save for LoopCD-Hidden reference state
     int B, const int32_t* d_pos,
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    cudaStream_t stream);
+
+// LoopCD-Hidden in-place update for batched prefill: hidden = hidden + omega * (hidden - ref_hidden)
+void launch_loopcd_hidden_apply(
+    float* hidden,
+    const float* ref_hidden,
+    float omega,
+    int B,
     cudaStream_t stream);
 
 // Simple vector ops

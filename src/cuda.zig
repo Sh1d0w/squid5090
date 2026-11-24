@@ -11,6 +11,11 @@ pub const CSampleConfig = extern struct {
     seed: u64 = 0,
 };
 
+pub const CLoopCDConfig = extern struct {
+    omega: f32 = 0.0,
+    ref_pass: i32 = 1,
+};
+
 pub const CLinearWeight = extern struct {
     kind: u8 = 0,
     rows: i32 = 0,
@@ -402,11 +407,20 @@ pub extern "c" fn squid_launch_mega_mlp_post_res(
     mlp_ring: [*]f32,
     residual: [*]const f32,
     hidden_out: [*]f32,
+    loopcd_save_out: ?[*]f32,
     batch_size: i32,
     d_pos: *const i32,
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_loopcd_hidden_apply(
+    hidden: [*]f32,
+    ref_hidden: [*]const f32,
+    omega: f32,
+    batch_size: i32,
     stream: ?*anyopaque,
 ) void;
 
@@ -438,6 +452,9 @@ pub extern "c" fn squid_launch_mega_mlp_post_next_depth_norm(
     abl_r: ?[*]const f32,
     abl_d: ?[*]const f32,
     abl_p: ?[*]const f32,
+    loopcd_h1: ?[*]const f32,
+    loopcd_h2: ?[*]const f32,
+    loopcd_cfg: ?*const CLoopCDConfig,
     stream: ?*anyopaque,
 ) void;
 

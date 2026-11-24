@@ -40,6 +40,8 @@ pub const ServerConfig = struct {
     default_temperature: f32 = 1.0,
     default_top_p: f32 = 0.95,
     default_top_k: i32 = 0,
+    default_loopcd_omega: f32 = 0.0,
+    default_loopcd_ref: i32 = 1,
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
@@ -609,6 +611,8 @@ fn handle_chat_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -686,6 +690,10 @@ fn handle_chat_completions(
             include_usage = extract_bool_field(body[start..pos], "include_usage");
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -703,6 +711,8 @@ fn handle_chat_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     // Encode Inkling-2-Mini chat template directly into prompt_tokens:
@@ -748,6 +758,8 @@ fn handle_chat_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
 
     if (!stream) {
@@ -983,6 +995,8 @@ fn handle_text_completions(
     var req_temp: f32 = config.default_temperature;
     var req_top_p: f32 = config.default_top_p;
     var req_top_k: i32 = config.default_top_k;
+    var req_loopcd_omega: f32 = config.default_loopcd_omega;
+    var req_loopcd_ref: i32 = config.default_loopcd_ref;
     var has_seed: bool = false;
     var req_seed: u64 = 0;
     var stream: bool = false;
@@ -1030,6 +1044,10 @@ fn handle_text_completions(
             echo = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "mtp")) {
             if (parse_json_i64_opt(body, &pos)) |v| req_mtp = clamp_i64_to_i32(v, 0, @intCast(constants.mtp_draft_count_max));
+        } else if (std.mem.eql(u8, k, "loopcd_omega")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_loopcd_omega = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "loopcd_ref")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_loopcd_ref = if (v == 2) 2 else 1;
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -1047,6 +1065,8 @@ fn handle_text_completions(
     if (!std.math.isFinite(req_temp) or req_temp < 0.0) req_temp = 0.0;
     if (!std.math.isFinite(req_top_p) or req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
     if (req_top_k < 0) req_top_k = 0;
+    if (!std.math.isFinite(req_loopcd_omega) or req_loopcd_omega < -1.0 or req_loopcd_omega > 2.0) req_loopcd_omega = config.default_loopcd_omega;
+    if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     const prompt_len = tokenizer.encode_into(prompt, true, &buffers.tok_scratch, buffers.prompt_tokens);
@@ -1072,6 +1092,8 @@ fn handle_text_completions(
         .top_p = req_top_p,
         .top_k = req_top_k,
         .seed = req_seed,
+        .loopcd_omega = req_loopcd_omega,
+        .loopcd_ref = req_loopcd_ref,
     };
 
     if (!stream) {

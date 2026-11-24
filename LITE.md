@@ -183,6 +183,29 @@ Then we timed every stage inside a 2,048-token chunk — and got a shock: a tiny
 
 ---
 
+### Step 6: Free Reasoning Guidance From Discarded Loop Passes (`LoopCD-Hidden`, [arXiv:2610.02185](https://arxiv.org/abs/2610.02185))
+
+Remember that Inkling-2-Mini is a **looped** transformer: its middle 12 layers run **3 times** ($h_1 \to h_2 \to h_3$) before handing off to the final 6 Coda layers. Normally, $h_1$ and $h_2$ get thrown away as soon as pass 3 finishes.
+
+**LoopCD-Hidden** turns that discarded rough draft into a free steering vector right before the Coda layers:
+
+$$h' = h_3 + \omega\,(h_3 - h_1)$$
+
+Think of $h_1$ as the model's "first instinct" and $h_3$ as its "carefully checked answer." The difference $(h_3 - h_1)$ points straight along the direction of deeper reasoning — nudging slightly further along that arrow ($\omega \approx 0.1\text{--}0.2$) amplifies what thinking discovered while cancelling first-pass mistakes!
+
+```text
+  LoopCD-Hidden Fused at the Loop -> Coda Handoff (0 extra kernel launches, 0 extra KV!)
+
+  Pass 1 (vi=17):  writes h_1 ─────────────────────────┐
+  Pass 2 (vi=29):  writes h_2 (optional --loopcd-ref 2)│
+  Pass 3 (vi=41):  computes h_3 ──▶ (+) h' = h_3 + ω(h_3 - h_1) ──▶ Coda (L18..L23) ──▶ Logits
+                                     ▲ fused inside vi=42 mega-kernel!
+```
+
+Because `squid5090` fuses this directly into the existing visit-42 handoff kernel (reading $\omega$ and `ref_pass` from an 8-byte device struct), it adds **zero extra CUDA kernel launches**, **zero extra Coda KV cache**, and **zero CUDA Graph rebuilds** when toggled per HTTP request (`"loopcd_omega": 0.1`). On our 30-task RTX 5090 Math + Code + Logic benchmark in thinking mode, `--loopcd-omega 0.1` lifted accuracy from **`25/30` (83.3%) → `27/30` (90.0%)** while using **5.5% fewer thinking tokens** (and stays opt-in `--loopcd-omega 0.0` by default so baseline direct-mode behavior is untouched).
+
+---
+
 ## Part 2: Abliteration, Explained Geometrically (3Blue1Brown Style)
 
 Now for the second half: **what is abliteration, why do normal methods hurt Inkling-2-Mini, and how does a tiny 1.8 MB file suppress refusals while leaving `53/53` tested harmless chat prompts unchanged (`KL <= 0.03` on general text)?**
