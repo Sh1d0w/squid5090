@@ -163,11 +163,9 @@ In `squid5090`:
 
 > **Note:** The core `squid5090` inference binary requires **zero Python**. Python + PyTorch are only needed offline if you want to run `tools/ablate.py` to generate a new custom `.safetensors` file.
 
-1. **Install offline tooling dependencies** (into a dedicated venv so your system stays clean):
+1. **Sync offline tooling dependencies with [`uv`](https://docs.astral.sh/uv/)** (installs into an isolated `tools/.venv` with CUDA 13.0 PyTorch wheels and the Inkling-2-Mini `transformers` commit):
    ```bash
-   python3 -m venv .venv-ablate
-   source .venv-ablate/bin/activate
-   pip install -r tools/requirements.txt
+   uv sync --project tools
    ```
 
 2. **Build `squid5090`** (used by `tools/ablate.py search` and `verify` for fast refusal evaluation):
@@ -175,34 +173,34 @@ In `squid5090`:
    zig build -Doptimize=ReleaseFast
    ```
 
-3. **Run the full abliteration pipeline** (replace `/opt/models/inkling-2-mini` with your model directory, or export `SQUID_MODEL_DIR`):
+3. **Run the full abliteration pipeline via `uv run`** (replace `/opt/models/inkling-2-mini` with your model directory, or export `SQUID_MODEL_DIR`):
    ```bash
    export SQUID_MODEL_DIR=/opt/models/inkling-2-mini
    WORK=work/ablate-run1
    mkdir -p "$WORK"
 
    # 1. Capture per-visit harmful/harmless mean read activations (direct answer & reasoning start)
-   python3 tools/ablate.py directions --out "$WORK/directions.pt"
-   python3 tools/ablate.py directions --out "$WORK/directions_think.pt" --think
+   uv run --project tools tools/ablate.py directions --out "$WORK/directions.pt"
+   uv run --project tools tools/ablate.py directions --out "$WORK/directions_think.pt" --think
 
    # 2. Compute 48x2x2304x2304 harmless write covariances & shrinkage Fisher-LDA detectors (~10 GB host RAM)
-   python3 tools/ablate.py stats --work "$WORK"
+   uv run --project tools tools/ablate.py stats --work "$WORK"
 
    # 3. Record original model's harmless greedy answers & top-64 logprobs (KL targets)
-   python3 tools/ablate.py baseline --out "$WORK/baseline_val.pt" --split val
-   python3 tools/ablate.py baseline --out "$WORK/baseline.pt" --split report
+   uv run --project tools tools/ablate.py baseline --out "$WORK/baseline_val.pt" --split val
+   uv run --project tools tools/ablate.py baseline --out "$WORK/baseline.pt" --split report
 
    # 4. Run Optuna multi-objective TPE search (KL in PyTorch ref, fast refusals via squid5090 serve!)
-   python3 tools/ablate.py search --work "$WORK" --batches 12 --n 8
+   uv run --project tools tools/ablate.py search --work "$WORK" --batches 12 --n 8
 
    # 5. Inspect Pareto-optimal trials (refusals vs KL damage)
-   python3 tools/ablate.py show --work "$WORK" --top 20
+   uv run --project tools tools/ablate.py show --work "$WORK" --top 20
 
    # 6. Export your chosen trial N into a 1.8 MB safetensors file
-   python3 tools/ablate.py export --work "$WORK" --trial <N> --out "$WORK/custom-abliterated.safetensors"
+   uv run --project tools tools/ablate.py export --work "$WORK" --trial <N> --out "$WORK/custom-abliterated.safetensors"
 
    # 7. Verify held-out refusals (harmful_test + JailbreakBench) and harmless KL damage
-   python3 tools/ablate.py verify \
+   uv run --project tools tools/ablate.py verify \
      --ablation "$WORK/custom-abliterated.safetensors" \
      --baseline "$WORK/baseline.pt" \
      --server ./zig-out/bin/squid5090 \
@@ -216,9 +214,9 @@ In `squid5090`:
      --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --spec-threshold 0.80 \
      --ablation "$WORK/custom-abliterated.safetensors"
 
-   # Evaluate 32 mild over-refusal prompts against the live OpenAI server
-   python3 tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label ablated --out "$WORK/refusals-ablated.json"
-   python3 tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/refusals-ablated.json"
+   # Evaluate 32 mild over-refusal prompts against the live OpenAI server (zero deps via uv PEP 723)
+   uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label ablated --out "$WORK/refusals-ablated.json"
+   uv run tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/refusals-ablated.json"
    ```
 
 ---

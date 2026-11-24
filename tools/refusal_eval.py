@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 # Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
 # for squid5090 OpenAI-compatible serving.
 """Refusal evaluation for a squid5090 OpenAI-compatible server.
@@ -7,9 +11,9 @@ Runs a fixed set of mild prompts that safety-tuned models commonly over-refuse, 
 completion and whether it looks like a refusal, and can compare two runs (original vs abliterated).
 `--thinking` lets the model reason first (low effort) and judges the final answer.
 
-    tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label original \
+    uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label original \
         --out results/refusals-original.json
-    tools/refusal_eval.py --compare results/refusals-original.json results/refusals-abliterated.json
+    uv run tools/refusal_eval.py --compare results/refusals-original.json results/refusals-abliterated.json
 """
 from __future__ import annotations
 

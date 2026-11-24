@@ -3,15 +3,15 @@
 # for squid5090 (TigerStyle Zig + Blackwell CUDA engine).
 """Abliteration of Inkling-2-Mini by detector-gated directional ablation of residual-stream writes.
 
-    tools/ablate.py directions --out W/directions.pt                 # per-visit harmful/harmless means, answer start
-    tools/ablate.py directions --out W/directions_think.pt --think   # the same at the start of a reasoning turn
-    tools/ablate.py stats      --work W                              # harmless statistics of the writes, detectors
-    tools/ablate.py baseline   --out W/baseline_val.pt --split val   # original model's harmless answers (KLD targets)
-    tools/ablate.py baseline   --out W/baseline.pt                   # the same for the report split
-    tools/ablate.py search     --work W --batches 12                 # Optuna TPE over the ablation parameters
-    tools/ablate.py show       --work W                              # best trials of the search
-    tools/ablate.py export     --work W --trial N --out W/ablation.safetensors
-    tools/ablate.py verify     --ablation W/ablation.safetensors --baseline W/baseline.pt --out W/verify.json
+    uv run --project tools tools/ablate.py directions --out W/directions.pt                 # per-visit harmful/harmless means, answer start
+    uv run --project tools tools/ablate.py directions --out W/directions_think.pt --think   # the same at the start of a reasoning turn
+    uv run --project tools tools/ablate.py stats      --work W                              # harmless statistics of the writes, detectors
+    uv run --project tools tools/ablate.py baseline   --out W/baseline_val.pt --split val   # original model's harmless answers (KLD targets)
+    uv run --project tools tools/ablate.py baseline   --out W/baseline.pt                   # the same for the report split
+    uv run --project tools tools/ablate.py search     --work W --batches 12                 # Optuna TPE over the ablation parameters
+    uv run --project tools tools/ablate.py show       --work W                              # best trials of the search
+    uv run --project tools tools/ablate.py export     --work W --trial N --out W/ablation.safetensors
+    uv run --project tools tools/ablate.py verify     --ablation W/ablation.safetensors --baseline W/baseline.pt --out W/verify.json
 
 The intervention (see inkling_ref.Ablation) acts on each visit's attention and MLP writes after their
 post-convolutions, and only on writes that the visit's detector flags:

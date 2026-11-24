@@ -21,7 +21,8 @@ following Apache-2.0 licensed open-source projects:
      (cuda/kernels_prefill.cu).
    - Offline Fisher-LDA abliteration generation and refusal evaluation tools
      (tools/ablate.py, tools/inkling_ref.py, tools/refusal_eval.py,
-     tools/requirements.txt), adapted to evaluate refusals via `squid5090 serve`.
+     tools/pyproject.toml), adapted to run via `uv` and evaluate refusals via
+     `squid5090 serve`.
 
 2. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

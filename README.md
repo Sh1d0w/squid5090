@@ -317,11 +317,11 @@ squid5090/
 ├── THEORY.md                 # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                   # Optimization roadmap & full experiment table
 ├── ledger.jsonl              # Structured JSONL log of every experiment & gate
-├── tools/                    # Optional offline Python abliteration & refusal-eval tooling (zero Python in runtime!)
-│   ├── ablate.py             # Full Fisher-LDA + Optuna TPE pipeline to generate custom 1.8 MB .safetensors
+├── tools/                    # Optional offline uv Python abliteration & refusal-eval tooling (zero Python in runtime!)
+│   ├── pyproject.toml        # uv project config (CUDA 13.0 PyTorch + Inkling-2-Mini transformers + optuna)
+│   ├── ablate.py             # Full Fisher-LDA + Optuna TPE pipeline (`uv run --project tools tools/ablate.py ...`)
 │   ├── inkling_ref.py        # Packed-expert BF16 reference wrapper with Visits & Ablation hooks
-│   ├── refusal_eval.py       # 32-prompt over-refusal evaluator against live `squid5090 serve`
-│   └── requirements.txt      # Offline Python deps for tools/ablate.py only
+│   └── refusal_eval.py       # 32-prompt over-refusal evaluator (`uv run tools/refusal_eval.py`)
 ├── cuda/                     # Pure Blackwell sm_120a CUDA device kernels & C-ABI bridge
 │   ├── config.hpp            # Shared CUDA architectural geometry constants
 │   ├── weights.hpp           # Plain POD device-pointer descriptors
