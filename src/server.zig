@@ -38,11 +38,12 @@ pub const ServerConfig = struct {
     api_key: []const u8 = "",
     default_effort: []const u8 = "none",
     default_mtp: u32 = 3,
-    default_temperature: f32 = 0.6,
+    default_temperature: f32 = 1.0,
     default_top_p: f32 = 0.95,
     default_top_k: i32 = 0,
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
+    keep_history_thinking: bool = false,
 };
 
 const StopList = struct {
@@ -655,7 +656,14 @@ fn handle_chat_completions(
 
     // Render Inkling-2-Mini chat template directly into static render_buf!
     var render_writer = tiger.ByteWriter.init(buffers.render_buf);
-    const sys_prefix_bytes: usize = render_chat_template_zero_alloc(&render_writer, messages_json, tools_json, effort, buffers.scratch_str_buf);
+    const sys_prefix_bytes: usize = render_chat_template_zero_alloc(
+        &render_writer,
+        messages_json,
+        tools_json,
+        effort,
+        config.keep_history_thinking,
+        buffers.scratch_str_buf,
+    );
     if (!enable_thinking) {
         render_writer.append_slice("<|message_model|><|content_text|>");
     }
@@ -1198,6 +1206,7 @@ fn render_chat_template_zero_alloc(
     messages_json: []const u8,
     tools_json: []const u8,
     effort: []const u8,
+    keep_history_thinking: bool,
     scratch: []u8,
 ) usize {
     if (tools_json.len > 2 and tools_json[0] == '[') {
@@ -1286,7 +1295,7 @@ fn render_chat_template_zero_alloc(
         const is_assistant: bool = std.mem.eql(u8, role, "assistant");
 
         var has_reasoning: bool = false;
-        if (is_assistant) {
+        if (is_assistant and keep_history_thinking) {
             if (extract_string_field(msg_obj, "reasoning_content", scratch)) |rc| {
                 if (rc.len > 0) {
                     has_reasoning = true;

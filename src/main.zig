@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var port: u16 = 8000;
     var mtp: u32 = if (std.mem.eql(u8, command, "serve")) 7 else 0;
     var spec_threshold: f32 = 0.80;
-    var temperature: f32 = if (std.mem.eql(u8, command, "serve")) 0.6 else 0.0;
+    var temperature: f32 = if (std.mem.eql(u8, command, "serve")) 1.0 else 0.0;
     var top_p: f32 = 0.95;
     var top_k: i32 = 0;
     var seed: u64 = 0;
@@ -50,6 +50,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var embed_on_host: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
+    var keep_history_thinking: bool = false;
     var has_tokens_arg: bool = false;
 
     var arg_i: usize = 3;
@@ -128,6 +129,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--raw-thinking")) {
             raw_thinking = true;
+        } else if (std.mem.eql(u8, arg, "--keep-history-thinking")) {
+            keep_history_thinking = true;
         }
     }
 
@@ -249,6 +252,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .default_top_k = top_k,
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
+            .keep_history_thinking = keep_history_thinking,
         });
     }
 
@@ -421,7 +425,7 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 0.6] [--top-p 0.95] [--top-k 0] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
             "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
             "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
