@@ -11,6 +11,13 @@ const weights_mod = @import("weights.zig");
 
 pub const TokenCallbackFn = *const fn (context: *anyopaque, token_id: i32) bool;
 
+pub const SampleParams = struct {
+    temperature: f32 = 0.0,
+    top_p: f32 = 0.95,
+    top_k: i32 = 0,
+    seed: u64 = 0,
+};
+
 pub const GenerateStats = struct {
     prompt_tokens: u32 = 0,
     cached_tokens: u32 = 0,
@@ -238,6 +245,9 @@ pub const Engine = struct {
     ds_ws: [*]f32 = undefined,
     lm_blk_val: [*]f32 = undefined,
     lm_blk_idx: [*]i32 = undefined,
+    lm_logits: [*]f32 = undefined,
+    d_sample_cfg: *cuda.CSampleConfig = undefined,
+    sample_params: SampleParams = .{},
 
     // Fast batched prefill scratch (B <= 256, ~119 MiB total inside same VRAMArena)
     p_tokens: [*]i32 = undefined,
@@ -411,6 +421,10 @@ pub const Engine = struct {
         self.ds_ws = self.arena.alloc_many(f32, constants.dspark_workspace_floats);
         self.lm_blk_val = self.arena.alloc_many(f32, b_max * 1024);
         self.lm_blk_idx = self.arena.alloc_many(i32, b_max * 1024);
+        self.lm_logits = self.arena.alloc_many(f32, b_max * constants.vocab_unpadded_count);
+        self.d_sample_cfg = self.arena.alloc_one(cuda.CSampleConfig);
+        const zero_cfg: cuda.CSampleConfig = .{};
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
 
         // Fast batched prefill arena (B <= 256)
         const pb: u64 = prefill_batch_max;
@@ -794,6 +808,16 @@ pub const Engine = struct {
         const num_drafts: u32 = if (num_drafts_in > constants.mtp_draft_count_max) constants.mtp_draft_count_max else num_drafts_in;
         const use_mtp: bool = (num_drafts > 0 and w.dspark.loaded != 0);
         const prompt_len: u32 = @intCast(prompt.len);
+
+        // Upload per-request sampling config to device (zero CUDA graph rebuild!).
+        const cfg_h: cuda.CSampleConfig = .{
+            .inv_temp = if (self.sample_params.temperature >= 1e-4) (1.0 / self.sample_params.temperature) else 0.0,
+            .top_p = self.sample_params.top_p,
+            .top_k = self.sample_params.top_k,
+            .pad = 0,
+            .seed = self.sample_params.seed,
+        };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&cfg_h), @sizeOf(cuda.CSampleConfig), self.stream));
 
         // --- PREFIX KV CACHE MATCHING & SIDE-REQUEST SHIELDING ---
         const prefill_start_ns: u64 = tiger.clock_monotonic_ns();
@@ -2320,9 +2344,11 @@ pub const Engine = struct {
                 &w.unembed,
                 self.mlp_normed,
                 self.d_next_tokens,
-                null,
+                self.lm_logits,
                 self.lm_blk_val,
                 self.lm_blk_idx,
+                self.d_sample_cfg,
+                self.d_pos,
                 batch_size,
                 self.stream,
             );
@@ -2554,6 +2580,8 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(b * 2 * constants.kv_dim * 4, a); // ds_kv
     total += tiger.align_up_u64(constants.dspark_workspace_floats * 4, a); // ds_ws
     total += 2 * tiger.align_up_u64(b * 1024 * 4, a); // lm_blk_val, lm_blk_idx
+    total += tiger.align_up_u64(b * constants.vocab_unpadded_count * 4, a); // lm_logits
+    total += tiger.align_up_u64(@sizeOf(cuda.CSampleConfig), a); // d_sample_cfg
 
     // Fast batched prefill arena (B <= 512)
     const pb: u64 = prefill_batch_max;

@@ -3,6 +3,14 @@
 
 const constants = @import("constants.zig");
 
+pub const CSampleConfig = extern struct {
+    inv_temp: f32 = 0.0,
+    top_p: f32 = 0.95,
+    top_k: i32 = 0,
+    pad: u32 = 0,
+    seed: u64 = 0,
+};
+
 pub const CLinearWeight = extern struct {
     kind: u8 = 0,
     rows: i32 = 0,
@@ -439,6 +447,8 @@ pub extern "c" fn squid_launch_lm_head_argmax(
     out_logits: ?[*]f32,
     scratch_vals: [*]f32,
     scratch_idxs: [*]i32,
+    sample_cfg: ?*const CSampleConfig,
+    d_pos: ?*const i32,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;

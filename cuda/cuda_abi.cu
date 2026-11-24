@@ -711,8 +711,10 @@ void squid_launch_mega_mlp_post_next_depth_norm(
 
 void squid_launch_lm_head_argmax(
     const CLinearWeight* unembed, const float* x, int32_t* out_tokens, float* out_logits,
-    float* scratch_vals, int32_t* scratch_idxs, int32_t B, void* stream) {
-    launch_lm_head_argmax(to_lw(*unembed), x, out_tokens, out_logits, scratch_vals, scratch_idxs, B, static_cast<cudaStream_t>(stream));
+    float* scratch_vals, int32_t* scratch_idxs, const SampleConfig* sample_cfg, const int32_t* d_pos,
+    int32_t B, void* stream) {
+    launch_lm_head_argmax(to_lw(*unembed), x, out_tokens, out_logits, scratch_vals, scratch_idxs,
+                          sample_cfg, d_pos, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_dspark_commit(

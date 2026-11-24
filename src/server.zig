@@ -38,6 +38,9 @@ pub const ServerConfig = struct {
     api_key: []const u8 = "",
     default_effort: []const u8 = "none",
     default_mtp: u32 = 3,
+    default_temperature: f32 = 0.6,
+    default_top_p: f32 = 0.95,
+    default_top_k: i32 = 0,
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
 };
@@ -549,8 +552,13 @@ fn handle_chat_completions(
     var req_model: []const u8 = config.model_name;
     var effort_buf: [32]u8 = undefined;
     var effort: []const u8 = config.default_effort;
-    var max_tokens: i32 = 1024;
+    var max_tokens: i32 = 16384;
     var has_max_completion_tokens: bool = false;
+    var req_temp: f32 = config.default_temperature;
+    var req_top_p: f32 = config.default_top_p;
+    var req_top_k: i32 = config.default_top_k;
+    var has_seed: bool = false;
+    var req_seed: u64 = 0;
     var stream: bool = false;
     var include_usage: bool = false;
     var enable_thinking: bool = true;
@@ -597,11 +605,25 @@ fn handle_chat_completions(
                 }
             }
         } else if (std.mem.eql(u8, k, "max_completion_tokens")) {
-            max_tokens = @intCast(tokenizer_mod.parse_i64(body, &pos));
-            has_max_completion_tokens = true;
+            if (parse_json_i64_opt(body, &pos)) |v| {
+                max_tokens = @intCast(v);
+                has_max_completion_tokens = true;
+            }
         } else if (std.mem.eql(u8, k, "max_tokens")) {
-            const v: i32 = @intCast(tokenizer_mod.parse_i64(body, &pos));
-            if (!has_max_completion_tokens) max_tokens = v;
+            if (parse_json_i64_opt(body, &pos)) |v| {
+                if (!has_max_completion_tokens) max_tokens = @intCast(v);
+            }
+        } else if (std.mem.eql(u8, k, "temperature")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_temp = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "top_p")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_top_p = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "top_k")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_top_k = @intCast(v);
+        } else if (std.mem.eql(u8, k, "seed")) {
+            if (parse_json_i64_opt(body, &pos)) |v| {
+                req_seed = @bitCast(v);
+                has_seed = true;
+            }
         } else if (std.mem.eql(u8, k, "stream")) {
             stream = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "enable_thinking")) {
@@ -611,7 +633,7 @@ fn handle_chat_completions(
             tokenizer_mod.skip_json_value(body, &pos);
             include_usage = extract_bool_field(body[start..pos], "include_usage");
         } else if (std.mem.eql(u8, k, "mtp")) {
-            req_mtp = @intCast(tokenizer_mod.parse_i64(body, &pos));
+            if (parse_json_i64_opt(body, &pos)) |v| req_mtp = @intCast(v);
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -626,6 +648,9 @@ fn handle_chat_completions(
         return;
     }
     if (max_tokens < 1) max_tokens = 1;
+    if (req_temp < 0.0) req_temp = 0.0;
+    if (req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
+    if (req_top_k < 0) req_top_k = 0;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     // Render Inkling-2-Mini chat template directly into static render_buf!
@@ -663,6 +688,16 @@ fn handle_chat_completions(
     var parser = InklingStreamParser.init(tokenizer, config.raw_thinking, buffers, prng_state.*);
     if (!enable_thinking) parser.section = .text;
     prng_state.* = prng_state.* *% 6364136223846793005 +% 1;
+    if (!has_seed) {
+        req_seed = prng_state.* ^ tiger.clock_monotonic_ns();
+        prng_state.* = prng_state.* *% 6364136223846793005 +% 1;
+    }
+    engine.sample_params = .{
+        .temperature = req_temp,
+        .top_p = req_top_p,
+        .top_k = req_top_k,
+        .seed = req_seed,
+    };
 
     if (!stream) {
         const NonStreamCtx = struct {
@@ -750,8 +785,8 @@ fn handle_chat_completions(
         });
 
         tiger.print_stdout(
-            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
+            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
         );
         send_json_response(fd, 200, bw.slice());
         return;
@@ -856,8 +891,8 @@ fn handle_chat_completions(
     const tps: f64 = if (stats.decode_ms > 0.0) (dec_toks * 1000.0 / stats.decode_ms) else 0.0;
     const dl: f64 = if (stats.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(stats.spec_steps))) else 1.0;
     tiger.print_stdout(
-        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, stats.prefill_ms, stats.decode_ms, tps, dl },
+        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
     );
 }
 
@@ -879,7 +914,12 @@ fn handle_text_completions(
     pos += 1;
 
     var prompt: []const u8 = "";
-    var max_tokens: i32 = 256;
+    var max_tokens: i32 = 2048;
+    var req_temp: f32 = config.default_temperature;
+    var req_top_p: f32 = config.default_top_p;
+    var req_top_k: i32 = config.default_top_k;
+    var has_seed: bool = false;
+    var req_seed: u64 = 0;
     var stream: bool = false;
     var echo: bool = false;
     var req_mtp: i32 = @intCast(config.default_mtp);
@@ -907,13 +947,24 @@ fn handle_text_completions(
         } else if (std.mem.eql(u8, k, "model")) {
             if (tokenizer_mod.parse_json_string(body, &pos, &req_model_buf)) |ms| req_model = ms else tokenizer_mod.skip_json_value(body, &pos);
         } else if (std.mem.eql(u8, k, "max_tokens")) {
-            max_tokens = @intCast(tokenizer_mod.parse_i64(body, &pos));
+            if (parse_json_i64_opt(body, &pos)) |v| max_tokens = @intCast(v);
+        } else if (std.mem.eql(u8, k, "temperature")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_temp = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "top_p")) {
+            if (parse_json_f64_opt(body, &pos)) |v| req_top_p = @floatCast(v);
+        } else if (std.mem.eql(u8, k, "top_k")) {
+            if (parse_json_i64_opt(body, &pos)) |v| req_top_k = @intCast(v);
+        } else if (std.mem.eql(u8, k, "seed")) {
+            if (parse_json_i64_opt(body, &pos)) |v| {
+                req_seed = @bitCast(v);
+                has_seed = true;
+            }
         } else if (std.mem.eql(u8, k, "stream")) {
             stream = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "echo")) {
             echo = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "mtp")) {
-            req_mtp = @intCast(tokenizer_mod.parse_i64(body, &pos));
+            if (parse_json_i64_opt(body, &pos)) |v| req_mtp = @intCast(v);
         } else if (std.mem.eql(u8, k, "stop")) {
             parse_stop_field(body, &pos, &stops);
         } else {
@@ -928,6 +979,9 @@ fn handle_text_completions(
         return;
     }
     if (max_tokens < 1) max_tokens = 1;
+    if (req_temp < 0.0) req_temp = 0.0;
+    if (req_top_p <= 0.0 or req_top_p > 1.0) req_top_p = 1.0;
+    if (req_top_k < 0) req_top_k = 0;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
     const prompt_len = tokenizer.encode_into(prompt, true, &buffers.tok_scratch, buffers.prompt_tokens);
@@ -944,6 +998,16 @@ fn handle_text_completions(
     const created: i64 = tiger.epoch_seconds();
 
     var parser = InklingStreamParser.init(tokenizer, true, buffers, prng_state.*);
+    if (!has_seed) {
+        req_seed = prng_state.* ^ tiger.clock_monotonic_ns();
+        prng_state.* = prng_state.* *% 6364136223846793005 +% 1;
+    }
+    engine.sample_params = .{
+        .temperature = req_temp,
+        .top_p = req_top_p,
+        .top_k = req_top_k,
+        .seed = req_seed,
+    };
 
     if (!stream) {
         const CmplCtx = struct {
@@ -1486,6 +1550,35 @@ fn eql_ignore_case(a: []const u8, b: []const u8) bool {
         if (la != lb) return false;
     }
     return true;
+}
+
+fn parse_json_i64_opt(data: []const u8, pos: *usize) ?i64 {
+    tokenizer_mod.skip_ws(data, pos);
+    if (pos.* + 4 <= data.len and std.mem.eql(u8, data[pos.* .. pos.* + 4], "null")) {
+        pos.* += 4;
+        return null;
+    }
+    const start = pos.*;
+    tokenizer_mod.skip_json_value(data, pos);
+    const raw = trim_ascii_ws(data[start..pos.*]);
+    if (raw.len == 0) return null;
+    return std.fmt.parseInt(i64, raw, 10) catch blk: {
+        const f = std.fmt.parseFloat(f64, raw) catch break :blk null;
+        break :blk @intFromFloat(f);
+    };
+}
+
+fn parse_json_f64_opt(data: []const u8, pos: *usize) ?f64 {
+    tokenizer_mod.skip_ws(data, pos);
+    if (pos.* + 4 <= data.len and std.mem.eql(u8, data[pos.* .. pos.* + 4], "null")) {
+        pos.* += 4;
+        return null;
+    }
+    const start = pos.*;
+    tokenizer_mod.skip_json_value(data, pos);
+    const raw = trim_ascii_ws(data[start..pos.*]);
+    if (raw.len == 0) return null;
+    return std.fmt.parseFloat(f64, raw) catch null;
 }
 
 fn parse_json_bool(data: []const u8, pos: *usize) bool {

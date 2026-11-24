@@ -84,6 +84,16 @@ enum class KVFormat {
     Q4   = 2  // 0.531 B/elem (signed INT4 [-7..7] + group-64 FP16 scale -> up to 1M context!)
 };
 
+// Device-resident sampling config (uploaded via H2D before generate; zero graph rebuild!)
+// inv_temp == 0.0f => pure greedy argmax with zero extra memory traffic.
+struct SampleConfig {
+    float inv_temp;
+    float top_p;
+    int32_t top_k;
+    uint32_t pad;
+    uint64_t seed;
+};
+
 constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
 constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf

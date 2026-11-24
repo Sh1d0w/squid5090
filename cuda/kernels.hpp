@@ -39,15 +39,17 @@ void launch_bf16_linear(
     int B, int N, int K,
     cudaStream_t stream);
 
-// Fused LM Head + Softcap(30) + GPU Argmax for B rows!
-// Optionally writes full logits [B, VOCAB_UNPADDED] if out_logits != nullptr.
+// Fused LM Head + Softcap(30) + GPU Argmax / Nucleus+TopK Gumbel-Max Sampling for B rows!
+// When sample_cfg == nullptr or sample_cfg->inv_temp <= 0: pure greedy argmax (zero logits write).
 void launch_lm_head_argmax(
     const LinearWeight& unembed,
-    const float* x,          // [B, HIDDEN]
-    int32_t* out_tokens,     // [B]
-    float* out_logits,       // optional [B, VOCAB_UNPADDED]
-    float* scratch_vals,     // [B, 1024]
-    int32_t* scratch_idxs,   // [B, 1024]
+    const float* x,                  // [B, HIDDEN]
+    int32_t* out_tokens,             // [B]
+    float* out_logits,               // optional [B, VOCAB_UNPADDED]
+    float* scratch_vals,             // [B, 1024]
+    int32_t* scratch_idxs,           // [B, 1024]
+    const SampleConfig* sample_cfg,  // optional device pointer
+    const int32_t* d_pos,            // optional device pointer (batch start pos)
     int B,
     cudaStream_t stream);
 

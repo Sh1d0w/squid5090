@@ -38,6 +38,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var port: u16 = 8000;
     var mtp: u32 = if (std.mem.eql(u8, command, "serve")) 7 else 0;
     var spec_threshold: f32 = 0.80;
+    var temperature: f32 = if (std.mem.eql(u8, command, "serve")) 0.6 else 0.0;
+    var top_p: f32 = 0.95;
+    var top_k: i32 = 0;
+    var seed: u64 = 0;
     var max_tokens: u32 = 128;
     var runs: u32 = 6;
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
@@ -93,6 +97,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--spec-threshold") and arg_i + 1 < argv.len) {
             arg_i += 1;
             spec_threshold = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.80;
+        } else if (std.mem.eql(u8, arg, "--temp") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            temperature = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.0;
+        } else if (std.mem.eql(u8, arg, "--top-p") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            top_p = std.fmt.parseFloat(f32, std.mem.span(argv[arg_i])) catch 0.95;
+        } else if (std.mem.eql(u8, arg, "--top-k") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            top_k = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--seed") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            seed = std.fmt.parseInt(u64, std.mem.span(argv[arg_i]), 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--max-tokens") and arg_i + 1 < argv.len) {
             arg_i += 1;
             max_tokens = std.fmt.parseInt(u32, std.mem.span(argv[arg_i]), 10) catch 128;
@@ -212,6 +228,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     engine.init(&model_weights, ctx, use_graphs, kv_format);
     engine.spec_threshold = spec_threshold;
     engine.use_prompt_lookup = use_prompt_lookup;
+    engine.sample_params = .{
+        .temperature = temperature,
+        .top_p = top_p,
+        .top_k = top_k,
+        .seed = if (seed != 0) seed else tiger.clock_monotonic_ns(),
+    };
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
@@ -222,6 +244,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .api_key = api_key,
             .default_effort = effort,
             .default_mtp = mtp,
+            .default_temperature = temperature,
+            .default_top_p = top_p,
+            .default_top_k = top_k,
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
         });
@@ -396,8 +421,8 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
-            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 0.6] [--top-p 0.95] [--top-k 0] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
             "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
             "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",

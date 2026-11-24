@@ -23,6 +23,8 @@ ExecStart=/opt/squid5090/zig-out/bin/squid5090 serve /opt/models/inkling-2-mini 
     --ctx 524288 \
     --mtp 7 \
     --spec-threshold 0.80 \
+    --temp 0.6 \
+    --top-p 0.95 \
     --ablation /opt/models/inkling-2-mini/inkling-2-mini-abliterated.safetensors
 
 Restart=on-failure

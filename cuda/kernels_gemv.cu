@@ -854,6 +854,19 @@ static void dispatch_linear_h_b(
 
 constexpr int LM_HEAD_BLOCKS = 680;
 
+__device__ __forceinline__ float hash_gumbel(uint64_t seed, int32_t pos, int32_t tok) {
+    uint64_t h = seed ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ULL)
+                      ^ ((uint64_t)(uint32_t)tok * 0xBF58476D1CE4E5B9ULL);
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    // Strictly inside (0, 1) with exact float32 representation: [2^-24, 1 - 2^-24]
+    float u = ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f);
+    return -__logf(-__logf(u));
+}
+
 template <int B_CONST, int KIND>
 __global__ void __launch_bounds__(256)
 lm_head_stage1_kernel(
@@ -865,7 +878,9 @@ lm_head_stage1_kernel(
     float* __restrict__ out_logits,
     float* __restrict__ blk_max_val,
     int32_t* __restrict__ blk_max_idx,
+    const SampleConfig* __restrict__ sample_cfg,
     int V) {
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp > 0.0f);
     __shared__ uint16_t s_x16[B_CONST * HIDDEN];
     int tid = threadIdx.x;
     int total_x = B_CONST * HIDDEN;
@@ -983,7 +998,7 @@ lm_head_stage1_kernel(
         for (int b = 0; b < B_CONST; ++b) {
             float val = ((TPR == 16) ? half_warp_sum(acc[b]) : warp_sum(acc[b])) * scale;
             if (lane == 0) {
-                if (out_logits) {
+                if (write_logits) {
                     float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
                     out_logits[(size_t)b * V + row] = cap_val;
                     if (cap_val > best_val[b]) { best_val[b] = cap_val; best_idx[b] = row; }
@@ -1024,7 +1039,9 @@ lm_head_nvfp4_mma_stage1_kernel(
     float* __restrict__ out_logits,
     float* __restrict__ blk_max_val,
     int32_t* __restrict__ blk_max_idx,
+    const SampleConfig* __restrict__ sample_cfg,
     int V, uint32_t zero) {
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp > 0.0f);
     constexpr int SPLITK = 6;
     constexpr int U = 3; // 6 * 3 * 128 = 2304
     constexpr int CB = HIDDEN >> 1;
@@ -1120,7 +1137,7 @@ lm_head_nvfp4_mma_stage1_kernel(
                     float s = cs[0][tid][b] + cs[1][tid][b] + cs[2][tid][b]
                             + cs[3][tid][b] + cs[4][tid][b] + cs[5][tid][b];
                     float val = s * global_scale;
-                    if (out_logits) {
+                    if (write_logits) {
                         float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
                         out_logits[(size_t)b * V + row] = cap_val;
                         if (cap_val > best_val[b] || (cap_val == best_val[b] && row < best_idx[b])) {
@@ -1159,7 +1176,11 @@ lm_head_nvfp4_mma_stage1_kernel(
 __global__ void lm_head_stage2_argmax_kernel(
     const float* __restrict__ blk_max_val,
     const int32_t* __restrict__ blk_max_idx,
+    const float* __restrict__ out_logits,
     int32_t* __restrict__ out_tokens,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    int V,
     int B) {
     pdl_wait();
     pdl_trigger();
@@ -1183,12 +1204,113 @@ __global__ void lm_head_stage2_argmax_kernel(
     __shared__ int32_t si[8];
     if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
     __syncthreads();
+
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && out_logits != nullptr);
+    if (!do_sample) {
+        if (tid == 0) {
+            bv = sv[0]; bi = si[0];
+            for (int w = 1; w < 8; ++w) {
+                if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+            }
+            out_tokens[b] = bi;
+        }
+        return;
+    }
+
+    __shared__ float s_max_val;
+    __shared__ int32_t s_max_idx;
+    __shared__ float hist_sum[256];
+    __shared__ uint32_t hist_cnt[256];
+    __shared__ float s_tau;
+
     if (tid == 0) {
         bv = sv[0]; bi = si[0];
         for (int w = 1; w < 8; ++w) {
             if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
         }
-        out_tokens[b] = bi;
+        s_max_val = bv;
+        s_max_idx = bi;
+    }
+    __syncthreads();
+
+    const float max_logit = s_max_val;
+    const int32_t greedy_idx = s_max_idx;
+    const float inv_temp = sample_cfg->inv_temp;
+    const float top_p = sample_cfg->top_p;
+    const int32_t top_k = sample_cfg->top_k;
+    const uint64_t seed = sample_cfg->seed;
+    const int32_t pos = d_pos ? (*d_pos + b) : b;
+    const float* logits = out_logits + (size_t)b * V;
+
+    constexpr float HIST_RANGE = 20.0f;
+    constexpr float HIST_SCALE = 256.0f / HIST_RANGE; // 12.8 bins/nat (0.078125 nat resolution)
+
+    if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
+        hist_sum[tid] = 0.0f;
+        hist_cnt[tid] = 0u;
+        __syncthreads();
+
+        for (int row = tid; row < V; row += 256) {
+            float d = (max_logit - logits[row]) * inv_temp;
+            if (d < HIST_RANGE) {
+                int bin = (int)(d * HIST_SCALE);
+                if (bin < 0) bin = 0;
+                else if (bin > 255) bin = 255;
+                atomicAdd(&hist_sum[bin], __expf(-d));
+                atomicAdd(&hist_cnt[bin], 1u);
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total_z = 0.0f;
+            for (int k = 0; k < 256; ++k) total_z += hist_sum[k];
+            float cum_z = 0.0f;
+            uint32_t cum_c = 0u;
+            int cut_bin = 255;
+            const float target_z = (top_p > 0.0f && top_p < 1.0f) ? (top_p * total_z) : total_z;
+            for (int k = 0; k < 256; ++k) {
+                cum_z += hist_sum[k];
+                cum_c += hist_cnt[k];
+                const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
+                const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);
+                if (hit_p || hit_k) {
+                    cut_bin = k;
+                    break;
+                }
+            }
+            s_tau = max_logit - ((float)(cut_bin + 1) / HIST_SCALE) / inv_temp;
+        }
+        __syncthreads();
+    } else {
+        if (tid == 0) s_tau = max_logit - HIST_RANGE / inv_temp;
+        __syncthreads();
+    }
+
+    const float tau = s_tau;
+    float best_s = -1e30f;
+    int32_t best_t = greedy_idx;
+    for (int row = tid; row < V; row += 256) {
+        float l = logits[row];
+        if (l >= tau) {
+            float sc = (l - max_logit) * inv_temp + hash_gumbel(seed, pos, row);
+            if (sc > best_s) { best_s = sc; best_t = row; }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+        int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
+        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
+    }
+    if ((tid & 31) == 0) { sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
+    __syncthreads();
+    if (tid == 0) {
+        best_s = sv[0]; best_t = si[0];
+        for (int w = 1; w < 8; ++w) {
+            if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
+        }
+        out_tokens[b] = best_t;
     }
 }
 
@@ -1599,44 +1721,47 @@ void launch_bf16_linear(
 template <int B_CONST>
 static void dispatch_lm_head(
     const LinearWeight& u, const float* x, int32_t* out_toks, float* out_logits,
-    float* s_val, int32_t* s_idx, cudaStream_t stream) {
+    float* s_val, int32_t* s_idx, const SampleConfig* sample_cfg, const int32_t* d_pos,
+    cudaStream_t stream) {
     if (u.kind == WeightKind::NVFP4) {
         if constexpr (B_CONST >= 2) {
             launch_pdl(lm_head_nvfp4_mma_stage1_kernel<B_CONST>, dim3(LM_HEAD_BLOCKS), 192, stream,
                 static_cast<const uint8_t*>(u.data), u.scales, u.global_scale,
-                x, out_logits, s_val, s_idx, u.rows, 0u);
+                x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
             launch_pdl(lm_head_stage1_kernel<B_CONST, 2>, dim3(LM_HEAD_BLOCKS), 256, stream,
                 u.data, u.scales, static_cast<const float*>(nullptr), u.global_scale,
-                x, out_logits, s_val, s_idx, u.rows);
+                x, out_logits, s_val, s_idx, sample_cfg, u.rows);
         }
     } else if (u.kind == WeightKind::FP8) {
         lm_head_stage1_kernel<B_CONST, 1><<<LM_HEAD_BLOCKS, 256, 0, stream>>>(
-            u.data, nullptr, u.row_scales, 1.0f, x, out_logits, s_val, s_idx, u.rows);
+            u.data, nullptr, u.row_scales, 1.0f, x, out_logits, s_val, s_idx, sample_cfg, u.rows);
     } else {
         lm_head_stage1_kernel<B_CONST, 0><<<LM_HEAD_BLOCKS, 256, 0, stream>>>(
-            u.data, nullptr, nullptr, 1.0f, x, out_logits, s_val, s_idx, u.rows);
+            u.data, nullptr, nullptr, 1.0f, x, out_logits, s_val, s_idx, sample_cfg, u.rows);
     }
-    launch_pdl(lm_head_stage2_argmax_kernel, dim3(B_CONST), 256, stream, s_val, s_idx, out_toks, B_CONST);
+    launch_pdl(lm_head_stage2_argmax_kernel, dim3(B_CONST), 256, stream,
+        s_val, s_idx, out_logits, out_toks, sample_cfg, d_pos, u.rows, B_CONST);
 }
 
 void launch_lm_head_argmax(
     const LinearWeight& unembed, const float* x, int32_t* out_tokens, float* out_logits,
-    float* scratch_vals, int32_t* scratch_idxs, int B, cudaStream_t stream) {
+    float* scratch_vals, int32_t* scratch_idxs, const SampleConfig* sample_cfg,
+    const int32_t* d_pos, int B, cudaStream_t stream) {
     switch (B) {
-        case 1: dispatch_lm_head<1>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 2: dispatch_lm_head<2>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 3: dispatch_lm_head<3>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 4: dispatch_lm_head<4>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 5: dispatch_lm_head<5>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 6: dispatch_lm_head<6>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 7: dispatch_lm_head<7>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
-        case 8: dispatch_lm_head<8>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, stream); break;
+        case 1: dispatch_lm_head<1>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 2: dispatch_lm_head<2>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 3: dispatch_lm_head<3>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 4: dispatch_lm_head<4>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 5: dispatch_lm_head<5>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 6: dispatch_lm_head<6>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 7: dispatch_lm_head<7>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
+        case 8: dispatch_lm_head<8>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, stream); break;
         default:
             for (int i = 0; i < B; ++i) {
                 dispatch_lm_head<1>(unembed, x + (size_t)i * HIDDEN, out_tokens + i,
                     out_logits ? out_logits + (size_t)i * unembed.rows : nullptr,
-                    scratch_vals, scratch_idxs, stream);
+                    scratch_vals, scratch_idxs, sample_cfg, d_pos, stream);
             }
             break;
     }
