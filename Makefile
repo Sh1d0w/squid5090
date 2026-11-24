@@ -15,6 +15,7 @@ KV             ?= q4
 CTX            ?= 1048576
 MTP            ?= 7
 SPEC_THRESHOLD ?= 0.80
+EXACT_CTX      ?= 65536
 PROMPT         ?= Write a Python LRU cache with tests.
 RUNS           ?= 3
 ARGS           ?=
@@ -23,16 +24,19 @@ BIN := ./zig-out/bin/squid5090
 RUN := LD_LIBRARY_PATH=$(CUDA_PATH)/lib64 $(BIN)
 
 .DEFAULT_GOAL := help
-.PHONY: help build serve bench health omp clean
+.PHONY: help build serve serve-exact bench health omp clean
 
 help: ## Show targets
-	@awk -F ':.*## ' '/^[a-z]+:.*## /{printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk -F ':.*## ' '/^[a-z-]+:.*## /{printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build zig-out/bin/squid5090
 	$(ZIG) build -Dcuda-path=$(CUDA_PATH)
 
 serve: ## Start the OpenAI-compatible API server
 	$(RUN) serve $(MODEL) --host $(HOST) --port $(PORT) --mode $(MODE) --kv $(KV) --ctx $(CTX) --mtp $(MTP) --spec-threshold $(SPEC_THRESHOLD) $(ARGS)
+
+serve-exact: ## Start the full-precision (exact BF16, mtp=0) API server
+	$(RUN) serve $(MODEL) --host $(HOST) --port $(PORT) --mode exact --kv bf16 --ctx $(EXACT_CTX) --mtp 0 $(ARGS)
 
 bench: ## Run the decode benchmark
 	$(RUN) bench $(MODEL) --prompt "$(PROMPT)" --mode $(MODE) --kv $(KV) --mtp $(MTP) --max-tokens 1024 --runs $(RUNS) $(ARGS)
