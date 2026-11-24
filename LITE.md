@@ -17,6 +17,20 @@ Now watch what happens in the two phases of an LLM conversation:
 1. **Reading your prompt (Prefill):** You hand the factory 20,000 words all at once. It brings each crate of weights through the hallway *once* and uses it on all 20,000 words. The calculators run full-blast. **Prefill is limited by math speed.**
 2. **Writing the reply (Decode):** The factory can only write **one word (token) at a time**, because word #2 depends on word #1. To produce *that single word*, it has to haul **billions of weights** all the way through the hallway, do one quick multiplication per number, and throw them away — while 95% of the calculators sit completely idle! **Decode is limited by the hallway.**
 
+```text
+  PREFILL (20,000 tokens at once — Compute-Bound)
+  ┌───────────────────┐     1,513 GB/s     ┌─────────────────────────────┐
+  │  VRAM Warehouse   │═══════▶  1 trip ══▶│  Tensor Cores: ██████████   │
+  │  (Model Weights)  │   reused 20,000×   │  100% busy  -> 9,181 tok/s  │
+  └───────────────────┘                    └─────────────────────────────┘
+
+  DECODE (1 token at a time — Bandwidth-Bound)
+  ┌───────────────────┐     1,513 GB/s     ┌─────────────────────────────┐
+  │  VRAM Warehouse   │══▶ 2.8 GB / tok ══▶│  Tensor Cores: █░░░░░░░░░   │
+  │  (Model Weights)  │  used ONCE, tossed │   95% IDLE  -> bottleneck!  │
+  └───────────────────┘                    └─────────────────────────────┘
+```
+
 Once you see that picture, every optimization stops looking like black magic and becomes simple physics.
 
 ---
@@ -36,6 +50,18 @@ Normally, generating one token requires the CPU to shout ~600 separate tiny inst
 - **What we did:** First, we threw away Python completely and wrote the engine in a single compiled Zig binary. Second, we recorded the entire 600-step choreography **once** into a **CUDA Graph**. Now, for every token, the CPU makes **one** call: *"replay the recording."*
 - **Bonus trick (Blackwell PDL):** On the RTX 5090, we let Step $N+1$ start walking weights down the hallway *while Step $N$ is still finishing its last few calculations* — overlapping the gaps between rooms.
 
+```text
+  BEFORE (Python + eager launches): ~600 CPU calls/token + idle gaps
+  CPU: [call][call][call][call]... (overhead!)
+  GPU:   [Norm]   [QKV]   [Attn]   [MoE]   [LM Head]
+               ^^^     ^^^      ^^^     ^^^ dead air between kernels
+
+  AFTER (Zig + CUDA Graph + Blackwell PDL): 1 CPU call + overlapped prologues
+  CPU: [Launch Graph] ──────────────────────────────────────────▶ (free!)
+  GPU: [Norm][QKV][Attn][MoE][LM Head]
+           └─▶ overlaps next kernel's weight fetch while current tail finishes!
+```
+
 ---
 
 ### Step 3: Pack the Crates Tighter (4-Bit Weights + 4-Bit Long-Term Memory)
@@ -46,9 +72,29 @@ If the hallway is the bottleneck, shrinking every box from 16 bits down to **4 b
 - **1,000,000-Token Memory (`Q4 KV`):** Inkling-2-Mini has a clever hybrid design: out of 48 layer steps, 36 only look back at the last 1,024 words (tiny fixed memory!), and only 8 unique layers actually store the entire conversation history. By compressing that long-term history into 4-bit numbers (`Q4`), a **1,048,576-token** conversation fits in **23.2 GiB** — with nearly 9 GiB to spare on a 32 GiB card!
 - **Instant Multi-Turn Memory (Prefix Cache):** When you send Turn 2 of a 16,000-word coding session, why re-read the first 16,000 words? We snapshot the tiny local state to regular system RAM (`0` extra VRAM), so Turn 2 picks up where Turn 1 left off in **72 milliseconds** instead of 2.1 seconds.
 
+```text
+  RTX 5090 32 GiB VRAM @ FULL 1,048,576-TOKEN CONTEXT
+  ┌──────────────────────────┬────────────────┬──────────────────┐
+  │   NVFP4 Model Weights    │  Q4 KV Cache   │   Free Headroom  │
+  │        14.6 GiB          │    8.6 GiB     │     ~8.8 GiB     │
+  └──────────────────────────┴────────────────┴──────────────────┘
+   0                        14.6            23.2                32.0 GiB
+
+  Why 1M tokens only needs 8.6 GiB (Inkling's 5:1 Local-to-Global pattern):
+  ┌──────┬──────┬──────┬──────┬──────┬────────────────────────────┐
+  │ L0   │ L1   │ L2   │ L3   │ L4   │ L5  (Global Attention)     │
+  │ 1024 │ 1024 │ 1024 │ 1024 │ 1024 │ Full 1,048,576-tok Q4 KV!  │
+  │ fixed│ fixed│ fixed│ fixed│ fixed│ (only 8 unique global KV)  │
+  └──────┴──────┴──────┴──────┴──────┴────────────────────────────┘
+```
+
 ---
 
 ### Step 4: The Real Magic Trick — Guess 7 Words Ahead for Free (Speculative Decoding)
+
+<p align="center">
+  <img src="assets/lite-speculative.gif" alt="3Blue1Brown-style animation of the RTX 5090 memory hallway and 8-token lossless speculative decoding" width="820"/>
+</p>
 
 After Steps 1–3, generating 1 token at a time hits the hallway's speed limit: **`~263 tok/s`**. So how did we reach **`589.5 tok/s`** on code and **`771.6 tok/s`** when editing/quoting code?
 
@@ -67,6 +113,33 @@ So we pair the big model with **two lightning-fast "drafters"** (guessers):
 4. **Why it's 100% lossless:**
    The big model still grades every single guessed token in parallel. If guesses 1, 2, 3, and 4 match what the big model would have picked, and guess 5 is wrong, we keep 1–4 plus the big model's true #5, and throw away 6–7. The final text is **mathematically identical** to running the big model alone — just **2–3× faster**.
 
+```mermaid
+flowchart LR
+    CTX["Last 16 Tokens"] --> PL{"CPU O(1) Prompt-Lookup<br/>(5 ns hash check)"}
+    PL -- "Match found" --> VB8["GPU Verify B=8<br/>(771.6 tok/s RAG/code-copy)"]
+    PL -- "No match" --> DS["GPU DSpark Drafter<br/>(3 layers, 0.4 ms, 7 guesses + conf)"]
+    DS --> SW{"GPU Switch<br/>(cudaGraphCondTypeSwitch)"}
+    SW -- "Low conf" --> V2["Verify B=2"]
+    SW -- "Mid conf" --> V4["Verify B=4"]
+    SW -- "High conf" --> V8["Verify B=8<br/>(589.5 tok/s code)"]
+    V2 --> OUT["Emit Accepted + 1 Bonus Token"]
+    V4 --> OUT
+    V8 --> OUT
+    VB8 --> OUT
+    OUT -. "Next DSpark draft overlaps!" .-> DS
+```
+
+```text
+  Lossless Parallel Grading (1 Weight Load -> 6 Tokens Emitted!)
+  Drafted (7 guesses):  [ for ] [  i  ] [ in  ] [range] [  (  ] [ 10  ] [  )  ]
+                           │       │       │       │       │       │       │
+                           ▼       ▼       ▼       ▼       ▼       ▼       ▼
+  Big Model Grades:     [ for ] [  i  ] [ in  ] [range] [  (  ] [  n  ] [ ... ]
+                           ✓       ✓       ✓       ✓       ✓       ✗     drop
+                                                                   │
+  Final Output:         "for"    "i"    "in"   "range"   "("      "n"  (100% exact!)
+```
+
 ---
 
 ### Step 5: Always Look Back With a Stopwatch (How Prefill Hit `9,181 tok/s`)
@@ -74,6 +147,16 @@ So we pair the big model with **two lightning-fast "drafters"** (guessers):
 To make prompt-reading fast, we built a giant `128×128` Tensor Core MoE engine that processes **2,048 tokens at once** so every expert's weights are reused ~128 times. Prefill jumped from `5,077` to `7,689 tok/s`.
 
 Then we timed every stage inside a 2,048-token chunk — and got a shock: a tiny 4-tap convolution was burning **26% of the entire runtime**! Why? Because it was running sequentially across the 2,048 tokens using only **9 out of 170 GPU cores**! Because a 4-tap convolution only looks 3 tokens backward, we sliced the 2,048 tokens into 32-token strips across **576 GPU blocks** in 30 lines of code — and prefill jumped straight to **`9,181 tok/s`** (reading a 64,000-token Needle-in-a-Haystack document in **8.4 seconds**).
+
+```text
+  BEFORE: 9 CTAs march serially across 2,048 tokens (161/170 SMs IDLE -> 7,689 tok/s)
+  CTA 0..8: [t=0 ──────────────────────────────────────────────────────▶ t=2047]
+  SMs 9..169: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ IDLE ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+  AFTER: 2D-Tiled (9 channel tiles × 64 time strips = 576 CTAs -> 9,181 tok/s!)
+  Strip 0:  [t=0..31]    Strip 1:  [t=32..63]   ...   Strip 63: [t=2016..2047]
+  (each strip only peeks 3 tokens left -> ALL 170 RTX 5090 SMs saturated!)
+```
 
 ---
 
@@ -108,9 +191,25 @@ On Inkling-2-Mini, that breaks for **three** reasons:
 2. **4-bit quantization squashes tiny edits:** Re-packing surgical weight tweaks back into 4-bit numbers rounds them into noise.
 3. **Always-on damage:** Blocking direction $r$ *even when you're just writing a Python LRU cache* nudges every word probability slightly off course.
 
+```text
+  Why Classic Weight Editing Breaks Looped Layers (24 physical -> 48 logical steps)
+
+  Prelude         ┌───────── Shared Physical Layers 6..17 ─────────┐         Coda
+  [L0..L5] ──────▶│  Pass 1 (visits 6..17)  -> reasoning & syntax  │──────▶ [L18..L23]
+   6 steps        │  Pass 2 (visits 18..29) -> refusal forms here! │         6 steps
+                  │  Pass 3 (visits 30..41) -> final verification  │
+                  └────────────────────────────────────────────────┘
+                    ▲ Classic weight edit hammers ALL 3 passes!
+                    ✓ Runtime 1.8 MB sidecar targets ONLY the exact visit hill!
+```
+
 ---
 
 ### The Breakthrough: A Smart 1.8 MB "Bouncer" at Runtime
+
+<p align="center">
+  <img src="assets/lite-abliteration.gif" alt="3Blue1Brown-style animation of Fisher-LDA runtime-gated geometric abliteration in 2,304-D space" width="820"/>
+</p>
 
 Instead of touching the 19 GB weights at all, we leave the model **100% untouched** and place a tiny **1.8 MB sidecar** (`--ablation`) at the exit of each of the 48 steps.
 
@@ -132,12 +231,45 @@ Now the bouncer's rule is dead simple:
 - On normal coding, math, and chat: $y$ stays comfortably inside the harmless pancake → the bouncer says **"Not a refusal — pass straight through untouched!"** Output is **bit-for-bit identical** to the unmodified model.
 - When a refusal begins to form: $y$ pops way outside the pancake → the bouncer steps in!
 
+```text
+  2D Cross-Section of the 2,304-Dimensional Activation Room (Visit v)
+
+      ▲ Fisher-LDA Bouncer Axis (d_v = Σ⁻¹ δ, scaled so harmless σ = 1)
+      │
+      │                        ★ Refusal thought y (pops > kσ out of pancake!)
+      │                        │
+      │                        │  Bouncer triggers! Trim ONLY excess along r_v
+  ────┼────────────────────────┼─────────────────────────────────── Threshold τ_v (kσ)
+      │                        ▼
+      │                 ● trimmed y' (back to harmless baseline c_v)
+      │
+      │          ╭──────────────────────────────────────────╮
+      │       ╭──╯  ·  ·  ○ coding prompt ·  ·   ·  ·       ╰──╮  Harmless Cloud
+      │       ╰──╮    ·  ·   μ_harmless  ·   ·  ·  ○ chat   ╭──╯  ("squished pancake")
+      │          ╰──────────────────────────────────────────╯
+      │             ▲ stays BELOW τ_v -> 0 intervention -> 0.000 KL drift!
+      └─────────────────────────────────────────────────────────────────────────▶
+                               Wide harmless variance direction
+```
+
 #### Check 2: The Gentle Thermostat — Only Trim the *Excess*
 Even when the bouncer triggers, we don't blindly zero out the whole refusal direction (normal harmless text still has a small average value $c_v$ along $r_v$). Instead, we subtract **only the excess above the harmless average**:
 
 $$y \;\leftarrow\; y \;-\; w_v \cdot \underbrace{\mathbb{I}(d_v \cdot y > \tau_v)}_{\text{Bouncer (0 or 1)}} \cdot \underbrace{\max(r_v \cdot y - c_v,\; 0)}_{\text{Only excess above normal}} \cdot r_v$$
 
 And because every one of the **48 logical steps** gets its own strength $w_v$ (shaped as a smooth triangular hill across the 48 steps, zero everywhere else), we only act on the exact loop passes responsible for refusal — leaving coding and reasoning passes completely alone!
+
+```text
+  Per-Visit Ablation Strength w_v Across All 48 Logical Steps
+  w_v
+   ▲                     ╱╲
+   │                   ╱    ╲          <- Active ONLY where refusal forms
+   │                 ╱        ╲
+   │               ╱            ╲
+   └──────────────┴──────────────┴──────────────▶ Logical Visit (0 .. 47)
+     0..5 Prelude   6..17  18..29  30..41  42..47
+                    Pass 1 Pass 2  Pass 3  Coda
+```
 
 ---
 
@@ -150,6 +282,18 @@ And because every one of the **48 logical steps** gets its own strength $w_v$ (s
    - The reference model measures **intelligence drift** (throwing out anything that shifts harmless text by more than `0.03` KL).
    - **`squid5090 serve`** tests real refusal rates at **500+ tok/s** across harmful and borderline prompts!
 5. **Export (`export`):** Save the winning trial's vectors and thresholds into a single **1.8 MB `.safetensors`** file — ready to plug straight into `squid5090 --ablation`.
+
+```mermaid
+flowchart LR
+    D["1. directions<br/>(336 harm vs 336 harmless -> r_v)"] --> OPT
+    S["2. stats<br/>(2304x2304 Σ -> Fisher-LDA d_v, c_v)"] --> OPT
+    B["3. baseline<br/>(untouched harmless logits)"] --> OPT
+    OPT{"4. Optuna Search<br/>(10 hill + threshold params)"} --> KL["Ref Model:<br/>KL Drift <= 0.03"]
+    OPT --> EV["squid5090 serve:<br/>Refusal Eval @ 500+ tok/s"]
+    KL --> EXP["5. export<br/>(1.8 MB .safetensors)"]
+    EV --> EXP
+    EXP --> SRV["squid5090 --ablation<br/>(541 tok/s, 0 harmless drift)"]
+```
 
 ### Copy-Paste Recipe (with `uv`)
 
