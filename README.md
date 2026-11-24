@@ -59,6 +59,24 @@ $$h' = h_3 + \omega\,(h_3 - h_b), \qquad b \in \{1, 2\}$$
   - **Thinking mode (`enable_thinking=true`, default):** $\omega \in \{0.1, 0.2\}$ with $h_b = h_1$ (and $\omega = 0.3$ with $h_2$) lifts accuracy from **`25/30 (83.3%)` → `27/30 (90.0%, +6.7 pts)`** (`10/10` Math, `10/10` Logic, `7/10` Code), with $\omega = 0.1$ using **5.5% fewer thinking tokens** (`11,893` vs `12,584`) and raising 7,784-tok top-1 match (`96.93% → 96.96%`, `ΔPPL +0.0065`). Above $\omega \ge 0.5$, generation degrades (`24/30`), matching Appendix G.1 of the paper.
   - **Direct mode (`enable_thinking=false`):** Unmodified baseline ($\omega = 0.0$) scores `29/30 (96.7%)` vs `27–28/30` at $\omega \in [0.2, 0.5]$, so `squid5090` keeps `--loopcd-omega 0.0` as the opt-in default and exposes `--loopcd-omega` / `--loopcd-ref` on both CLI and per-request HTTP JSON (`"loopcd_omega": 0.1, "loopcd_ref": 1`).
 
+### 4. Cross-Engine Comparison & Verification (1× RTX 5090)
+
+![Cross-Engine Comparison & LoopCD-Hidden Sweep (1× RTX 5090)](assets/engine_comparison.png)
+
+> **Methodology transparency:** All `squid5090` rows below were measured live end-to-end over HTTP SSE on a single RTX 5090 (`driver 590.48.01`, `CUDA 13.1`, `P1` clocks `13,801 MHz`, `--ctx 65536`, `--mtp 7`, median of 3 runs on identical Chat/Prose/Code/Copy prompts + cold 18.9K prefill, alongside `10/10` automated build/parity/security/cache/SSE/tool-call tests PASS). Rows marked `*` are **verbatim latest upstream README/doc figures** (different prompts, power caps, or clock states — `ingine` HEAD requires CUDA 13.4 / driver 595+ and `basalt` uses `.basalt` packs):
+
+| Engine / Mode | Source & Conditions | Chat `T=0 / T=1` | Prose `T=0 / T=1` | Code / Struct `T=0 / T=1` | Cold Prefill | Published KLD | Max Context (1× 5090) | Key Features & Tradeoffs |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| **`squid5090` (`exact/bf16`)** | **Live RTX 5090** (`P1`, SSE) | 170.7 / 141.6 | 159.2 / 126.7 | 328.7 / 259.4 *(copy 507)* | 7,749 *(18.9K)* | **0.0000** *(ref)* | 64K–128K (`0` spill) | Bit-exact ref, LoopCD-Hidden |
+| **`squid5090` (`fp8/fp8`, ≤448K def.)** | **Live RTX 5090** (`P1`, SSE) | 234.2 / 232.1 | 216.2 / 196.7 | **537.5** / 403.3 *(copy **689.6 / 595.0**)* | 8,185 *(18.9K)* | **0.0061** *(7.8K vs exact)* | 256K–448K (`0` spill) | Official L0–23 MoE, LoopCD, CUDA 13.0+ |
+| **`squid5090` (`fp8/q4`, 512K def.)** | **Live RTX 5090** (`P1`, SSE) | 249.4 / 229.8 | 220.2 / 191.5 | 522.1 / 377.7 *(copy 645)* | 7,870 *(18.9K)* | **0.0096** *(7.8K vs exact)* | **512K** (`22.6 GiB`, `0` spill) | 30-task: `96.7%` direct / `90.0%` LoopCD |
+| **`squid5090` (`nvfp4/q4`, opt-in)** | **Live RTX 5090** (`P1`, SSE) | 286.3 / 292.3 | 269.3 / 239.5 | 509.6 / 465.8 *(P0: 590, RAG 772)* | 8,108 *(18.9K)* | 0.0263 *(7.8K vs exact)* | **1,048,576** (`23.2 GiB`, `0` spill) | 30-task: `90.0%`, real needle PASS to 512K |
+| **`ingine`*** ([`satellitedown`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine)) | *Upstream README* (`P0`, 1K med.) | **501 / 487** | ~450 *(agent)* | **561 / 554** *(tools ~740)* | **10,900** *(20K)* | `0.005` *(ablation, 8K prose)* | 262,144 (`24.4 GiB`, `0` spill) | **Vision**, abliteration, needs CUDA 13.4+ |
+| **`basalt`*** ([`jesdga95`](https://github.com/jesdga95/basalt)) | *Upstream docs* (400W, `MX8`) | **347** *(acc 68%)* | **296** *(acc 51%)* | **628** *(8K JSON, acc 98%)* | **15,820** *(16K)* | **0.0030–0.0045** *(512-tok wt2)* | **1,048,576** *(elastic RAM spill)* | **Vision + Grammar + Parallel + Multi-GPU** |
+| **`llama.cpp`*** (`IQ4_NL`) | *Basalt docs* (`-fa 1`, no draft) | 94.5 | 94.5 | 92.5 | 3,093 *(pp512)* | — | KV-limited | Universal GGUF, vision, grammar |
+
+- **Where each engine wins:** **`ingine`** leads single-stream chat/agent decode (`487–501 tok/s`) and includes vision (requires CUDA 13.4 / driver 595+, caps at 262K); **`basalt`** leads feature breadth (**vision, constrained JSON grammar, parallel slots, multi-GPU**), raw 16K prefill (`15.8K tok/s`), and ultra-low 512-tok KLD (`0.0030–0.0045`) with elastic RAM-spilled 1M context; **`squid5090`** leads **zero-spill 512K–1M VRAM efficiency** (`22.6 GiB` at 512K `fp8/q4`, `23.2 GiB` at 1M `nvfp4/q4` with zero CPU spill), **zero-overhead `LoopCD-Hidden`** (`+6.7 pts` thinking accuracy, `-5.5%` tokens), **zero-dependency 16 MiB single-binary deployment** on CUDA 13.0/13.1 (`driver 580+`), and fast Code/Code-Copy in `0.0061`-KLD `fp8/fp8` (`538–690 tok/s`).
+
 ### Current Scope & Limitations
 - **Text-only:** No vision/image encoder yet.
 - **No constrained grammar / JSON-schema decoding** yet (standard OpenAI `tools` / `tool_calls` streaming is supported).
