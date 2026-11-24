@@ -74,3 +74,13 @@
 {"exp":"audit_kld_long_fp8_q4","date":"2026-11-24","corpus":"tools/kld_corpus.txt","positions":7784,"mode":"fp8","kv":"q4","mean_kld":0.009178,"median_kld":0.001104,"p95_kld":0.039785,"top1_pct":96.80,"ref_ppl":2.7048,"cand_ppl":2.7091,"delta_ppl":0.0043,"weight_vram_gib":16.56,"runtime_vram_gib":1.02}
 {"exp":"audit_kld_long_nvfp4_fp8","date":"2026-11-24","corpus":"tools/kld_corpus.txt","positions":7784,"mode":"nvfp4","kv":"fp8","mean_kld":0.022998,"median_kld":0.002948,"p95_kld":0.095089,"top1_pct":94.99,"ref_ppl":2.7048,"cand_ppl":2.7485,"delta_ppl":0.0437,"weight_vram_gib":14.28,"runtime_vram_gib":1.08}
 {"exp":"audit_kld_long_nvfp4_q4","date":"2026-11-24","corpus":"tools/kld_corpus.txt","positions":7784,"mode":"nvfp4","kv":"q4","mean_kld":0.026291,"median_kld":0.003453,"p95_kld":0.110257,"top1_pct":94.81,"ref_ppl":2.7048,"cand_ppl":2.7607,"delta_ppl":0.0559,"weight_vram_gib":14.28,"runtime_vram_gib":1.02}
+{"exp":"lever15_tc_fp8_kld_fp8_fp8","date":"2026-11-24","corpus":"tools/kld_corpus.txt","positions":7784,"mode":"fp8","kv":"fp8","mean_kld":0.006143,"median_kld":0.000627,"p95_kld":0.025082,"top1_pct":97.42,"ref_ppl":2.7048,"cand_ppl":2.7019,"delta_ppl":-0.0030}
+{"exp":"lever15_tc_fp8_kld_fp8_q4","date":"2026-11-24","corpus":"tools/kld_corpus.txt","positions":7784,"mode":"fp8","kv":"q4","mean_kld":0.009574,"median_kld":0.001189,"p95_kld":0.042074,"top1_pct":96.93,"ref_ppl":2.7048,"cand_ppl":2.7083,"delta_ppl":0.0035}
+{"exp":"lever15_tc_fp8_q4_code_t0","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":0.0,"clocks":"P1","median_tps":427.27,"acc_pct":69.0,"dl":3.49}
+{"exp":"lever15_tc_fp8_q4_code_t1","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":1.0,"clocks":"P1","median_tps":422.39,"acc_pct":70.5,"dl":4.00}
+{"exp":"lever15_tc_fp8_q4_copy_t0","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":0.0,"clocks":"P1","median_tps":486.76,"acc_pct":78.5,"dl":3.86}
+{"exp":"lever15_tc_fp8_q4_copy_t1","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":1.0,"clocks":"P1","median_tps":432.98,"acc_pct":83.7,"dl":4.12}
+{"exp":"lever15_tc_fp8_q4_chat_t0","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":0.0,"clocks":"P1","median_tps":252.26,"acc_pct":44.5,"dl":1.68}
+{"exp":"lever15_tc_fp8_q4_chat_t1","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":1.0,"clocks":"P1","median_tps":226.15,"acc_pct":46.7,"dl":1.68}
+{"exp":"lever15_tc_fp8_q4_prose_t0","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":0.0,"clocks":"P1","median_tps":239.14,"acc_pct":40.6,"dl":1.54}
+{"exp":"lever15_tc_fp8_q4_prose_t1","date":"2026-11-24","mode":"fp8","kv":"q4","mtp":7,"temp":1.0,"clocks":"P1","median_tps":207.55,"acc_pct":38.0,"dl":1.50}

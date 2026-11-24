@@ -21,7 +21,8 @@ Complete consolidated engineering reference for `squid5090`: roofline analysis, 
 | **Lever 11: `B=2048` WGEMM + 2D-Tiled Short Conv** | Multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 576-CTA 4-tap FIR sconv (`-42.9 ms/chunk`) | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | **8,755 / 7,742 tok/s** *(9,181 chunk peak)* | **1M** (`23.22 GiB`) |
 | **Lever 12: Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** *(ablated)* | **332.5 tok/s** *(0 diff 53/53)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
 | **Lever 13: Hybrid O(1) Prompt-Lookup + DSpark** | Zero-malloc 2-entry hash index (`8,192` ring, `min_match_len=16`), bypasses DSpark into `verify_b8_graph_exec` on verbatim matches | **589.5 tok/s** code<br>**771.6 tok/s** quote/RAG *(P0)* | **332.5 tok/s** *(P0)* | 259.0 tok/s | **8,755 / 7,742 tok/s** | **1M** (`23.22 GiB`) |
-| **Lever 14: Rejection Sampling + Long-Ctx KLD + 512K Recall + Hardening** | Exact Leviathan/Chen rejection sampling (`q_i(v)` drafted in CUDA Graph + deterministic fixed-point top-p + residual resampling), FP32-accum FP8 GEMV, 32 MiB HTTP/chunked tokenizer, streaming FP64 `kld` eval (`7,784` tok), real 128K–512K needle recall | **547.0 / 444.9** (`T=0/1`, P1)<br>**610.5 / 518.5** copy (`T=0/1`, P1) | **315.7 / 279.3** (`T=0/1`, P1)<br>**308.4 / 272.6** prose (`P1`) | 248.5 tok/s *(P1)* | **5,988 / 4,575 / 3,062 tok/s** *(128K/256K/512K)* | **512K real PASS**<br>**1M** (`23.23 GiB`) |
+| **Lever 14: Rejection Sampling + Long-Ctx KLD + 512K Recall + Hardening** | Exact Leviathan/Chen rejection sampling (`q_i(v)` drafted in CUDA Graph + deterministic fixed-point top-p + residual resampling), FP32-accum FP8 GEMV, 32 MiB HTTP/chunked tokenizer, streaming FP64 `kld` eval (`7,784` tok), real 128K–512K needle recall | **547.0 / 485.1** (`T=0/1`, P1)<br>**610.5 / 518.5** copy (`T=0/1`, P1) | **315.7 / 279.3** (`T=0/1`, P1)<br>**308.4 / 272.6** prose (`P1`) | 248.5 tok/s *(P1)* | **5,988 / 4,575 / 3,062 tok/s** *(128K/256K/512K)* | **512K real PASS**<br>**1M** (`23.23 GiB`) |
+| **Lever 15: Blackwell TC FP8 MMA + PDL (`serve` default)** | Added fused `qkvrg_fused_fp8_mma`, `linear_fp8_mma`, and `lm_head_fp8_mma` (`mma.m16n8k16.f32.f16` + PDL), boosting `fp8/q4` `T=1.0` code **`+66.4%`** (`253.9 → 422.4 tok/s`) while keeping official L0–23 MoE experts & `0.0061–0.0096` KLD (`ΔPPL <= +0.0035`); promoted `--mode fp8` to default `serve` mode | **427.3 / 422.4** (`fp8/q4`, `T=0/1`, P1)<br>**486.8 / 433.0** copy (`T=0/1`) | **252.3 / 226.2** (`fp8/q4`, `T=0/1`, P1)<br>**239.1 / 207.6** prose (`P1`) | 195.2 tok/s *(fp8)* | 5,988 / 4,575 / 3,062 tok/s | **512K** (`22.59 GiB`, `fp8/q4`)<br>**256K** (`22.65 GiB`, `fp8/fp8`) |
 
 ### Built-In Exact FP64 KLD vs. Official `exact/bf16`
 
@@ -33,8 +34,8 @@ Directly stresses the 8 quantized global KV layers across Python, C++/CUDA, Zig,
 | `exact` | `bf16` | **0.000000** | 0.000000 | 0.000000 | **100.00%** | 2.7048 | +0.0000 |
 | `exact` | `fp8` | 0.003509 | 0.000323 | 0.015505 | 98.39% | 2.7007 | -0.0041 |
 | `exact` | `q4` | 0.007752 | 0.000891 | 0.034746 | 97.15% | 2.7063 | +0.0015 |
-| **`fp8`** | **`fp8`** | **0.006028** | 0.000656 | 0.024474 | **97.44%** | 2.7000 | -0.0048 |
-| **`fp8`** | **`q4`** | **0.009178** | 0.001104 | 0.039785 | **96.80%** | 2.7091 | +0.0043 |
+| **`fp8`** | **`fp8`** | **0.006143** | 0.000627 | 0.025082 | **97.42%** | 2.7019 | -0.0030 |
+| **`fp8`** | **`q4`** | **0.009574** | 0.001189 | 0.042074 | **96.93%** | 2.7083 | +0.0035 |
 | `nvfp4` | `fp8` | 0.022998 | 0.002948 | 0.095089 | 94.99% | 2.7485 | +0.0437 |
 | **`nvfp4`** | **`q4`** | **0.026291** | 0.003453 | 0.110257 | **94.81%** | 2.7607 | +0.0559 |
 

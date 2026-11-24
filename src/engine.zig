@@ -2246,12 +2246,8 @@ pub const Engine = struct {
             const in_kh = if (distinct_inputs) self.attn_in_h[1] else self.attn_in_h[0];
             const in_vh = if (distinct_inputs) self.attn_in_h[2] else self.attn_in_h[0];
 
-            if (lw.w_qrgs.kind == @intFromEnum(constants.WeightKind.nvfp4)) {
+            if (lw.w_qrgs.kind != @intFromEnum(constants.WeightKind.bf16)) {
                 cuda.squid_launch_qkvrg_fused(&lw.w_qrgs, &lw.w_k, &lw.w_v, in_qh, in_kh, in_vh, self.qrgs, self.k_proj, self.v_proj, batch_size, self.stream);
-            } else if (lw.w_qrgs.kind == @intFromEnum(constants.WeightKind.fp8)) {
-                cuda.squid_launch_linear_h(&lw.w_qrgs, in_qh, self.qrgs, batch_size, 0, self.stream);
-                cuda.squid_launch_linear_h(&lw.w_k, in_kh, self.k_proj, batch_size, 0, self.stream);
-                cuda.squid_launch_linear_h(&lw.w_v, in_vh, self.v_proj, batch_size, 0, self.stream);
             } else {
                 cuda.squid_launch_linear(&lw.w_qrgs, in_q, self.qrgs, batch_size, 0, self.stream);
                 cuda.squid_launch_linear(&lw.w_k, in_k, self.k_proj, batch_size, 0, self.stream);

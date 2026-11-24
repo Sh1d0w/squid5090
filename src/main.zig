@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var tokens_file: []const u8 = "";
     var prompt_text: []const u8 = "";
     var prompt_file: []const u8 = "";
-    var mode_str: []const u8 = if (std.mem.eql(u8, command, "serve")) "nvfp4" else "exact";
+    var mode_str: []const u8 = if (std.mem.eql(u8, command, "serve")) "fp8" else "exact";
     var kv_str: []const u8 = "auto";
     var host: []const u8 = "0.0.0.0";
     var model_name: []const u8 = "inkling-2-mini";
@@ -668,7 +668,7 @@ fn print_usage() void {
     tiger.write_fd_all(2,
         "squid5090 — TigerStyle Zig + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n" ++
             "Usage:\n" ++
-            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
+            "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode fp8|nvfp4|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
             "  squid5090 generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n" ++
             "  squid5090 bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv auto] [--mtp 0] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++

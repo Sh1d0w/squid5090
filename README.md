@@ -23,15 +23,16 @@ All numbers below are measured directly on one RTX 5090 (32 GiB GDDR7) with `squ
 | **`exact / bf16`** *(official)* | **0.0000** | 100.00% | 2.7048 | 292.8 / 248.8 tok/s | — | — | — | 18.28 GiB |
 | `exact / fp8` | 0.0035 | 98.39% | 2.7007 | — | — | — | — | 18.28 GiB |
 | `exact / q4` | 0.0078 | 97.15% | 2.7063 | — | — | — | — | 18.28 GiB |
-| **`fp8 / fp8`** | **0.0060** | **97.44%** | 2.7000 | — | — | — | — | 16.85 GiB |
-| **`fp8 / q4`** *(quality sweet spot)* | **0.0092** | **96.80%** | 2.7091 | **356.2 / 253.9 tok/s** | — | 233.6 / 208.7 tok/s | 242.8 / 236.2 tok/s | 16.85 GiB |
+| **`fp8 / fp8`** *(default ≤448K)* | **0.0061** | **97.42%** | 2.7019 | — | **402.9 / 434.9 tok/s** | 226.4 / 207.4 tok/s | 249.7 / 216.9 tok/s | 16.85 GiB |
+| **`fp8 / q4`** *(default 512K)* | **0.0096** | **96.93%** | 2.7083 | **427.3 / 422.4 tok/s** | **486.8 / 433.0 tok/s** | **252.3 / 226.2 tok/s** | **239.1 / 207.6 tok/s** | 16.85 GiB |
 | `nvfp4 / fp8` | 0.0230 | 94.99% | 2.7485 | — | — | — | — | 14.57 GiB |
-| **`nvfp4 / q4`** *(max speed / 1M)* | **0.0263** | **94.81%** | 2.7607 | **547.0 / 444.9 tok/s** *(P0: 589.5)* | **610.5 / 518.5 tok/s** | **315.7 / 279.3 tok/s** *(P0: 332.5)* | **308.4 / 272.6 tok/s** | 14.57 GiB |
+| **`nvfp4 / q4`** *(opt-in max speed / 1M)* | **0.0263** | **94.81%** | 2.7607 | **547.0 / 485.1 tok/s** *(P0: 589.5)* | **610.5 / 518.5 tok/s** | **315.7 / 279.3 tok/s** *(P0: 332.5)* | **308.4 / 272.6 tok/s** | 14.57 GiB |
 
+- **Accuracy-first default (`--mode fp8`):** `squid5090 serve` defaults to **`--mode fp8`** (keeping ALL 24 MoE expert layers in 100% official checkpoint precision — L0–19 NVFP4 + L20–23 MXFP8 — plus official BF16 routers/controllers, and running attention + `lm_head` through Blackwell Tensor Core `mma.m16n8k16.f32.f16` FP8 MMA + PDL). This delivers **`0.0061–0.0096` long-context KLD** (`ΔPPL -0.0030` to `+0.0035` over 7,784 tokens — **16× smaller PPL delta** than 4-bit) while reaching **`422.4 tok/s`** code (`T=1.0`, `acc=70.5%`, `dl=4.00`) and **`486.8 tok/s`** code-copy in `22.6 GiB` at 512K!
 - **Temperature transparency:** `bench` defaults to `--temp 0.0` (greedy); `serve` defaults to `--temp 1.0 --top-p 0.95` (matching Inkling-2-Mini's official `generation_config.json`), using **exact Leviathan/Chen stochastic rejection sampling** (`q_i(v)` drafted from DSpark + residual resampling from $\mathrm{norm}(\max(0, p - q))$ inside the CUDA Graph).
-- **Clock-state & prompt transparency:** The unified table above was measured on identical prompts at shared-GPU `P1` memory clocks (`13,801 MHz`); dedicated `P0` clocks (`14,001 MHz`) yield ~7% higher decode on the same prompts (`589.5 tok/s` code, `332.5 tok/s` chat, `541.1 tok/s` ablated, `259.6 tok/s` `mtp=0`). On longer verbatim RAG/code-copy bursts (`91.5%` prompt-lookup hit rate, `P0`), hybrid lookup reaches `771.6 tok/s`.
-- **Short- vs. long-context KLD:** On 529-token prompts (inside the 1,024-token BF16 local window), KLD is `0.0030` (`fp8/fp8`), `0.0050` (`fp8/q4`), and `0.0184` (`nvfp4/q4`). At 7,784 tokens (7.6× past the local window, shown above), `q4` global KV adds only `+0.0032–0.0078` KLD (`ΔPPL <= +0.0043` in `fp8/q4`).
-- **Choosing a mode:** Use **`--mode fp8 --kv fp8`** (or `--kv q4`) for near-lossless `0.006–0.009` long-context KLD (`96.8–97.4%` top-1 agreement); use **`--mode nvfp4 --kv q4`** for peak single-user throughput (`0.0263` long-ctx KLD, `ΔPPL +0.0559`) or full 1M context in `23.2 GiB`.
+- **Clock-state & prompt transparency:** The unified table above was measured on identical prompts at shared-GPU `P1` memory clocks (`13,801 MHz`); dedicated `P0` clocks (`14,001 MHz`) yield ~7% higher decode on the same prompts (`589.5 tok/s` `nvfp4` code, `332.5 tok/s` chat, `541.1 tok/s` ablated, `259.6 tok/s` `mtp=0`). On longer verbatim RAG/code-copy bursts (`91.5%` prompt-lookup hit rate, `P0`), `nvfp4` hybrid lookup reaches `771.6 tok/s`.
+- **Short- vs. long-context KLD:** On 529-token prompts (inside the 1,024-token BF16 local window), KLD is `0.0030` (`fp8/fp8`), `0.0050` (`fp8/q4`), and `0.0184` (`nvfp4/q4`). At 7,784 tokens (7.6× past the local window, shown above), `q4` global KV adds only `+0.0035` KLD over `fp8` KV (`ΔPPL +0.0035` in `fp8/q4`).
+- **Choosing a mode:** Keep the default **`--mode fp8`** (`--kv auto` selects `fp8` ≤ 448K and `q4` at 512K–1M) for near-lossless accuracy (`0.006–0.0096` KLD, `~422–487 tok/s`); opt in to **`--mode nvfp4 --kv q4`** only when you need peak 4-bit throughput (`0.0263` KLD, `ΔPPL +0.0559`) or 1M context in `23.2 GiB`.
 
 ### 2. Real Long-Context Recall vs. Synthetic 1M Step-Latency Scaling (`--mode nvfp4 --kv q4`)
 
@@ -89,17 +90,21 @@ uvx --from huggingface-hub hf download thinkingmachines/Inkling-2-Mini \
 ### 3. Run the OpenAI API Server, CLI, or KLD Evaluator
 
 ```bash
-# OpenAI HTTP/SSE server (512K Q4 KV, ~20.3 GiB VRAM, exact rejection sampling at temp=1.0)
-./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-  --host 0.0.0.0 --port 8000 --mode nvfp4 --kv q4 --ctx 524288 --mtp 7 --temp 1.0 --top-p 0.95
-
-# Higher-precision mode (0.0092 long-ctx KLD vs exact/bf16, ~22.6 GiB at 512K)
+# Default high-accuracy OpenAI HTTP/SSE server (FP8 Tensor Core MMA + official L0-23 MoE, 512K Q4 KV, ~22.6 GiB VRAM, 0.0096 KLD)
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
   --host 0.0.0.0 --port 8000 --mode fp8 --kv q4 --ctx 524288 --mtp 7 --temp 1.0 --top-p 0.95
 
+# Near-lossless 256K FP8 KV (0.0061 long-ctx KLD, dPPL -0.0030, ~22.6 GiB VRAM)
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
+  --host 0.0.0.0 --port 8000 --mode fp8 --kv fp8 --ctx 262144 --mtp 7 --temp 1.0 --top-p 0.95
+
+# Opt-in max-speed / 1M context NVFP4 mode (~23.2 GiB at 1M, 0.0263 KLD)
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
+  --host 0.0.0.0 --port 8000 --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --temp 1.0 --top-p 0.95
+
 # Optional: enable 1.8 MB runtime-gated Fisher-LDA abliteration (zero weight modification)
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-  --host 0.0.0.0 --port 8000 --mode nvfp4 --kv q4 --ctx 524288 --mtp 7 \
+  --host 0.0.0.0 --port 8000 --mode fp8 --kv q4 --ctx 524288 --mtp 7 \
   --ablation /opt/models/inkling-2-mini/inkling-2-mini-abliterated.safetensors
 
 # Benchmark (supports --temp 0.0 or --temp 1.0)
@@ -123,7 +128,7 @@ curl -s http://localhost:8000/health
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode` | `nvfp4` (`serve`), `exact` (CLI) | Weight precision: `exact` (BF16 dense) \| `fp8` (FP8 dense, `0.006–0.009` long-ctx KLD) \| `nvfp4` (`0.026` long-ctx KLD, max speed) |
+| `--mode` | `fp8` (`serve`), `exact` (CLI) | Weight precision: `exact` (BF16 dense) \| `fp8` (FP8 TC MMA dense + official L0–23 MoE, `0.006–0.0096` KLD) \| `nvfp4` (`0.026` KLD, max speed) |
 | `--kv` | `auto` | Global KV cache format: `bf16` \| `fp8` \| `q4` (enables up to `1M` context in `23.2 GiB`) |
 | `--ctx` | `65536` (`serve`), `8192` (CLI) | Context window size up to `1048576` |
 | `--mtp` | `7` (`serve`), `0` (CLI) | DSpark drafter (`0` = off, `7` = adaptive `{2,4,8}` CUDA Graph switch) |
