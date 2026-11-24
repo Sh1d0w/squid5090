@@ -19,6 +19,9 @@ following Apache-2.0 licensed open-source projects:
    - Multi-stage `cp.async` `128x128x64` grouped MoE GEMM pipeline structure for
      prefill, specialized for Blackwell `cvt.rn.f16x2.e2m1x2` + FP16 MMA
      (cuda/kernels_prefill.cu).
+   - Offline Fisher-LDA abliteration generation and refusal evaluation tools
+     (tools/ablate.py, tools/inkling_ref.py, tools/refusal_eval.py,
+     tools/requirements.txt), adapted to evaluate refusals via `squid5090 serve`.
 
 2. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

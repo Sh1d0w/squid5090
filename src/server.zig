@@ -553,6 +553,7 @@ fn handle_chat_completions(
     var has_max_completion_tokens: bool = false;
     var stream: bool = false;
     var include_usage: bool = false;
+    var enable_thinking: bool = true;
     var req_mtp: i32 = @intCast(config.default_mtp);
     var stops: StopList = .{};
     var key_buf: [128]u8 = undefined;
@@ -603,6 +604,8 @@ fn handle_chat_completions(
             if (!has_max_completion_tokens) max_tokens = v;
         } else if (std.mem.eql(u8, k, "stream")) {
             stream = parse_json_bool(body, &pos);
+        } else if (std.mem.eql(u8, k, "enable_thinking")) {
+            enable_thinking = parse_json_bool(body, &pos);
         } else if (std.mem.eql(u8, k, "stream_options")) {
             const start = pos;
             tokenizer_mod.skip_json_value(body, &pos);
@@ -628,6 +631,9 @@ fn handle_chat_completions(
     // Render Inkling-2-Mini chat template directly into static render_buf!
     var render_writer = tiger.ByteWriter.init(buffers.render_buf);
     const sys_prefix_bytes: usize = render_chat_template_zero_alloc(&render_writer, messages_json, tools_json, effort, buffers.scratch_str_buf);
+    if (!enable_thinking) {
+        render_writer.append_slice("<|message_model|><|content_text|>");
+    }
     const rendered = render_writer.slice();
 
     // Encode system+tools prefix first (clean special-token boundary <|end_message|>) to pass exact checkpoint hint!
@@ -655,6 +661,7 @@ fn handle_chat_completions(
     const created: i64 = tiger.epoch_seconds();
 
     var parser = InklingStreamParser.init(tokenizer, config.raw_thinking, buffers, prng_state.*);
+    if (!enable_thinking) parser.section = .text;
     prng_state.* = prng_state.* *% 6364136223846793005 +% 1;
 
     if (!stream) {

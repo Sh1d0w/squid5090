@@ -279,7 +279,7 @@ TigerStyle's **243 always-on release assertions** added zero measurable GPU over
 
 ## What We Did to Yield These GPU Results
 
-We followed a hardware-first, roofline-driven hill-climbing methodology (full details in [THEORY.md](THEORY.md), [PLAN.md](PLAN.md), and [ledger.jsonl](ledger.jsonl)): measure real hardware ceilings first (`1,512.9 GB/s` GDDR7, 170 SMs, 96 MiB L2), optimize one lever at a time with 6-run medians, verify bitwise parity & long-context needle retrieval, and revert regressions.
+We followed a hardware-first, roofline-driven hill-climbing methodology (full details in [LEARNINGS.md](LEARNINGS.md), [THEORY.md](THEORY.md), [PLAN.md](PLAN.md), and [ledger.jsonl](ledger.jsonl)): measure real hardware ceilings first (`1,512.9 GB/s` GDDR7, 170 SMs, 96 MiB L2), optimize one lever at a time with medians, verify bitwise parity & long-context needle retrieval, and revert regressions.
 
 | Lever | What Changed | Effect (P1, 512 tok, 6-run median unless noted) |
 |---|---|---|
@@ -312,9 +312,16 @@ squid5090/
 ├── deploy/
 │   └── squid5090.service     # Persistent systemd service unit for the OpenAI API server
 ├── README.md                 # Quickstart, OpenAI server guide & optimization walkthrough
+├── LEARNINGS.md              # Deep-dive GPU optimization & Fisher-LDA abliteration learnings + workflow
+├── NOTICE                    # Apache-2.0 attributions
 ├── THEORY.md                 # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                   # Optimization roadmap & full experiment table
 ├── ledger.jsonl              # Structured JSONL log of every experiment & gate
+├── tools/                    # Optional offline Python abliteration & refusal-eval tooling (zero Python in runtime!)
+│   ├── ablate.py             # Full Fisher-LDA + Optuna TPE pipeline to generate custom 1.8 MB .safetensors
+│   ├── inkling_ref.py        # Packed-expert BF16 reference wrapper with Visits & Ablation hooks
+│   ├── refusal_eval.py       # 32-prompt over-refusal evaluator against live `squid5090 serve`
+│   └── requirements.txt      # Offline Python deps for tools/ablate.py only
 ├── cuda/                     # Pure Blackwell sm_120a CUDA device kernels & C-ABI bridge
 │   ├── config.hpp            # Shared CUDA architectural geometry constants
 │   ├── weights.hpp           # Plain POD device-pointer descriptors
