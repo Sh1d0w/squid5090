@@ -33,7 +33,7 @@ following Apache-2.0 licensed open-source projects:
 3. sybil-solutions/inference-optimisation-skill
    https://github.com/sybil-solutions/inference-optimisation-skill
    - Hardware-ceiling roofline methodology, noise-controlled hill-climbing
-     workflow, and lever prioritization documented in OPTIMIZATIONS.md.
+     workflow, and lever prioritization documented in LEARNINGS.md.
 
 4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

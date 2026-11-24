@@ -1,226 +1,189 @@
-# Engineering & Abliteration Learnings (`squid5090`)
+# `squid5090` Technical Reference & Learnings
 
-A technical post-mortem of everything we learned optimizing [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) from **`76.6 tok/s` to `585.9 tok/s`** single-user decode, **`9,181 tok/s`** chunk prefill, and **`1,048,576` (1M) context** on a single NVIDIA RTX 5090 — plus the full mathematical derivation and practical pipeline for generating custom **1.8 MB runtime-gated Fisher-LDA abliteration** `.safetensors` files with [`tools/ablate.py`](tools/ablate.py).
+Complete consolidated engineering reference for `squid5090`: roofline analysis, Blackwell `sm_120a` decode & prefill kernels, Hybrid Prompt-Lookup + DSpark speculative decoding, 1M-context memory architecture, TigerStyle Zig systems design, an explicit audit against [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill) (what we applied *and* what remains unexploited), and the complete Fisher-LDA runtime-gated abliteration math and `uv` generation workflow.
+
+*(For a high-level plain-English 3Blue1Brown-style overview, read [`LITE.md`](LITE.md). For quickstart build & install, see [`README.md`](README.md).)*
 
 ---
 
-## 1. End-to-End Progression Summary (Single RTX 5090, 32 GiB GDDR7)
+## 1. Benchmark Summary & Full Progression (Single RTX 5090, 32 GiB GDDR7)
 
-| Milestone | Key Engineering Change | Code Decode (`c=1`) | Chat Decode | Single-Token (`mtp=0`) | Prefill (20K / 64K) | Max Context / VRAM |
+### End-to-End Hill-Climb (`76.6 → 589.5 / 771.6 tok/s`)
+
+| Milestone / Lever | Core Change | Code (`c=1`) | Chat (`c=1`) | `mtp=0` | Prefill (20K / 64K) | Max Ctx / VRAM |
 |---|---|---:|---:|---:|---:|---|
-| **v0 Eager Baseline** | All 48 visits implemented from scratch (`exact` BF16+NVFP4/MXFP8) | — | — | 76.6 tok/s | ~900 tok/s | ~200K (`18.8 GiB`) |
-| **CUDA Graphs + NVFP4 PTX** | Persistent `cudaGraphExec_t`, Blackwell `cvt.rn.f16x2.e2m1x2`, all-NVFP4 linear load-time quant | — | — | 190.1 tok/s | ~900 tok/s | ~256K (`15.0 GiB`) |
-| **Half-Warp GEMV + Mega-Fusions + DSpark `mtp=3`** | 99%-BW `lm_head`, 32K pruned draft vocab, zero-atomic deterministic MoE, TC Split-K FlashDecoding, `B=512` TC prefill | 369.6 tok/s | 307.3 tok/s | 243.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
-| **Blackwell PDL + TC `mma.m16n8k16` Decode** | `cudaLaunchAttributeProgrammaticStreamSerialization` + `pdl_wait_fenced`, register-permuted TC `moe_up`/`moe_down` & dense NVFP4 GEMVs | 470.2 tok/s | 307.3 tok/s | **259.0–262.8 tok/s** | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
-| **Adaptive `{2, 4, 8}` Switch Graph + Overlap** | Markov online softmax confidence, CUDA 13.1 `cudaGraphCondTypeSwitch`, overlapped next-round draft | **585.9 tok/s** | **332.5 tok/s** | 259.0–262.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
-| **`B=2048` WGEMM Prefill + 2D-Tiled Short Conv** | Multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 576-CTA 4-tap FIR sconv | **585.9 tok/s** | **332.5 tok/s** | 259.0–262.8 tok/s | **8,755 / 7,742 tok/s** *(9,181 chunk peak)* | **1M** (`23.22 GiB`) |
-| **Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** | **332.5 tok/s** *(0 harmless diff)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
+| **v0 Eager Baseline** | Full 48-visit Inkling-2-Mini in `exact` (BF16 + NVFP4/MXFP8) | — | — | 76.6 tok/s | ~900 tok/s | ~200K (`18.8 GiB`) |
+| **Levers 1–3: Graphs + NVFP4 PTX** | Persistent `cudaGraphExec_t`, Blackwell `cvt.rn.f16x2.e2m1x2`, load-time NVFP4 quant (`5.47 → 2.80 GB/tok`), fused `qkvrg` | — | — | 190.1 tok/s | ~900 tok/s | ~256K (`15.0 GiB`) |
+| **Levers 4–7: DSpark + 99%-BW GEMV + 1M TC Split-K** | Pruned 32K draft vocab (`868 → 428 µs`), half-warp `lm_head` (`1,497 GB/s`), zero-atomic deterministic MoE, `--kv q4` + host-pinned embed, unified TC Split-K FlashDecoding, `B=512` TC prefill | 369.6 tok/s | 307.3 tok/s | 243.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
+| **Lever 8: TigerStyle Zig Consolidation** | Rewrote host engine, BPE tokenizer (`32.8M tok/s`), 2-arena `VRAMArena`, zero-malloc HTTP/SSE server in Zig (`build.zig`) | 369.6 tok/s | 307.3 tok/s | 243.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
+| **Lever 9: Blackwell PDL + TC `mma.m16n8k16` Decode** | `cudaLaunchAttributeProgrammaticStreamSerialization` + `pdl_wait_fenced`, register-permuted TC `moe_up_tc` / 144-CTA `moe_down_tc` / dense NVFP4 GEMVs | 470.2 tok/s | 307.3 tok/s | **259.0–262.8 tok/s** | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
+| **Lever 10: Adaptive `{2,4,8}` Switch Graph + Overlap** | Markov online softmax confidence, CUDA 13.1 `cudaGraphCondTypeSwitch`, overlapped next-round drafting | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
+| **Lever 11: `B=2048` WGEMM + 2D-Tiled Short Conv** | Multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 576-CTA 4-tap FIR sconv (`-42.9 ms/chunk`) | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | **8,755 / 7,742 tok/s** *(9,181 chunk peak)* | **1M** (`23.22 GiB`) |
+| **Lever 12: Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** *(ablated)* | **332.5 tok/s** *(0 harmless diff)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
+| **Lever 13: Hybrid O(1) Prompt-Lookup + DSpark** | Zero-malloc 2-entry hash index (`8,192` ring, `min_match_len=16`), bypasses DSpark into `verify_b8_graph_exec` on verbatim matches | **589.5 tok/s** code<br>**771.6 tok/s** quote/RAG | **332.5 tok/s** | 259.0 tok/s | **8,755 / 7,742 tok/s** | **1M** (`23.22 GiB`) |
+
+### Long-Context Scaling & Prefix Cache Latency (`--mode nvfp4 --kv q4`)
+
+| Workload / Context Depth | Prefill Latency / Rate | Decode Speed (`c=1`) | Total VRAM | Notes |
+|---|---:|---:|---:|---|
+| **Short Code (1,024 tok)** | `29.0 ms` | **589.5 tok/s** (`acc=73.1%`, `dl=3.82`) | **15.59 GiB** | Bit-exact parity; `lookup=10/268` |
+| **Verbatim Code Copy / RAG (568 tok)** | `91.2 ms` | **771.6 tok/s** (`acc=91.5%`, `dl=5.40`) | **15.59 GiB** | Bit-exact parity; `lookup=38/105` (+64.7 tok/s vs DSpark-only) |
+| **Live 16.0K HTTP cold warm-up** | `2,110.3 ms` (`7,600 tok/s`) | **383.3 tok/s** | **23.22 GiB** | Full 1M-ctx server over HTTP SSE |
+| **Live 16.1K HTTP Turn 1 (warm prefix)** | **`71.9 ms`** (`16,033` cached) | **446.7 tok/s** (`dl=3.10`) | **23.22 GiB** | `107.4 ms` end-to-end TTFT (1,600 gen tok) |
+| **Cold 20K (`19,978` tok)** | **`2,281.9 ms`** (`8,755 tok/s`) | **453.6 tok/s** | **16.71 GiB** | `9,181 tok/s` `B=2048` chunk peak |
+| **Cold 64K Needle-in-a-Haystack (PASS)** | **`8,464.8 ms`** (`7,742 tok/s`) | **317.6–331.0 tok/s** | **16.71 GiB** | Verbatim needle recall PASS |
+| **Warm 82.5K turn (past 65K cap)** | **`62.4 ms`** (`82,454` cached) | **237.5 tok/s** | **23.22 GiB** | **>1,400× faster** than cold prefill |
+| **Cold 131K (`129,984` tok)** | **`19,971.5 ms`** (`6,509 tok/s`) | **236.4–284.8 tok/s** | **16.71 GiB** | Sustained >6.5K tok/s across 130K tokens |
+| **256K / 512K / 1M (`1,048,000` `longctx`)** | — | **228.1 / 163.7 / 108.0 tok/s** (`B=4 @dl=2.5`) | **17.8 / 20.4 / 23.22 GiB** | `B=1`: `119.8 / 79.5 / 48.5 tok/s`; 0 host spill |
 
 ---
 
-## 2. Roofline & Architectural Realities of Inkling-2-Mini on Blackwell (`sm_120a`)
+## 2. Roofline & Inkling-2-Mini Hardware Realities (`sm_120a`)
 
-1. **Measured hardware ceilings beat spec-sheet numbers:**
-   - RTX 5090 sustained GDDR7 bandwidth measured in-device is **`1,512.9 GB/s`** across 170 SMs, with 96 MiB L2 and 100 KiB dynamic shared memory per SM.
-   - Always verify the GPU is in **`P0`** (`14,001 MHz` memory clock, `0%` background utilization) before attributing a 5–10% delta to a kernel change. Background GPU consumers silently clamp the card into `P1` (`13,801 MHz` mem) and add SM contention.
-2. **Why Inkling-2-Mini has unusual performance characteristics:**
-   - **24 physical layers → 48 logical visits:** layers `0..5`, then layers `6..17` looped **3 times** (`36` looped visits), then layers `18..23`.
-   - **AttnRes + cross-pass controllers + 4-tap short convolutions:** every visit includes depth attention over block boundaries, post-attention and post-MLP causal 4-tap FIR convolutions, and on looped passes 1–2 four low-rank controllers. These small memory-bound ops quickly dominate latency unless mega-fused and overlapped.
-   - **Hybrid attention enables 1M context on 32 GiB:** 36 visits are local sliding-window attention (`W = 1024`, fixed tiny ring buffer `kv_cap = 1280`), leaving only **12 global visits sharing 8 unique global KV caches** (plus 1 global DSpark drafter layer). Quantizing global KV to group-64 INT4 (`--kv q4`) + pinning the `0.86 GiB` BF16 embedding table in zero-copy host RAM fits **`1,048,576` tokens in `23.22 GiB` VRAM** with zero host-RAM spilling of weights or KV caches.
-   - **Bandwidth wall at `B=1`:** Quantizing dense weights, `lm_head`, and layers `20..23` experts to NVFP4 on load cuts per-token HBM traffic from `5.47 GB/tok` to `~2.80 GB/tok`. Even at `~75%` aggregate GDDR7 utilization across 48 visits, `B=1` tops out around `260–270 tok/s`. Breaking `500+ tok/s` requires **multi-token speculative verification** (`B = 2..8`) where dense weights are loaded once for `B` tokens and MoE experts are deduplicated across tokens.
+1. **Measured hardware ceilings** (full derivation in [`THEORY.md`](THEORY.md)): RTX 5090 sustained GDDR7 copy bandwidth is **`1,512.9 GB/s`**, 170 SMs, 96 MiB L2, 100 KiB dynamic SMEM/SM. Always confirm `P0` clocks (`14,001 MHz` mem, `0%` background GPU load) before benchmarking — background GPU load silently drops the card to `P1` (`13,801 MHz`) and costs ~10% decode throughput.
+2. **24 physical layers → 48 logical visits:** layers `0..5`, `3×(6..17)`, `18..23`, with AttnRes block-boundary depth attention, cross-pass low-rank controllers, and static + dynamic 4-tap causal short convolutions.
+3. **Why 1M context fits in `23.22 GiB`:** 36 visits are local SWA (`W=1024`, fixed `1280`-slot ring), leaving only **12 global visits sharing 8 unique global KV caches** (+ 1 global DSpark layer). Group-64 INT4 global KV (`--kv q4`, 2-op exact FP16 magic-bias nibble unpack) + zero-copy pinned host embeddings (`0.86 GiB` saved) fits `1,048,576` tokens with `8.8 GiB` VRAM headroom.
+4. **Why speculation is mandatory past ~265 tok/s:** All-NVFP4 weight traffic is `~2.80 GB/tok`. At `~75%` aggregate GDDR7 utilization across 48 visits, `B=1` tops out at `259–268 tok/s`. Verifying `B=2..8` tokens amortizes dense weight loads `B×` and deduplicates shared MoE experts.
 
 ---
 
-## 3. GPU Decode Optimization Learnings (`76.6 → 585.9 tok/s`)
+## 3. Blackwell Decode & Prefill Kernel Learnings
 
-### 3.1 Native Blackwell FP4 Unpack & Streaming Loads
-- Using Blackwell's native `cvt.rn.f16x2.e2m1x2` PTX instruction + 128-bit `uint4` streaming loads (`ld.global.nc.L1::no_allocate.L2::256B`) eliminates LUT overhead and L1 thrashing.
-- **CUDA 13.1 `ptxas` pitfall:** Do **not** enable `L2::cache_hint` on CUDA 13.1 (`ptxas` codegen bug). Plain `ld.global.nc.L1::no_allocate.L2::256B` compiles cleanly and hits 99% of measured GDDR7 bandwidth on `lm_head` (`1,497 GB/s`).
+### Decode (`cuda/kernels_common.cuh`, `kernels_gemv.cu`, `kernels_inkling.cu`, `kernels_dspark.cu`, `cuda_abi.cu`)
+- **NVFP4 PTX + streaming loads:** `cvt.rn.f16x2.e2m1x2` + `ld.global.nc.L1::no_allocate.L2::256B` hits `1,497 GB/s` (`99%` of measured ceiling) on half-warp `lm_head`. **CUDA 13.1 pitfall:** never enable `L2::cache_hint` (`ptxas` 13.1 codegen bug).
+- **Blackwell PDL:** `cudaLaunchKernelEx` + `cudaLaunchAttributeProgrammaticStreamSerialization` + `pdl_wait_fenced(zero)` + `pdl_trigger()` overlaps producer epilogues with consumer weight-load prologues across ~600 kernel boundaries per step (`mtp=0`: `243.8 → 262.8 tok/s`).
+- **Register-permuted Tensor Core `mma.m16n8k16` for `M=1..8`:** Replaces CUDA-core `half2` FMA in `moe_up_tc_kernel`, 144-CTA fused `moe_down_tc_kernel`, `qkvrg_fused_mma`, `linear_nvfp4_mma` (`K ∈ {2304, 3072, 9216}`), and `lm_head_mma` (`mtp=3`: `369.6 → 470.2 tok/s`).
+  - *Numerical note:* `B=1` (FP16-pair CUDA core) vs `B>=2` (FP32-accum TC MMA) can 1-ULP tie-break differently on long greedy rollouts; `B=2`, `B=4`, `B=8`, and adaptive `{2,4,8}` share the exact same FP32-accum path and match bit-for-bit.
+- **Adaptive `{2, 4, 8}` CUDA Graph Conditional Switch + Overlapped Drafting:**
+  - Markov head computes online softmax `(m, sum)` under softcap `30.0` alongside argmax to emit per-draft confidences `p_0..p_6`.
+  - Device kernel `z_adaptive_select_width_kernel` chooses `B=8` (if `p_0, p_1, p_2 > threshold`), `B=4` (if `p_0 > threshold`), or `B=2` otherwise, and dispatches inside a single CUDA 13.1 `cudaGraphCondTypeSwitch` with zero host sync.
+  - Next round's `draft_graph_exec` is enqueued behind `done_event` so drafting overlaps host D2H/SSE emission.
+  - **Zero-rollback guarantee:** 16-slot modular sconv rings `(p & 15)` (`8 + 3 = 11 < 16`) + position-indexed KV/DSpark caches mean rejected tokens strictly sit ahead of `*d_pos = P + n_acc` and are overwritten on the next step.
+- **Hybrid O(1) Prompt-Lookup + DSpark Drafter (`src/engine.zig`):**
+  - Zero-malloc `PromptLookupIndex` (`8,192`-token ring + `16,384`-slot 2-entry hash table storing `(pos0, pos1)`, ~320 KiB host RAM, 0 VRAM).
+  - **Key threshold lesson:** `min_match_len = 6` caused 37 false triggers on short Python test boilerplate (`assert cache.get("...`), regressing regular code from `586 → 565 tok/s`. Raising `min_match_len = 16` eliminated false triggers completely, lifting regular code to **`589.5 tok/s`** and verbatim code/RAG quotes from **`706.9 → 771.6 tok/s`** (`+9.2%`, `91.5%` acceptance, 100% bit-exact!).
+  - Uses a `draft_in_flight` state machine: on a hit, a 28-byte FIFO H2D overwrites `d_drafts` and launches `verify_b8_graph_exec` (which still runs `commit_dspark = true` so DSpark stays synchronized), then sets `draft_in_flight = false` so every subsequent round in the matching passage skips `draft_graph_exec` completely!
 
-### 3.2 Blackwell Programmatic Dependent Launch (PDL)
-- Launching kernels inside a captured CUDA Graph with `cudaLaunchKernelEx` + `cudaLaunchAttributeProgrammaticStreamSerialization` allows the GPU scheduler to start a consumer kernel's prologue (index math, address computation, weight-load issue) **before** the producer kernel's epilogue finishes retiring, synchronizing only at `pdl_wait_fenced(zero)` immediately before reading producer outputs and calling `pdl_trigger()` right after writing outputs.
-- Across 48 visits (~600 kernel boundaries per decode step), PDL alone lifted `mtp=0` from `243.8 → 262.8 tok/s` with zero algorithmic change.
+### Prefill (`cuda/kernels_prefill.cu`)
+- **`B=2048` Multi-Stage `cp.async` `128×128×64` Grouped MoE GEMM (`p_wgemm_kernel`):** Raises average tokens/expert `32 → 128`, uses 3-stage swizzled FP16 activation `cp.async` + 3–7-stage weight `cp.async` (~98–99 KiB SMEM) + `ldmatrix.x4` + FP16 MMA, contiguous sorted `Up → Down` handoff, and pigeonhole tile bound (`B<=512, TR=32` or `B<=2048, TR=128` → `<= 256` tiles, zero host sync). Cut 48-visit MoE prefill for 2,048 tokens to `92.2 ms` (`2.4×` faster).
+- **2D Time-Tiled Short Conv (`p_sconv_post_res_kernel`):** `SQUID_PROF_PREFILL=1` revealed the 4-tap FIR sconv was running serially over `B=2048` on only `9` CTAs (`70.3 ms` = 26% of prefill!). Tiling across `SCONV_T_BLK = 32` (`576` CTAs) + a separate 9-CTA `p_sconv_ring_commit_kernel` (preventing the race where `(pos0 + 2047) & 15 == (pos0 - 1) & 15` overwrites CTA 0's read!) saved **`42.9 ms/chunk`** and jumped chunk prefill from `7,689 → 9,181 tok/s`!
 
-### 3.3 Register-Permuted Tensor Core `mma.m16n8k16` for `M = 1..8` MoE & Dense GEMVs
-- At `B=1`, CUDA-core `half2` FMA is near-optimal because latency is pure HBM read. At `B = 2..8` (speculative verify), CUDA-core FMA becomes compute- and register-bound, especially inside MoE where 8 tokens share overlapping experts.
-- Replacing CUDA-core MoE with `moe_up_tc_kernel` and a **144-CTA fused `moe_down_tc_kernel`** (plus Tensor Core `qkvrg_fused_mma`, `linear_nvfp4_mma` for `K ∈ {2304, 3072, 9216}`, and `lm_head_mma` for `M >= 2`) keeps weight traffic constant while pushing `M = 2..8` compute onto Blackwell Tensor Cores (`mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`).
-- **Effect:** `mtp=3` jumped from **`369.6 → 470.2 tok/s`** on code.
-- **Numerical parity note:** `B=1` (FP16-pair CUDA core) and `B >= 2` (FP32-accumulate Tensor Core MMA) can diverge by 1 ULP on tight argmax ties over 400-token greedy rollouts. Always verify multi-token parity across `B=4`, fixed `B=8`, and adaptive `{2, 4, 8}` — all three share the exact same FP32-accumulate Tensor Core path and produce bit-for-bit identical token streams.
-
-### 3.4 Adaptive `{2, 4, 8}` Speculative Verify via CUDA Graph Conditional Switch
-- **The fixed-width dilemma:** On predictable code, verifying `B=8` tokens (`mtp=7`) jumps from `470 → 511 tok/s`. On unpredictable prose/chat, verifying `B=8` *regresses* from `307 → 270 tok/s` because the extra drafted tokens miss and waste MoE/attention bandwidth.
-- **Device-side adaptive solution:**
-  1. Inside the DSpark Markov argmax head (`cuda/kernels_dspark.cu`), compute online softmax `(m, sum)` under softcap `30.0` in a single pass alongside argmax to emit exact per-draft confidence `p_i = max_v softmax(logits_i)` for drafts `0..6`.
-  2. Run a tiny 1-thread device kernel `z_adaptive_select_width_kernel` that picks the verify width:
-     - `B = 8` if the first 3 drafts all exceed `--spec-threshold` (default `0.80`)
-     - `B = 4` if draft 0 exceeds `--spec-threshold`
-     - `B = 2` otherwise
-  3. Dispatch the chosen branch directly on the GPU inside a single CUDA 13.1 **`cudaGraphCondTypeSwitch`** graph (`case 0 → B=2`, `case 1 → B=4`, `case 2 → B=8`) — **zero host round-trip, zero graph re-capture**.
-  4. **Overlapped next-round drafting:** After launching the conditional switch verify graph, record `done_event` and immediately enqueue the *next* round's DSpark draft graph on the stream before calling `cudaEventSynchronize(done_event)`. While the host copies out accepted tokens and flushes HTTP SSE chunks, the GPU is already drafting the next round.
-  5. **Zero-rollback state design:** Because every sconv ring in `squid5090` is a 16-slot modular ring indexed by `(p & 15)` (`max_B + 3 = 8 + 3 = 11 < 16`), a verify batch never overwrites the `P-3..P-1` history needed on rejection, and KV / DSpark caches are position-indexed — rejected positions strictly sit ahead of the updated `*d_pos = P + n_acc` and are harmlessly overwritten on the next step.
-- **Effect:** **`585.9 tok/s`** on code (`acc=72.5%`, `dl=3.80`, beating `ingine`'s published `561 tok/s` on the same prompt!) AND **`332.5 tok/s`** on chat (beating both `mtp=3` and fixed `mtp=7` simultaneously!).
-
----
-
-## 4. GPU Prefill Optimization Learnings (`5,077 → 9,181 tok/s`)
-
-### 4.1 `B=2048` Multi-Stage `cp.async` `128×128×64` Grouped MoE GEMM (`p_wgemm_kernel`)
-- At `B=512`, each of the 128 experts receives on average only `512 × 8 / 128 = 32` tokens — too small to saturate Tensor Cores relative to weight-dequant overhead.
-- Raising `prefill_batch_max` from `512 → 2048` quadruples expert reuse to ~128 tokens/expert.
-- We implemented a multi-stage `cp.async` grouped MoE GEMM (`p_wgemm_kernel<FMT, MODE, K, TM>` in [`cuda/kernels_prefill.cu`](cuda/kernels_prefill.cu)) with:
-  - `TM = 32` for `B <= 512` and `TM = 128` for `B > 512`, `TN = 128`, `BK = 64`.
-  - **Pigeonhole tile bound:** For `B <= 512` with `TR = 32` (`4,096` token-expert pairs) OR `B <= 2048` with `TR = 128` (`16,384` pairs), the total number of expert tiles across 128 experts is strictly bounded by `128 + 128 = 256` (`<= 256`), requiring **zero host sync** to read tile counts and fixed static scratch memory.
-  - 3-stage `cp.async` swizzled FP16 activations + 3–7-stage `cp.async` packed NVFP4/MXFP8 weights (~98–99 KiB dynamic SMEM, fitting cleanly under Blackwell's 100 KiB limit) + Blackwell hardware `cvt.rn.f16x2.e2m1x2` + `ldmatrix.x4` + FP16 MMA.
-  - Contiguous sorted activation handoff between `Up` and `Down` (`out_act_h[(pb + row) * INTERMEDIATE]`), eliminating scattered gathers on `Down`.
-- **Effect:** Cut MoE prefill time for 2,048 tokens across all 48 visits to **`92.2 ms`** (`1.92 ms/visit`, 2.4× faster MoE), taking 20K prefill from `5,077 → 7,449 tok/s`.
-
-### 4.2 Always Profile After Your Big Win: The 9-CTA Short-Conv Bottleneck
-- Running `SQUID_PROF_PREFILL=1` on `B=2048` immediately revealed:
-  ```text
-  Before: total=266.35ms (7689 tok/s) | pre_sub=52.43ms dense_tc=29.50ms attn_sub=57.27ms post_sub=17.88ms moe=92.15ms commit=17.13ms
-  ```
-- Why were `pre_sub + post_sub` taking **`70.3 ms` (26% of all prefill time!!)**? Because `p_sconv_post_res_kernel` launched only `2304 / 256 = 9` CTAs on a 170-SM GPU (5% SM occupancy) and looped serially `for (int b = 0; b < 2048; ++b)`!
-- **Key insight:** A 4-tap causal short convolution is a pure **FIR** filter (no IIR feedback!) — token `b` only depends on `src[b], src[b-1], src[b-2], src[b-3]`.
-- **Subtle concurrency trap avoided:** Tiling across `SCONV_T_BLK = 32` (`576 CTAs`) creates a subtle race if the last Y-CTA writes `ring[((pos0 + b) & 15)]` while CTA `y=0` is still reading `ring[((pos0 - 1) & 15)]`, because for `B=2048`, `(pos0 + 2047) & 15 == (pos0 - 1) & 15`!
-- **Clean race-free fix:** Keep `ring` read-only inside the 576-CTA tiled `p_sconv_post_res_kernel` when `ty > 1`, and follow it with a tiny 9-CTA `p_sconv_ring_commit_kernel` (only writes the final 16 tokens, `<2 µs`).
-- **Effect:**
-  ```text
-  After:  total=223.07ms (9181 tok/s) | pre_sub=19.73ms dense_tc=29.45ms attn_sub=57.19ms post_sub=7.67ms moe=92.59ms commit=16.43ms
-  ```
-  - Saved **`42.9 ms`** per 2,048-token chunk in 30 lines of CUDA!
-  - **20K prefill:** **`8,755 tok/s`** (`2,282 ms`) | **64K Needle-in-a-Haystack (PASS):** **`7,742 tok/s`** (`8.46 s`) | **131K prefill:** **`6,509 tok/s`** (`19.97 s`).
+### TigerStyle Zig Architecture (`src/`)
+Measured head-to-head against our earlier C++20 host engine on the exact same GPU and CUDA kernels:
+- **2 `cudaMalloc` bump arenas** (`1` weights + `1` runtime, paired `assert_exact_fill()`) vs `1,359` allocations (**680× fewer** driver allocs).
+- **0 post-init / per-SSE-token host `malloc`s** (`ServerBuffers`), **243+ always-on release assertions**, `0.07 tok/s` run-to-run jitter.
+- **Native Zig BPE tokenizer (`src/tokenizer.zig`):** `135 ms` cold mmap load (`1.84×` faster), **`32.8M tok/s`** encode (`2.05×` faster), 100% exact parity with HF `tokenizers`.
+- **4-checkpoint host-RAM prefix KV cache + 4K global-KV side-request shield** (`0` extra VRAM): reuses 16K–82.5K prefixes in `62–72 ms` without short title/classifier side requests evicting the session.
+- **Warning-free `zig build`:** treats any `nvcc` warning stderr as a build failure, enforcing clean kernel pruning.
 
 ---
 
-## 5. TigerStyle Systems Learnings
+## 4. Audit vs. [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill)
 
-- **2 `cudaMalloc` arenas (`VRAMArena` + `assert_exact_fill()`):** Two-pass size calculation guarantees exact upfront VRAM accounting (zero fragmentation, zero surprise OOMs at 1M context, and immediate assertion failure if any tensor or buffer size drifts).
-- **Zero-malloc hot path (`ServerBuffers`):** Static startup-allocated HTTP, tokenizer, prompt, and SSE buffers yield deterministic `0.07 tok/s` run-to-run variance and zero GC/allocator jitter even during 450+ tok/s live SSE streaming.
-- **Warning-free CUDA builds:** `build.zig` treats any `nvcc` warning stderr as a build failure, forcing dead kernels and unused variables to be pruned immediately.
+We used `inference-optimisation-skill` (0xSero / Sybil Solutions) as the core optimization methodology (`THEORY.md` ceilings → `PLAN.md` log → `ledger.jsonl` → single-variable A/B → long-context needles → greedy parity gates).
+
+### What We Learned & Applied
+- **Ceilings first (`ceilings.md`):** Measured real copy BW (`1,512.9 GB/s`) before writing kernels.
+- **Lever ordering (`SKILL.md` §3, `levers.md`):** Decode graphs → native 4-bit quant (`NVFP4`) → 32K draft vocab pruning → GPU-side argmax/verify → decode-style TC Split-K verify attention → per-workload adaptive draft depth → explicit prefix caching (`cached_tokens > 0`) → stage-level prefill profiling (`SQUID_PROF_PREFILL=1`) → grouped MoE weight reuse → static memory arenas with headroom.
+- **Measurement discipline (`methodology.md`):** Real tokenizer counts (not SSE chunks), dedicated `P0` GPU state, `a / step_time` separation, 1-ULP `M=1` vs `M=k` numeric distinction, and 64K verbatim needle verification.
+
+### What We Did *Not* Apply Yet (Remaining Headroom)
+1. **Native Blackwell FP8 / INT8 Tensor Core Prefill Dense GEMMs (`levers.md`):** `launch_prefill_gemm_h` currently dequantizes to FP16 scratch and runs FP16 `cublasGemmEx` (`dense_tc = 29.5 ms` at `B=2048`). Switching to native Blackwell FP8 `cublasLtMatmul` (labelled lossy trade) could shave `~12–15 ms/chunk` toward **`10,000+ tok/s`** prefill.
+2. **SASS / `cuobjdump --dump-sass` ISA Audit (`levers.md`, `methodology.md`):** We tuned PTX/CUDA, but haven't yet inspected `sm_120a` SASS on `moe_down_tc_kernel` and `p_wgemm_kernel` for hidden register spills or bank conflicts.
+3. **Multi-User Continuous Batching (`cN`, `SKILL.md` §3.4):** `squid5090` is intentionally single-slot (`c=1`) for peak responsiveness and 1M context. Supporting `c2`–`c4` requires paged global KV and per-slot sconv/local-KV ring banks.
+4. **Automated Interleaved `control → candidate → control` Bootstrap-CI Harness & Full 1M 3-Needle Soak (`methodology.md`, `publishing.md`):** We ran 3–6-run medians, 64K real needle PASS, 131K real prefill, and 1M `longctx` scaling, but haven't yet run an automated bootstrap-95%-CI harness or a real 1,048,000-token 3-needle prefill soak.
+5. **Wider Prompt-Lookup Verify Graph (`B=16`) + Early-Exit Markov RNN:** Extending prompt-lookup hits from `B=8` (`771.6 tok/s`) to `B=16` could push long code-copy/RAG bursts past `1,000 tok/s`, and early-exiting Markov steps `3..6` on low draft-0 confidence could save `~100–150 µs` on chat steps.
+
+*(Stack-specific items in the skill that do not apply: Triton/Inductor/DeepGEMM JIT caches — we are AOT native Zig/CUDA with `~3 s` startup; vLLM/SGLang/llama.cpp flags; Intel Xe/AMD ROCm/unified-memory cgroup workarounds; external FA2/oneDNN swaps incompatible with Inkling-2-Mini's L2-clipped Q/K/R + rel-bias + sinks + Q4 KV.)*
 
 ---
 
-## 6. Runtime-Gated Fisher-LDA Abliteration: Math, Intuition & How to Generate Your Own
+## 5. Runtime-Gated Fisher-LDA Abliteration (`--ablation` & `tools/ablate.py`)
 
-This section documents the complete abliteration method pioneered by [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), which we ported into `squid5090` (runtime CUDA/Zig execution + offline [`tools/ablate.py`](tools/ablate.py) generation pipeline).
+Adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0).
 
-### 6.1 Why Standard Weight-Space Abliteration Breaks on Inkling-2-Mini
-Standard abliteration (Arditi et al. / Heretic) projects a refusal direction $r$ out of output weight matrices ($W_{\text{out}} \leftarrow W_{\text{out}} - w\, r (r^\top W_{\text{out}})$). On Inkling-2-Mini, doing that directly in weight space fails for **three** reasons:
-1. **Looped weight sharing:** Physical layers `6..17` are executed **3 times** as 36 distinct logical visits (`visits 6..41`). Refusal circuits fire strongly on specific passes/visits, while earlier or later passes through the *same physical weights* perform general reasoning and coding. Editing physical weights corrupts all three passes at once.
-2. **4-bit quantization floor:** Re-quantizing a small rank-1 projection back into NVFP4 (`e2m1` + block-16 `e4m3` scales) either rounds the edit to zero or introduces large quantization noise across unrelated weights.
-3. **Unconditional damage on harmless text:** Always projecting out $r$ even when the model is NOT refusing shifts harmless token logits, increasing KL divergence and degrading coding/reasoning accuracy.
+### Why Weight-Space Abliteration Fails on Inkling-2-Mini
+1. **Looped weight sharing:** Physical layers `6..17` run 3× as 36 logical visits; editing physical weights corrupts coding/reasoning passes alongside refusal passes.
+2. **4-bit quantization floor:** Re-quantizing rank-1 edits back into NVFP4 rounds them to zero or adds noise.
+3. **Unconditional harmless drift:** Always subtracting $r$ shifts harmless token distributions even when no refusal is occurring.
 
-### 6.2 The 1.8 MB Runtime-Gated Residual-Write Formula
-Instead of touching model weights, we keep the base checkpoint **100% untouched** and apply a tiny, per-visit runtime intervention right after `post_attention_convolution` and `post_mlp_convolution` — the **exact** residual-stream write points across all `V = 48` logical visits:
+### The Per-Visit Gated Residual-Write Formula
+Instead of modifying the 19 GB weights, `squid5090` applies a 1.8 MB sidecar after `post_attention_convolution` and `post_mlp_convolution` at each of the **48 logical visits**:
 
 $$y \leftarrow y - w_v \cdot \mathbb{I}\!\left(d_v \cdot y > \tau_v\right) \cdot \max\!\left(r_v \cdot y - c_v,\; 0\right) \cdot r_v$$
 
-Every symbol has a sharp geometric purpose:
-1. **$r_v \in \mathbb{R}^{2304}$ (Projected Refusal Direction, unit norm):**
-   - Measure mean read activations on `N = 336` harmful prompts (`mlabonne/harmful_behaviors`) vs `336` harmless prompts (`mlabonne/harmless_alpaca`) at two positions: direct-answer start (`<|message_model|><|content_text|>`) and reasoning-turn start (`<|message_model|><|content_thinking|>`).
-   - Compute `diff = mean(harmful) - mean(harmless)`, then **orthogonalize against the harmless mean** (`diff <- diff - (diff · ĥ) ĥ`, where `ĥ = normalize(mean(harmless))`) so the direction never cancels the typical harmless activation component.
-   - Blend the direct-answer and reasoning-turn unit directions with search parameter `dir_mix ∈ [0, 1]` and re-normalize.
-2. **$c_v \in \mathbb{R}$ (Harmless Mean Baseline Offset):**
-   - Computed analytically from harmless write statistics as $c_v = \mathbb{E}_{\text{harmless}}[r_v \cdot y]$.
-   - Combining $c_v$ with the ReLU gate $\max(r_v \cdot y - c_v, 0)$ ensures we **only** remove excess projection along $r_v$ above normal harmless text — we never push harmless or negative projections further negative.
-3. **$d_v \in \mathbb{R}^{2304}$ & $\tau_v \in \mathbb{R}$ (Shrinkage Fisher-LDA Detector):**
-   - Why not gate on $r_v \cdot y$ alone? Because harmless activations have huge anisotropic variance; a raw mean-difference vector $r_v$ can accidentally overlap high-variance harmless directions (e.g., code formatting or prose style).
-   - Instead, `tools/ablate.py stats` accumulates the full **`2304 × 2304` FP64 covariance matrix $\Sigma_v$** of harmless residual writes across an equal mixture of harmless chat turns, harmless reasoning turns, and general technical text.
-   - It also collects 4 harmful-minus-harmless displacement vectors $\delta_{m,v}$ ($m \in \{\text{answer start, reasoning start, reasoning turn, direct answer}\}$), then solves the regularized Fisher Linear Discriminant system:
-     $$s_m = \left(\Sigma_v + \lambda\, \overline{\operatorname{diag}(\Sigma_v)}\, I\right)^{-1} \delta_{m,v}, \qquad \lambda = 0.1$$
-     $$u_v = \sum_{m=1}^{4} \frac{s_m}{\sqrt{\delta_{m,v}^\top s_m}}, \qquad d_v = \frac{u_v}{\sqrt{u_v^\top \Sigma_v u_v}}$$
-   - Notice that final normalization: $\operatorname{Std}_{\text{harmless}}(d_v \cdot y) = \sqrt{d_v^\top \Sigma_v d_v} \equiv 1$!
-   - Therefore, setting the threshold to:
-     $$\tau_v = \mathbb{E}_{\text{harmless}}[d_v \cdot y] + k_{\text{det}}$$
-     places the firing boundary at exactly **$k_{\text{det}}$ harmless standard deviations** above the harmless mean (typically $k_{\text{det}} \in [1.5, 4.5]$). On ordinary coding and chat prompts, $d_v \cdot y \le \tau_v$ almost everywhere, so `k = 0` and the model's output is **bit-for-bit identical** to the unmodified base model!
-4. **$w_v \ge 0$ (Heretic Linear-Decay Visit Kernel):**
-   - Rather than optimizing 96 independent visit weights (which would overfit), `ablate.py` parameterizes attention and MLP weights across the 48 visits with two 4-parameter triangular kernels `(max_w, pos, min_frac, dist)`:
-     $$w_v = \begin{cases} w_{\max} + (f_{\min} w_{\max} - w_{\max}) \frac{|v - p|}{D} & \text{if } |v - p| \le D \\ 0 & \text{otherwise} \end{cases}$$
-   - Total Optuna search dimensionality is just **10 continuous parameters**: `dir_mix`, `k_det`, and 4 kernel params each for attention and MLP!
-5. **Optuna Multi-Objective TPE Optimization:**
-   - Objective 1 (**refusals**): evaluated fast on the RTX 5090 by launching `squid5090 serve --ablation <trial.safetensors>` across direct harmful, effort-none harmful, low-effort reasoning harmful, and mild over-refusal prompt sets.
-   - Objective 2 (**capability damage**): `max(KL_answers, KL_text)`, teacher-forced KL divergence against the unmodified model in BF16 (`tools/inkling_ref.py`). Trials exceeding `--kl-cap 0.03` are pruned before serving.
-   - Choosing a Pareto-frontier trial yields near-zero refusals with `<0.005–0.02` KL divergence and **zero degradation on harmless coding/chat**.
+- **$r_v \in \mathbb{R}^{2304}$ (Projected Refusal Direction, unit norm):** Harmful minus harmless mean read activations (`336` prompts each from `mlabonne/harmful_behaviors` and `mlabonne/harmless_alpaca`), captured at both direct-answer and reasoning starts, orthogonalized against the harmless mean ($\text{diff} - (\text{diff}\cdot \hat{h})\hat{h}$), and blended by `dir_mix`.
+- **$c_v = \mathbb{E}_{\text{harmless}}[r_v \cdot y]$:** Harmless mean offset so $\max(r_v \cdot y - c_v, 0)$ subtracts only excess refusal projection.
+- **$d_v \in \mathbb{R}^{2304}, \tau_v$ (Shrinkage Fisher-LDA Detector):** Solved from the full `2304 × 2304` FP64 harmless write covariance $\Sigma_v$ (harmless chat + reasoning + general text) and 4 harmful-minus-harmless write displacements $\delta_{m,v}$:
+  $$s_m = \left(\Sigma_v + 0.1\,\overline{\operatorname{diag}(\Sigma_v)}\,I\right)^{-1}\delta_{m,v}, \quad u_v = \sum_{m=1}^{4}\frac{s_m}{\sqrt{\delta_{m,v}^\top s_m}}, \quad d_v = \frac{u_v}{\sqrt{u_v^\top \Sigma_v u_v}}$$
+  Because $\operatorname{Std}_{\text{harmless}}(d_v \cdot y) \equiv 1$, setting $\tau_v = \mathbb{E}_{\text{harmless}}[d_v \cdot y] + k_{\text{det}}$ ($k_{\text{det}} \in [1.5, 4.5]$) fires only when a write stands out by $>k_{\text{det}}$ harmless standard deviations — leaving normal coding/chat **bit-for-bit identical** (`53/53` verified on harmless chat).
+- **$w_v$ (Heretic Linear-Decay Kernel) + Optuna TPE:** Two 4-param triangular visit kernels `(max_w, pos, min_frac, dist)` for attention & MLP + `dir_mix` + `k_det` (10 parameters total). Optuna minimizes refusals (evaluated fast via `squid5090 serve --ablation`) and capability damage (`max(KL_answers, KL_text)` in BF16 reference `tools/inkling_ref.py`).
+- **CUDA Fusion:** Packed as `[48, 4]` `float4` `{w, c, floor, tau}` inside the single weight `VRAMArena` and fused into decode's 576-thread mega-kernels (`apply_ablation_576`) and prefill's `p_ablate_post_res_kernel` (`541.1 tok/s` ablated code decode).
 
-### 6.3 Safetensors Schema (`~1.77 MB` Total) & Zero-Overhead CUDA Fusion
-Exported by `tools/ablate.py export` and loaded by `squid5090 --ablation <path>`:
+### Generating Your Own Abliterated `.safetensors` with `uv`
 
-| Tensor Name | Shape | Dtype | Meaning |
-|---|---|---|---|
-| `attn_dirs`, `mlp_dirs` | `[48, 2304]` | `F32` | Per-visit refusal directions $r_v$ (unit-normalized on load in FP64→FP32) |
-| `attn_det`, `mlp_det` | `[48, 2304]` | `F32` | Per-visit Fisher-LDA detectors $d_v$ (kept at native $\sigma=1$ scale!) |
-| `attn_weight`, `mlp_weight` | `[48]` | `F32` | Per-visit ablation strength $w_v$ |
-| `attn_offset`, `mlp_offset` | `[48]` | `F32` | Per-visit harmless mean offset $c_v$ |
-| `attn_threshold`, `mlp_threshold` | `[48]` | `F32` | Per-visit detector threshold $\tau_v$ |
-| `gate` | `[1]` | `F32` | `1.0` for ReLU gate (`floor = 0`), `0.0` for affine (`floor = -FLT_MAX`) |
+Core `squid5090` requires zero Python. The offline generator in `tools/` runs cleanly via [`uv`](https://docs.astral.sh/uv/):
 
-In `squid5090`:
-- [`src/weights.zig`](src/weights.zig) packs `{w_v, c_v, floor, tau_v}` into a compact `[48, 4]` `float4` table inside the **single weight `VRAMArena`** (still 1 `cudaMalloc`, verified by `assert_exact_fill()`).
-- In decode ([`cuda/kernels_inkling.cu`](cuda/kernels_inkling.cu)), `apply_ablation_576` is fused directly into the 576-thread vectorized `mega_attn_post_mlp_in_kernel`, `mega_mlp_post_res_kernel`, and `mega_mlp_post_next_depth_norm_kernel` — zero extra kernel launches, only two warp-reduced dot products (`r · y` and `d · y`) over `y` already live in registers!
-- In prefill ([`cuda/kernels_prefill.cu`](cuda/kernels_prefill.cu)), `p_ablate_post_res_kernel` runs right after `p_sconv_post_res_kernel` whenever `--ablation` is active.
+```bash
+# 1. Sync isolated offline environment (CUDA 13.0 PyTorch + Inkling-2-Mini transformers + Optuna)
+uv sync --project tools
 
-### 6.4 Generating Your Own Abliterated Safetensors with `squid5090`
+# 2. Build squid5090 (used by `search` and `verify` for fast refusal evaluation)
+zig build -Doptimize=ReleaseFast
 
-> **Note:** The core `squid5090` inference binary requires **zero Python**. Python + PyTorch are only needed offline if you want to run `tools/ablate.py` to generate a new custom `.safetensors` file.
+# 3. Run the end-to-end pipeline
+export SQUID_MODEL_DIR=/opt/models/inkling-2-mini
+WORK=work/ablate-run1 && mkdir -p "$WORK"
 
-1. **Sync offline tooling dependencies with [`uv`](https://docs.astral.sh/uv/)** (installs into an isolated `tools/.venv` with CUDA 13.0 PyTorch wheels and the Inkling-2-Mini `transformers` commit):
-   ```bash
-   uv sync --project tools
-   ```
+uv run --project tools tools/ablate.py directions --out "$WORK/directions.pt"
+uv run --project tools tools/ablate.py directions --out "$WORK/directions_think.pt" --think
+uv run --project tools tools/ablate.py stats      --work "$WORK"
+uv run --project tools tools/ablate.py baseline   --out "$WORK/baseline_val.pt" --split val
+uv run --project tools tools/ablate.py baseline   --out "$WORK/baseline.pt" --split report
+uv run --project tools tools/ablate.py search     --work "$WORK" --batches 12 --n 8
+uv run --project tools tools/ablate.py show       --work "$WORK" --top 20
+uv run --project tools tools/ablate.py export     --work "$WORK" --trial <N> --out "$WORK/custom-abliterated.safetensors"
+uv run --project tools tools/ablate.py verify \
+  --ablation "$WORK/custom-abliterated.safetensors" \
+  --baseline "$WORK/baseline.pt" \
+  --server ./zig-out/bin/squid5090 \
+  --out "$WORK/verify.json"
 
-2. **Build `squid5090`** (used by `tools/ablate.py search` and `verify` for fast refusal evaluation):
-   ```bash
-   zig build -Doptimize=ReleaseFast
-   ```
-
-3. **Run the full abliteration pipeline via `uv run`** (replace `/opt/models/inkling-2-mini` with your model directory, or export `SQUID_MODEL_DIR`):
-   ```bash
-   export SQUID_MODEL_DIR=/opt/models/inkling-2-mini
-   WORK=work/ablate-run1
-   mkdir -p "$WORK"
-
-   # 1. Capture per-visit harmful/harmless mean read activations (direct answer & reasoning start)
-   uv run --project tools tools/ablate.py directions --out "$WORK/directions.pt"
-   uv run --project tools tools/ablate.py directions --out "$WORK/directions_think.pt" --think
-
-   # 2. Compute 48x2x2304x2304 harmless write covariances & shrinkage Fisher-LDA detectors (~10 GB host RAM)
-   uv run --project tools tools/ablate.py stats --work "$WORK"
-
-   # 3. Record original model's harmless greedy answers & top-64 logprobs (KL targets)
-   uv run --project tools tools/ablate.py baseline --out "$WORK/baseline_val.pt" --split val
-   uv run --project tools tools/ablate.py baseline --out "$WORK/baseline.pt" --split report
-
-   # 4. Run Optuna multi-objective TPE search (KL in PyTorch ref, fast refusals via squid5090 serve!)
-   uv run --project tools tools/ablate.py search --work "$WORK" --batches 12 --n 8
-
-   # 5. Inspect Pareto-optimal trials (refusals vs KL damage)
-   uv run --project tools tools/ablate.py show --work "$WORK" --top 20
-
-   # 6. Export your chosen trial N into a 1.8 MB safetensors file
-   uv run --project tools tools/ablate.py export --work "$WORK" --trial <N> --out "$WORK/custom-abliterated.safetensors"
-
-   # 7. Verify held-out refusals (harmful_test + JailbreakBench) and harmless KL damage
-   uv run --project tools tools/ablate.py verify \
-     --ablation "$WORK/custom-abliterated.safetensors" \
-     --baseline "$WORK/baseline.pt" \
-     --server ./zig-out/bin/squid5090 \
-     --out "$WORK/verify.json"
-   ```
-
-4. **Serve with your custom `.safetensors` and A/B test over-refusal:**
-   ```bash
-   # Serve with your new 1.8 MB ablation file
-   ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-     --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --spec-threshold 0.80 \
-     --ablation "$WORK/custom-abliterated.safetensors"
-
-   # Evaluate 32 mild over-refusal prompts against the live OpenAI server (zero deps via uv PEP 723)
-   uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label ablated --out "$WORK/refusals-ablated.json"
-   uv run tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/refusals-ablated.json"
-   ```
+# 4. Serve & A/B test 32 mild over-refusal prompts (zero extra deps via uv PEP 723)
+./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
+  --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --ablation "$WORK/custom-abliterated.safetensors"
+uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label ablated --out "$WORK/refusals-ablated.json"
+uv run tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/refusals-ablated.json"
+```
 
 ---
 
-## 7. Attribution
+## 6. Repository Map
 
-All kernel designs and abliteration tooling adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) are licensed under **Apache License 2.0**; see [`NOTICE`](NOTICE) for full attributions.
+```text
+squid5090/
+├── build.zig                 # Native Zig build (parallel content-hashed nvcc sm_120a + Zig ReleaseFast)
+├── README.md                 # Simple comparison table & Linux build/install quickstart
+├── LITE.md                   # Plain-English 3Blue1Brown-style visual guide to optimization & abliteration
+├── LEARNINGS.md              # This consolidated technical reference & skill audit
+├── NOTICE                    # Open-source attributions
+├── THEORY.md / PLAN.md / ledger.jsonl  # Roofline ceilings & structured experiment ledger
+├── deploy/squid5090.service  # Persistent systemd service unit
+├── cuda/                     # Native Blackwell sm_120a CUDA kernels & C-ABI bridge
+│   ├── kernels_common.cuh    # Blackwell PTX (e2m1, e4m3, m16n8k16, ldmatrix, PDL), Q4/FP8 KV, TC Split-K
+│   ├── kernels_gemv.cu       # PDL + TC mma.m16n8k16 MoE & dense NVFP4 GEMVs, 99%-BW lm_head
+│   ├── kernels_inkling.cu    # Mega-fused depth-attn/sconv/ablation, 1-launch controllers, router, attention
+│   ├── kernels_dspark.cu     # DSpark 3-layer drafter, TC base logits, folded Markov head + online softmax
+│   ├── kernels_prefill.cu    # B=2048 128x128x64 cp.async WGEMM, 2D-tiled sconv, FlashAttention, ablation
+│   └── cuda_abi.cu           # Thin extern "C" bridge + CUDA 13.1 cudaGraphCondTypeSwitch manager
+├── src/                      # 100% TigerStyle Zig engine & zero-malloc OpenAI server
+│   ├── tiger.zig / constants.zig / cuda.zig / vram_arena.zig / safetensors.zig
+│   ├── tokenizer.zig         # Flat open-addressed BPE tokenizer (32.8M tok/s) & Inkling chat/tool template
+│   ├── weights.zig           # Two-pass single-VRAMArena weight + optional ablation loader
+│   ├── engine.zig            # Single runtime VRAMArena, Switch Graph, PromptLookupIndex, Prefix Cache
+│   ├── server.zig            # Zero-malloc static-buffer POSIX HTTP/1.1 + SSE OpenAI API server
+│   └── main.zig              # Single-binary CLI (serve, generate, bench, longctx, tokenize)
+└── tools/                    # Optional offline uv Python abliteration & refusal-eval toolchain
+    ├── pyproject.toml        # uv project (CUDA 13.0 PyTorch + Inkling-2-Mini transformers + Optuna)
+    ├── ablate.py / inkling_ref.py / refusal_eval.py
+```
