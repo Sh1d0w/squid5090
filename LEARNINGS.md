@@ -38,12 +38,55 @@ Complete consolidated engineering reference for `squid5090`: roofline analysis, 
 
 ---
 
-## 2. Roofline & Inkling-2-Mini Hardware Realities (`sm_120a`)
+## 2. Measured Hardware Ceilings & Inkling-2-Mini Roofline (`sm_120a`)
 
-1. **Measured hardware ceilings** (full derivation in [`THEORY.md`](THEORY.md)): RTX 5090 sustained GDDR7 copy bandwidth is **`1,512.9 GB/s`**, 170 SMs, 96 MiB L2, 100 KiB dynamic SMEM/SM. Always confirm `P0` clocks (`14,001 MHz` mem, `0%` background GPU load) before benchmarking — background GPU load silently drops the card to `P1` (`13,801 MHz`) and costs ~10% decode throughput.
-2. **24 physical layers → 48 logical visits:** layers `0..5`, `3×(6..17)`, `18..23`, with AttnRes block-boundary depth attention, cross-pass low-rank controllers, and static + dynamic 4-tap causal short convolutions.
-3. **Why 1M context fits in `23.22 GiB`:** 36 visits are local SWA (`W=1024`, fixed `1280`-slot ring), leaving only **12 global visits sharing 8 unique global KV caches** (+ 1 global DSpark layer). Group-64 INT4 global KV (`--kv q4`, 2-op exact FP16 magic-bias nibble unpack) + zero-copy pinned host embeddings (`0.86 GiB` saved) fits `1,048,576` tokens with `8.8 GiB` VRAM headroom.
-4. **Why speculation is mandatory past ~265 tok/s:** All-NVFP4 weight traffic is `~2.80 GB/tok`. At `~75%` aggregate GDDR7 utilization across 48 visits, `B=1` tops out at `259–268 tok/s`. Verifying `B=2..8` tokens amortizes dense weight loads `B×` and deduplicates shared MoE experts.
+### 2.1 Measured RTX 5090 Hardware Ceilings
+Measured directly on-device (dedicated `P0` state; background GPU workloads silently clamp the card to `P1` at `13,801 MHz` mem and cost ~10% decode speed):
+
+| Metric | Measured Value | Notes |
+|---|---:|---|
+| GPU | NVIDIA GeForce RTX 5090 (`sm_120a`, Blackwell) | 170 SMs, 96.0 MiB L2, 100 KiB dynamic SMEM/SM |
+| Memory | 32,607 MiB GDDR7 (512-bit, `14,001 MHz` DDR) | Spec peak `1,792.1 GB/s` |
+| **Pure Read BW (`1 GiB`, `__ldg`)** | **`1,512.9 GB/s`** | **Real decode bandwidth ceiling** (`lm_head` hits `1,497 GB/s` = 99%) |
+| D2D Copy BW (`1 GiB`) | `1,235.1 GB/s` | Read + write |
+| BF16 Tensor Core GEMM (`4096³` / `8192³`) | `176.2` / `174.3 TFLOPS` | Sustained compute reference |
+| Toolchain | CUDA 13.1 (`V13.1.115`) / Driver `590.48.01` | Native `sm_120a` NVFP4/FP8/PDL/Graph Switch |
+
+### 2.2 Inkling-2-Mini Geometry & Resident Weight Footprint
+Checkpoint: `thinkingmachines/Inkling-2-Mini` (`model-00001-of-00001.safetensors` = `19.53 GB`, `mtp.safetensors` = `0.64 GB`).
+- **48 logical visits from 24 physical layers:** Prelude `0..5` (6 visits) → Looped Core `6..17` × **3 passes** (36 visits; physical weights reused 3×, distinct KV/sconv state per visit) → Coda `18..23` (6 visits). Includes AttnRes block-boundary depth attention, cross-pass low-rank controllers, and static + dynamic 4-tap short convolutions.
+- **Hybrid Attention (why 1M context fits in `23.22 GiB`):** 24 Q heads, 8 KV heads (`head_dim=128`, `d_rel=16`, `rel_extent=1024`). 40 visits are local sliding-window (`W=1024`, fixed `1280`-slot BF16 ring = ~210 MB total); only **8 global visits** (`layers 5, 11, 17, 23`) store full context (`32.8 KB/tok` BF16 → `16.4 KB/tok` FP8 → **`~8.5 KB/tok` Q4**). Combined with zero-copy host-pinned BF16 embeddings (`0.86 GiB` saved), `1,048,576` tokens fit in `23.22 GiB` with `8.8 GiB` headroom.
+- **MoE & DSpark:** 128 routed experts (top-8, `intermediate=1152`, softcapped SwiGLU `gate_cap=4, up_cap=25`), `hidden=2304`, vocab `200,058` (`201,024` padded). Built-in 3-layer DSpark MTP drafter (`intermediate=9216`, `block_size=8` → 7 drafts) + rank-256 Markov RNN head tapping target visits `[5, 23, 41, 48]`.
+
+| Weight Component (Text + MTP) | `exact` | `fp8` Dense | `nvfp4` All-Linear |
+|---|---:|---:|---:|
+| MoE Experts L0–19 (NVFP4) | 11.466 GB | 11.466 GB | 11.466 GB |
+| MoE Experts L20–23 | 4.204 GB (MXFP8) | 4.204 GB (MXFP8) | 2.293 GB (NVFP4) |
+| Attention Dense + Router (24 layers) | 1.308 GB (BF16) | 0.654 GB (FP8) | 0.368 GB (NVFP4) |
+| Controllers + Norms + SConv + AttnRes | 0.058 GB | 0.058 GB | 0.058 GB |
+| Embedding + LM Head (`unembed`) | 1.852 GB (BF16) | 1.389 GB | 1.187 GB (BF16 + NVFP4) |
+| DSpark MTP (3 layers + Markov) | 0.636 GB (BF16) | 0.320 GB (FP8) | ~0.240 GB (NVFP4 + 32K head) |
+| **Total Resident Weights** | **18.18 GiB** | **16.85 GiB** | **14.57 GiB** (`13.70 GiB` w/ host embed) |
+
+### 2.3 Decode Bandwidth Roofline (`B=1` & Speculative `B=2..8`)
+
+| Per-Token Traffic (`B=1`, short ctx) | `exact` (MB) | `fp8` (MB) | `nvfp4` (MB) |
+|---|---:|---:|---:|
+| Experts L0–19 (44 visits × 8/128) + L20–23 (4 visits) | 1,839.3 | 1,839.3 | 1,719.8 |
+| Attention Dense + Router (48 visits) + Controllers (24 visits) | 2,700.0 | 1,392.0 | 820.0 |
+| LM Head (`unembed`) | 926.3 | 463.2 | 260.5 |
+| **Total Bytes / Token (`B=1`)** | **5,465.6 MB** | **3,694.5 MB** | **2,800.3 MB** |
+| **Raw BW Ceiling (`1,512.9 GB/s` / `1,792 GB/s` spec)** | **277 / 328 tok/s** | **410 / 485 tok/s** | **540 / 640 tok/s** |
+
+- **Why `nvfp4` dense + LM head mattered so much:** In the official `exact` checkpoint, BF16 attention + LM head are **64.8%** of all decode traffic (`3,542 MB`), dwarfing the MoE experts (`1,839 MB`). Quantizing them to NVFP4 nearly doubled the single-token ceiling before speculation even began.
+- **Why speculation (`B=2..8`) breaks past `~265 tok/s`:** Across 48 visits with activation/KV/sconv/norm overhead, `B=1` saturates at `259–268 tok/s`. In a `B = K + 1` verify pass, dense weights and LM head are read **once** (`B×` amortized) and MoE experts deduplicate across consecutive correlated tokens (empirical unique-expert multiplier $u(4)\approx 2.8$, $u(8)\approx 4.5\text{--}4.9$ vs i.i.d. $3.64 / 6.45$):
+
+| Speculative Regime (`nvfp4`) | Verify `B` | Accepted `a` | Est. `u(B)` | Verify + Draft MB | MB / Accepted Tok | **Roofline (`1,513 GB/s`)** | **Achieved `squid5090`** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Autoregressive (`mtp=0`) | 1 | 1.0 | 1.0 | 2,800 | 2,800 | 540 tok/s | **262.8 tok/s** |
+| Fixed `mtp=3` (prose/code) | 4 | 2.6–3.0 | 2.9 | 6,218 | ~2,100–2,390 | ~633–720 tok/s | **307–470 tok/s** |
+| Adaptive `{2,4,8}` (code) | 2..8 | 3.8–5.2 | ~3.8–4.9 | ~8,000–9,658 | ~1,857 | ~815 tok/s | **589.5 tok/s** |
+| Hybrid Prompt-Lookup (quote/RAG) | 8 | 5.4–6.5 | ~4.5 | ~8,820 *(0 draft)* | ~1,380–1,630 | ~928–1,096 tok/s | **771.6 tok/s** |
 
 ---
 
@@ -80,7 +123,7 @@ Measured head-to-head against our earlier C++20 host engine on the exact same GP
 
 ## 4. Audit vs. [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill)
 
-We used `inference-optimisation-skill` (0xSero / Sybil Solutions) as the core optimization methodology (`THEORY.md` ceilings → `PLAN.md` log → `ledger.jsonl` → single-variable A/B → long-context needles → greedy parity gates).
+We used `inference-optimisation-skill` (0xSero / Sybil Solutions) as the core optimization methodology (Section 2 hardware ceilings → `PLAN.md` log → `ledger.jsonl` → single-variable A/B → long-context needles → greedy parity gates).
 
 ### What We Learned & Applied
 - **Ceilings first (`ceilings.md`):** Measured real copy BW (`1,512.9 GB/s`) before writing kernels.
@@ -165,9 +208,9 @@ squid5090/
 ├── build.zig                 # Native Zig build (parallel content-hashed nvcc sm_120a + Zig ReleaseFast)
 ├── README.md                 # Simple comparison table & Linux build/install quickstart
 ├── LITE.md                   # Plain-English 3Blue1Brown-style visual guide to optimization & abliteration
-├── LEARNINGS.md              # This consolidated technical reference & skill audit
+├── LEARNINGS.md              # Consolidated technical reference, hardware ceilings & skill audit
 ├── NOTICE                    # Open-source attributions
-├── THEORY.md / PLAN.md / ledger.jsonl  # Roofline ceilings & structured experiment ledger
+├── PLAN.md / ledger.jsonl    # Historical hill-climb experiment log
 ├── deploy/squid5090.service  # Persistent systemd service unit
 ├── cuda/                     # Native Blackwell sm_120a CUDA kernels & C-ABI bridge
 │   ├── kernels_common.cuh    # Blackwell PTX (e2m1, e4m3, m16n8k16, ldmatrix, PDL), Q4/FP8 KV, TC Split-K

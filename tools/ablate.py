@@ -156,8 +156,8 @@ def jbb_harmful() -> list[str]:
 
 _KL_TEXT = os.environ.get("SQUID_KL_TEXT") or os.pathsep.join((
     str(ROOT / "README.md"),
+    str(ROOT / "LITE.md"),
     str(ROOT / "LEARNINGS.md"),
-    str(ROOT / "THEORY.md"),
     str(ROOT / "PLAN.md"),
     str(ROOT / "src" / "*.zig"),
     str(ROOT / "cuda" / "*.cu"),
