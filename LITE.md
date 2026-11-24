@@ -1,6 +1,6 @@
 # `squid5090` Explained Simply (`LITE.md`)
 
-> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec** (`exact`, `B=1`) up to **589–771 tokens/sec** (greedy code/copy at dedicated `P0` clocks; **273–519 tok/s** across prose, chat, code, and copy at `temp=1.0`) with **1,000,000-token memory** on one RTX 5090 — and how to surgically remove refusals using a **1.8 MB geometric "bouncer"** with `0` diff on `53/53` tested harmless chat prompts.*
+> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec** (`exact`, `B=1`) to an accuracy-first **422–487 tokens/sec** FP8 Tensor Core default (`0.0061–0.0096` long-context KLD, `ΔPPL <= +0.0035`, `512K` context in `22.6 GiB`) — and up to **589–771 tokens/sec** / **1,000,000-token memory** in opt-in NVFP4 on one RTX 5090 — plus how to surgically remove refusals using a **1.8 MB geometric "bouncer"** with `0` diff on `53/53` tested harmless chat prompts.*
 >
 > **Attribution:** Key Blackwell kernel techniques (PDL overlap, Tensor Core `mma.m16n8k16` decode GEMVs, `128×128×64` MoE prefill, `{2, 4, 8}` CUDA Graph switch drafting) and the 1.8 MB runtime-gated Fisher-LDA abliteration method were adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0). Hybrid prompt-lookup drafting was inspired by [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine) (MIT). See [`NOTICE`](NOTICE).
 
@@ -28,7 +28,7 @@ Now watch what happens in the two phases of an LLM conversation:
 
   DECODE (1 token at a time — Bandwidth-Bound)
   ┌───────────────────┐     1,513 GB/s     ┌─────────────────────────────┐
-  │  VRAM Warehouse   │══▶ 2.8 GB / tok ══▶│  Tensor Cores: █░░░░░░░░░   │
+  │  VRAM Warehouse   │═▶ 2.8–3.7 GB/tok ─▶│  Tensor Cores: █░░░░░░░░░   │
   │  (Model Weights)  │  used ONCE, tossed │   90% IDLE  -> bottleneck!  │
   └───────────────────┘                    └─────────────────────────────┘
 ```
@@ -66,26 +66,42 @@ Normally, generating one token requires the CPU to shout ~600 separate tiny inst
 
 ---
 
-### Step 3: Pack the Crates Tighter (4-Bit Weights + 4-Bit Long-Term Memory)
+### Step 3: Pack the Crates Without Breaking the Brain (FP8 Default + Opt-In NVFP4 + Q4 Memory)
 
-If the hallway is the bottleneck, shrinking every box from 16 bits down to **4 bits** lets you move **4× as many weights per second**:
+If the hallway is the bottleneck, shrinking weight boxes lets you move far more weights per second — **but crushing sensitive layers to 4 bits can hurt quality if you aren't careful**. So we measured exact FP64 KL divergence across **7,784 tokens** ([`tools/kld_corpus.txt`](tools/kld_corpus.txt), 7.6× beyond the 1,024-token local window) and built two clean precision tiers:
 
-- **Weights (`NVFP4`):** We pack the model's weights into Blackwell's native 4-bit floating-point format. The RTX 5090 has dedicated hardware circuits that unpack 4-bit numbers straight into 16-bit numbers in a single clock cycle — cutting traffic from `5.47 GB` down to `2.80 GB` per token and shrinking the whole model to **14.6 GiB**.
-- **1,000,000-Token Memory (`Q4 KV`):** Inkling-2-Mini has a clever hybrid design: out of 48 layer steps, **40** only look back at the last 1,024 words (tiny fixed BF16 memory!), and only **8** global visits actually store the entire conversation history (`40 + 8 = 48`). By compressing that long-term history into 4-bit numbers (`Q4`), a **1,048,576-token** conversation fits in **23.2 GiB** — with nearly 9 GiB to spare on a 32 GiB card!
+- **Accuracy-First Default (`--mode fp8`, `16.85 GiB`):** Leaves **all 24 MoE expert layers in 100% official checkpoint precision** (L0–19 native NVFP4 + L20–23 native MXFP8 — zero re-quantization!) and keeps routers & controllers in BF16. Only dense attention & `lm_head` move from BF16 to **FP8 E4M3** (`3.69 GB/tok`), unpacking losslessly into Blackwell Tensor Core `mma.m16n8k16.f32.f16` (exact IEEE FP32 accumulation + PDL). Result: **`0.0061` KLD** (`fp8/fp8`, `ΔPPL -0.0030`) or **`0.0096` KLD** (`fp8/q4`, `ΔPPL +0.0035`) — virtually indistinguishable from unmodified `exact/bf16`!
+- **Opt-In Max-Speed / 1M (`--mode nvfp4`, `14.57 GiB`):** Packs attention, `lm_head`, and L20–23 experts into Blackwell's native 4-bit NVFP4 (`2.80 GB/tok`) for peak speed (`547–771 tok/s`) and full **1,048,576-token** context in `23.2 GiB` (`0.0263` long-ctx KLD, `ΔPPL +0.0559`).
+- **512K–1M Long-Term Memory (`Q4 KV`):** Inkling-2-Mini has a hybrid design: out of 48 layer steps, **40** only look back at the last 1,024 words (tiny fixed BF16 memory!), and only **8** global visits actually store the entire conversation history (`40 + 8 = 48`). Compressing those 8 global histories into `Q4` fits **512K in `22.6 GiB` (`fp8/q4` default)** or **1,048,576 tokens in `23.2 GiB` (`nvfp4/q4`)** — with nearly 9 GiB to spare on a 32 GiB card!
 - **Instant Multi-Turn Memory (Prefix Cache):** When you send Turn 2 of a 16,000-word coding session, why re-read the first 16,000 words? We snapshot the tiny local state to regular system RAM (`0` extra VRAM), so Turn 2 picks up where Turn 1 left off in **72 milliseconds** instead of 2.1 seconds.
 
+| Precision Mode | 7,784-Tok KLD | Top-1 Match | ΔPPL *(Ref `2.7048`)* | Code (`T=0` / `T=1.0`) | Code-Copy (`T=0` / `T=1.0`) | VRAM (`ctx`) |
+|---|---:|---:|---:|---:|---:|---|
+| `exact / bf16` *(official ref)* | `0.0000` | 100.00% | `+0.0000` | 292.8 / 248.8 tok/s | — | 18.3 GiB *(wt)* |
+| **`fp8 / fp8`** *(≤448K default)* | **`0.0061`** | **97.42%** | **`-0.0030`** | — | **402.9 / 434.9 tok/s** | **22.7 GiB** *(256K)* |
+| **`fp8 / q4`** *(512K default)* | **`0.0096`** | **96.93%** | **`+0.0035`** | **427.3 / 422.4 tok/s** | **486.8 / 433.0 tok/s** | **22.6 GiB** *(512K)* |
+| `nvfp4 / q4` *(opt-in max speed)* | `0.0263` | 94.81% | `+0.0559` | 547.0 / 485.1 *(P0: 589.5)* | 610.5 / 518.5 *(P0: 771.6)* | 20.3 / 23.2 GiB *(512K/1M)* |
+
 ```text
-  RTX 5090 32 GiB VRAM @ FULL 1,048,576-TOKEN CONTEXT
-  ┌──────────────────────────┬────────────────┬──────────────────┐
-  │   NVFP4 Model Weights    │  Q4 KV Cache   │   Free Headroom  │
-  │        14.6 GiB          │    8.6 GiB     │     ~8.8 GiB     │
-  └──────────────────────────┴────────────────┴──────────────────┘
-   0                        14.6            23.2                32.0 GiB
+  RTX 5090 32 GiB VRAM: ACCURACY-FIRST DEFAULT (512K) vs OPT-IN 1M CONTEXT
+  Default 512K (fp8 / q4, 0.0096 KLD):
+  ┌─────────────────────────────┬────────────┬───────────────────────┐
+  │   FP8 + Official L0-23 MoE  │ 512K Q4 KV │     Free Headroom     │
+  │          16.9 GiB           │  5.7 GiB   │       ~9.4 GiB        │
+  └─────────────────────────────┴────────────┴───────────────────────┘
+   0                           16.9        22.6                    32.0 GiB
+
+  Opt-In 1M (nvfp4 / q4, 0.0263 KLD):
+  ┌──────────────────────────┬────────────────┬──────────────────────┐
+  │   NVFP4 Model Weights    │  1M Q4 KV      │     Free Headroom    │
+  │        14.6 GiB          │    8.6 GiB     │       ~8.8 GiB       │
+  └──────────────────────────┴────────────────┴──────────────────────┘
+   0                        14.6            23.2                    32.0 GiB
 
   Why 1M tokens only needs 8.6 GiB (Inkling's 5:1 Local-to-Global pattern):
   ┌──────┬──────┬──────┬──────┬──────┬────────────────────────────┐
   │ L0   │ L1   │ L2   │ L3   │ L4   │ L5  (Global Attention)     │
-  │ 1024 │ 1024 │ 1024 │ 1024 │ 1024 │ Full 1,048,576-tok Q4 KV!  │
+  │ 1024 │ 1024 │ 1024 │ 1024 │ 1024 │ Full 512K–1M Q4/FP8 KV!    │
   │ fixed│ fixed│ fixed│ fixed│ fixed│ (only 8 unique global KV)  │
   └──────┴──────┴──────┴──────┴──────┴────────────────────────────┘
 ```
@@ -98,7 +114,7 @@ If the hallway is the bottleneck, shrinking every box from 16 bits down to **4 b
   <img src="assets/lite-speculative.gif" alt="3Blue1Brown-style animation of the RTX 5090 memory hallway and 8-token lossless speculative decoding" width="820"/>
 </p>
 
-After Steps 1–3, generating 1 token at a time in `nvfp4` hits the hallway's practical limit: **`~260 tok/s`** (up from `144 tok/s` in unquantized `exact` mode). So how did we reach **`589.5 tok/s`** on greedy code (`444.9 tok/s` at `temp=1.0`) and **`771.6 tok/s`** when editing/quoting code (`273–279 tok/s` on chat/prose at `temp=1.0`)?
+After Steps 1–3, generating 1 token at a time hits the hallway's practical limit: **`195 tok/s`** in accuracy-first `fp8` and **`~260 tok/s`** in opt-in `nvfp4` (up from `144 tok/s` in unquantized `exact` mode). So how did we reach **`422.4 tok/s`** code (`T=1.0`) / **`486.8 tok/s`** code-copy in default `fp8/q4` — and **`589.5 / 771.6 tok/s`** (`P0, T=0`) in opt-in `nvfp4/q4`?
 
 Remember those **~90% idle calculators** inside the factory? Checking **8 tokens at the exact same time** only requires hauling the weights through the hallway **once** — so verifying 8 words costs barely more time than generating 1 word!
 
@@ -106,14 +122,19 @@ So we pair the big model with **two lightning-fast "drafters"** (guessers):
 
 1. **Drafter #1 — Prompt-Lookup (5 nanoseconds on CPU):**
    Before running any AI at all, we check a tiny hash table of the last 8,192 words: *"Have I seen these exact last 16 tokens earlier in the prompt or my own output?"*
-   - When refactoring code, quoting docs, or repeating boilerplate, the answer is **yes!** We copy the next 7 tokens verbatim in nanoseconds and hand them straight to the big model to verify (**771.6 tok/s!**).
+   - When refactoring code, quoting docs, or repeating boilerplate, the answer is **yes!** We copy the next 7 tokens verbatim in nanoseconds and hand them straight to the big model to verify (**486.8 tok/s** in default `fp8/q4`, up to **771.6 tok/s** in opt-in `nvfp4`!).
 2. **Drafter #2 — DSpark (0.4 milliseconds on GPU):**
-   When writing brand-new code or prose, Inkling-2-Mini's built-in tiny 3-layer neural drafter predicts the next **7 tokens** *plus* a confidence score for each guess.
+   When writing brand-new code or prose, Inkling-2-Mini's built-in tiny 3-layer neural drafter predicts the next **7 tokens** *plus* a confidence score (and exact draft probability $q_i(v)$ when `temp > 0`) for each guess.
 3. **Adaptive GPU Switch (`{2, 4, 8}`):**
-   Here's a subtle trap: guessing 7 tokens ahead is awesome on predictable Python (`589 tok/s`), but actually *slows down* unpredictable creative chat (`270` vs `307 tok/s`) because bad guesses waste verification work.
+   Here's a subtle trap: guessing 7 tokens ahead is awesome on predictable Python, but actually *slows down* unpredictable creative chat because bad guesses waste verification work.
    - Our fix: right on the GPU — without ever asking the CPU — a tiny switch checks the drafter's confidence and automatically chooses whether to verify **2, 4, or 8 tokens** this round (`cudaGraphCondTypeSwitch`), while already starting the *next* round's draft in the background!
-4. **Why it's 100% lossless:**
-   The big model still grades every single guessed token in parallel. If guesses 1, 2, 3, and 4 match what the big model would have picked, and guess 5 is wrong, we keep 1–4 plus the big model's true #5, and throw away 6–7. The final text is **mathematically identical** to running the big model alone — just **2–3× faster**.
+4. **Why it's 100% lossless (even at `temp = 1.0`!):**
+   - At **`temp = 0` (greedy)**, the big model grades every guessed token in parallel: if guesses 1–5 match its exact argmax and guess 6 disagrees, we keep 1–5 plus the big model's true #6 and discard 7.
+   - At **`temp > 0` (server default `temp = 1.0, top_p = 0.95`)**, we run **exact Leviathan–Chen rejection sampling** right inside the CUDA Graph: accept draft token $d_i$ with probability $\alpha_i$, and on the first rejection resample from the positive residual distribution $p_{\text{res}}$:
+
+$$\alpha_i = \min\!\left(1,\; \frac{p_{\text{target}}(d_i)}{q_{\text{draft}}(d_i)}\right), \qquad p_{\text{res}}(x) = \frac{\max\!\left(p_{\text{target}}(x) - q_{\text{draft}}(x),\; 0\right)}{\sum_y \max\!\left(p_{\text{target}}(y) - q_{\text{draft}}(y),\; 0\right)}$$
+
+   By the law of total probability, $\mathbb{P}(\text{emit } x) \equiv p_{\text{target}}(x)$ **exactly** — mathematically identical to running the target model alone, just **2–3× faster**.
 
 ```mermaid
 flowchart LR
@@ -148,7 +169,7 @@ flowchart LR
 
 To make prompt-reading fast, we built a giant `128×128` Tensor Core MoE engine that processes **2,048 tokens at once** so every expert's weights are reused ~128 times. Prefill jumped from `5,077` to `7,689 tok/s`.
 
-Then we timed every stage inside a 2,048-token chunk — and got a shock: a tiny 4-tap convolution was burning **26% of the entire runtime**! Why? Because it was running sequentially across the 2,048 tokens using only **9 out of 170 GPU cores**! Because a 4-tap convolution only looks 3 tokens backward, we sliced the 2,048 tokens into 32-token strips across **576 GPU blocks** in 30 lines of code — and prefill jumped straight to **`9,181 tok/s`** (reading a 64,000-token Needle-in-a-Haystack document in **8.4 seconds**).
+Then we timed every stage inside a 2,048-token chunk — and got a shock: a tiny 4-tap convolution was burning **26% of the entire runtime**! Why? Because it was running sequentially across the 2,048 tokens using only **9 out of 170 GPU cores**! Because a 4-tap convolution only looks 3 tokens backward, we sliced the 2,048 tokens into 32-token strips across **576 GPU blocks** in 30 lines of code — and prefill jumped straight to **`9,181 tok/s`** (reading a 64,000-token Needle-in-a-Haystack document in **8.46 seconds**, with verified single-needle verbatim recall PASSes all the way up through **128K in `21.9 s`**, **256K in `57.3 s`**, and **512K in `171.1 s`**).
 
 ```text
   BEFORE: 9 CTAs march serially across 2,048 tokens (161/170 SMs IDLE -> 7,689 tok/s)
@@ -282,7 +303,7 @@ And because every one of the **48 logical steps** gets its own strength $w_v$ (s
 3. **Record the "perfect" harmless answers (`baseline`):** Save what the untouched model predicts on harmless prompts so we can measure *exact* intelligence drift (KL divergence) later.
 4. **Let Optuna find the sweet spot (`search`):** An automated optimizer tries combinations of 10 numbers (where the triangular hill peaks across the 48 steps, how tall/wide it is, and how strict the bouncer threshold $k$ is). For each guess:
    - The reference model measures **intelligence drift** (throwing out anything that shifts harmless text by more than `0.03` KL).
-   - **`squid5090 serve`** tests real refusal rates at **500+ tok/s** across harmful and borderline prompts!
+   - **`squid5090 serve`** tests real refusal rates at **400–500+ tok/s** across harmful and borderline prompts!
 5. **Export (`export`):** Save the winning trial's vectors and thresholds into a single **1.8 MB `.safetensors`** file — ready to plug straight into `squid5090 --ablation`.
 
 ```mermaid
@@ -291,7 +312,7 @@ flowchart LR
     S["2. stats<br/>(2304x2304 Σ -> Fisher-LDA d_v, c_v)"] --> OPT
     B["3. baseline<br/>(untouched harmless logits)"] --> OPT
     OPT{"4. Optuna Search<br/>(10 hill + threshold params)"} --> KL["Ref Model:<br/>KL Drift <= 0.03"]
-    OPT --> EV["squid5090 serve:<br/>Refusal Eval @ 500+ tok/s"]
+    OPT --> EV["squid5090 serve:<br/>Refusal Eval @ 400–500+ tok/s"]
     KL --> EXP["5. export<br/>(1.8 MB .safetensors)"]
     EV --> EXP
     EXP --> SRV["squid5090 --ablation<br/>(0 diff on 53/53 harmless)"]
@@ -317,9 +338,9 @@ uv run --project tools tools/ablate.py search     --work "$WORK" --batches 12 --
 uv run --project tools tools/ablate.py show       --work "$WORK" --top 20
 uv run --project tools tools/ablate.py export     --work "$WORK" --trial <N> --out "$WORK/my-abliterated.safetensors"
 
-# 3. Serve with the 1.8 MB sidecar (temp=1.0 default; 541 tok/s greedy code peak) and run the 32-prompt refusal check
+# 3. Serve with the 1.8 MB sidecar (accuracy-first fp8/q4 default: 0.0096 KLD, 512K in 22.6 GiB) and run the 32-prompt refusal check
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-  --mode nvfp4 --kv q4 --ctx 524288 --mtp 7 --ablation "$WORK/my-abliterated.safetensors"
+  --mode fp8 --kv q4 --ctx 524288 --mtp 7 --temp 1.0 --top-p 0.95 --ablation "$WORK/my-abliterated.safetensors"
 uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label mine
 ```
 
