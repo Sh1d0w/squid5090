@@ -682,4 +682,21 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     }
 }
 
+// Stateless SplitMix64 uniform (0, 1) and Gumbel(0, 1) noise helpers for CUDA-graph sampling.
+// Strictly inside [2^-24, 1 - 2^-24] in float32 -> never produces 0.0f, 1.0f, NaN, or Inf.
+__device__ __forceinline__ float hash_u01(uint64_t seed, int32_t pos, int32_t tok) {
+    uint64_t h = seed ^ ((uint64_t)(uint32_t)pos * 0x9E3779B97F4A7C15ULL)
+                      ^ ((uint64_t)(uint32_t)tok * 0xBF58476D1CE4E5B9ULL);
+    h ^= h >> 30;
+    h *= 0xBF58476D1CE4E5B9ULL;
+    h ^= h >> 27;
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 31;
+    return ((float)(h >> 41) + 0.5f) * (1.0f / 8388608.0f);
+}
+
+__device__ __forceinline__ float hash_gumbel(uint64_t seed, int32_t pos, int32_t tok) {
+    return -__logf(-__logf(hash_u01(seed, pos, tok)));
+}
+
 } // namespace squid

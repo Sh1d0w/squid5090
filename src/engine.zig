@@ -246,6 +246,9 @@ pub const Engine = struct {
     lm_blk_val: [*]f32 = undefined,
     lm_blk_idx: [*]i32 = undefined,
     lm_logits: [*]f32 = undefined,
+    d_draft_probs: [*]f32 = undefined,
+    d_draft_q_sel: [*]f32 = undefined,
+    d_draft_is_delta: *i32 = undefined,
     d_sample_cfg: *cuda.CSampleConfig = undefined,
     sample_params: SampleParams = .{},
 
@@ -422,9 +425,14 @@ pub const Engine = struct {
         self.lm_blk_val = self.arena.alloc_many(f32, b_max * 1024);
         self.lm_blk_idx = self.arena.alloc_many(i32, b_max * 1024);
         self.lm_logits = self.arena.alloc_many(f32, b_max * constants.vocab_unpadded_count);
+        self.d_draft_probs = self.arena.alloc_many(f32, constants.mtp_draft_count_max * constants.vocab_unpadded_count);
+        self.d_draft_q_sel = self.arena.alloc_many(f32, constants.mtp_draft_count_max);
+        self.d_draft_is_delta = self.arena.alloc_one(i32);
         self.d_sample_cfg = self.arena.alloc_one(cuda.CSampleConfig);
         const zero_cfg: cuda.CSampleConfig = .{};
+        const zero_i32: i32 = 0;
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_draft_is_delta), @ptrCast(&zero_i32), @sizeOf(i32), self.stream));
 
         // Fast batched prefill arena (B <= 256)
         const pb: u64 = prefill_batch_max;
@@ -965,7 +973,7 @@ pub const Engine = struct {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
-                    self.record_target_forward(1, false, true);
+                    self.record_target_forward(1, false, true, false);
                     cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
                 }
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
@@ -1003,6 +1011,13 @@ pub const Engine = struct {
                     const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
                     if (self.prompt_lookup.match(out_ptr)) {
                         lookup_hit = true;
+                        const one_i32: i32 = 1;
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                            @ptrCast(self.d_draft_is_delta),
+                            @ptrCast(&one_i32),
+                            @sizeOf(i32),
+                            self.stream,
+                        ));
                         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
                             @ptrCast(self.d_drafts),
                             @ptrCast(self.h_lookup_drafts.?),
@@ -1099,10 +1114,14 @@ pub const Engine = struct {
                         self.ds_ws,
                         self.d_drafts,
                         null,
+                        self.d_sample_cfg,
+                        self.d_draft_probs,
+                        self.d_draft_q_sel,
+                        self.d_draft_is_delta,
                         self.stream,
                     );
                     cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
-                    self.record_target_forward(batch, true, true);
+                    self.record_target_forward(batch, true, true, true);
                     cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
                 }
 
@@ -1193,7 +1212,7 @@ pub const Engine = struct {
             const is_last: bool = compute_last_lm and (i + batch == end_i);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
             self.current_position += @intCast(batch);
             i += batch;
         }
@@ -1232,7 +1251,7 @@ pub const Engine = struct {
             const is_last: bool = (i + batch == prompt_len);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
-            self.record_target_forward(@intCast(batch), use_mtp, is_last);
+            self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;
@@ -1912,7 +1931,35 @@ pub const Engine = struct {
         }
     }
 
-    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool) void {
+    /// Evaluate exact post-softcap FP32 logits [tokens.len, VOCAB_UNPADDED] for KLD / PPL quality eval.
+    pub fn eval_logits_chunked(self: *Engine, tokens: []const i32, out_logits_host: []f32) void {
+        const vocab: usize = constants.vocab_unpadded_count;
+        tiger.assert(tokens.len > 0 and tokens.len < self.context_tokens_max);
+        tiger.assert(out_logits_host.len >= tokens.len * vocab);
+        self.reset();
+
+        const dump_cfg: cuda.CSampleConfig = .{ .inv_temp = -1.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&dump_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+
+        var i: usize = 0;
+        while (i < tokens.len) {
+            const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.record_target_forward(@intCast(batch), false, true, false);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
+                @ptrCast(out_logits_host[i * vocab ..].ptr),
+                @ptrCast(self.lm_logits),
+                batch * vocab * @sizeOf(f32),
+                self.stream,
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            self.current_position += @intCast(batch);
+            i += batch;
+        }
+    }
+
+    fn record_target_forward(self: *Engine, batch_size: i32, commit_dspark: bool, compute_lm_head: bool, is_verify: bool) void {
         tiger.assert(batch_size >= 1 and batch_size <= constants.mtp_block_size_max);
         const w = self.weights.?;
         const b_usize: usize = @intCast(batch_size);
@@ -2349,6 +2396,12 @@ pub const Engine = struct {
                 self.lm_blk_idx,
                 self.d_sample_cfg,
                 self.d_pos,
+                if (is_verify) self.d_drafts else null,
+                if (is_verify) self.d_draft_probs else null,
+                if (is_verify) self.d_draft_q_sel else null,
+                if (is_verify) self.d_draft_is_delta else null,
+                if (is_verify) w.dspark.inv_draft_vocab_ids else null,
+                w.dspark.draft_vocab_size,
                 batch_size,
                 self.stream,
             );
@@ -2378,7 +2431,7 @@ pub const Engine = struct {
     fn ensure_b1_graph(self: *Engine) void {
         if (self.b1_graph_exec != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        self.record_target_forward(1, false, true);
+        self.record_target_forward(1, false, true, false);
         cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.b1_graph_exec));
         tiger.assert(self.b1_graph_exec != null);
@@ -2388,7 +2441,7 @@ pub const Engine = struct {
         const slot: usize = if (commit_dspark) 1 else 0;
         if (self.prefill_b8_graph_exec[slot] != null or !self.use_graphs) return;
         tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
-        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false);
+        self.record_target_forward(constants.mtp_block_size_max, commit_dspark, false, false);
         cuda.squid_launch_inc_pos_by(self.d_pos, constants.mtp_block_size_max, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.prefill_b8_graph_exec[slot]));
         tiger.assert(self.prefill_b8_graph_exec[slot] != null);
@@ -2421,10 +2474,14 @@ pub const Engine = struct {
             self.ds_ws,
             self.d_drafts,
             null,
+            self.d_sample_cfg,
+            self.d_draft_probs,
+            self.d_draft_q_sel,
+            self.d_draft_is_delta,
             self.stream,
         );
         cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
-        self.record_target_forward(batch, true, true);
+        self.record_target_forward(batch, true, true, true);
         cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, batch, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
         tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.spec_graph_exec[num_drafts]));
         tiger.assert(self.spec_graph_exec[num_drafts] != null);
@@ -2456,6 +2513,10 @@ pub const Engine = struct {
                 self.ds_ws,
                 self.d_drafts,
                 self.d_draft_conf,
+                self.d_sample_cfg,
+                self.d_draft_probs,
+                self.d_draft_q_sel,
+                self.d_draft_is_delta,
                 self.stream,
             );
             tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.draft_graph_exec));
@@ -2465,7 +2526,7 @@ pub const Engine = struct {
         if (self.verify_b8_graph_exec == null) {
             tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
             cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, constants.mtp_draft_count_max, self.stream);
-            self.record_target_forward(constants.mtp_block_size_max, true, true);
+            self.record_target_forward(constants.mtp_block_size_max, true, true, true);
             cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, constants.mtp_block_size_max, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_num_accepted.?), @ptrCast(self.d_num_acc), @sizeOf(i32), self.stream));
             tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_accepted), constants.mtp_block_size_max * @sizeOf(i32), self.stream));
@@ -2497,7 +2558,7 @@ pub const Engine = struct {
         const widths = [_]i32{ 2, 4, 8 };
         for (widths, 0..) |width, bidx| {
             tiger.assert_cuda(cuda.squid_adaptive_graph_branch_begin(self.adaptive_graph, @intCast(bidx), self.stream));
-            self.record_target_forward(width, true, true);
+            self.record_target_forward(width, true, true, true);
             cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, width, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
             tiger.assert_cuda(cuda.squid_adaptive_graph_branch_end(self.stream));
         }
@@ -2581,6 +2642,9 @@ fn compute_runtime_vram_bytes(
     total += tiger.align_up_u64(constants.dspark_workspace_floats * 4, a); // ds_ws
     total += 2 * tiger.align_up_u64(b * 1024 * 4, a); // lm_blk_val, lm_blk_idx
     total += tiger.align_up_u64(b * constants.vocab_unpadded_count * 4, a); // lm_logits
+    total += tiger.align_up_u64(constants.mtp_draft_count_max * constants.vocab_unpadded_count * 4, a); // d_draft_probs
+    total += tiger.align_up_u64(constants.mtp_draft_count_max * 4, a); // d_draft_q_sel
+    total += tiger.align_up_u64(4, a); // d_draft_is_delta
     total += tiger.align_up_u64(@sizeOf(cuda.CSampleConfig), a); // d_sample_cfg
 
     // Fast batched prefill arena (B <= 512)

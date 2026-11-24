@@ -39,17 +39,25 @@ void launch_bf16_linear(
     int B, int N, int K,
     cudaStream_t stream);
 
-// Fused LM Head + Softcap(30) + GPU Argmax / Nucleus+TopK Gumbel-Max Sampling for B rows!
-// When sample_cfg == nullptr or sample_cfg->inv_temp <= 0: pure greedy argmax (zero logits write).
+// Fused LM Head + Softcap(30) + GPU Argmax / Leviathan-Chen Stochastic Rejection Sampling!
+// sample_cfg->inv_temp == 0: pure greedy argmax (zero logits write).
+// sample_cfg->inv_temp <  0: write post-softcap logits for KLD eval + greedy argmax.
+// sample_cfg->inv_temp >  0: temperature/top_p/top_k sampling (with exact rejection sampling when d_draft_tokens != nullptr).
 void launch_lm_head_argmax(
     const LinearWeight& unembed,
-    const float* x,                  // [B, HIDDEN]
-    int32_t* out_tokens,             // [B]
-    float* out_logits,               // optional [B, VOCAB_UNPADDED]
-    float* scratch_vals,             // [B, 1024]
-    int32_t* scratch_idxs,           // [B, 1024]
-    const SampleConfig* sample_cfg,  // optional device pointer
-    const int32_t* d_pos,            // optional device pointer (batch start pos)
+    const float* x,                      // [B, HIDDEN]
+    int32_t* out_tokens,                 // [B]
+    float* out_logits,                   // optional [B, VOCAB_UNPADDED]
+    float* scratch_vals,                 // [B, 1024]
+    int32_t* scratch_idxs,               // [B, 1024]
+    const SampleConfig* sample_cfg,      // optional device pointer
+    const int32_t* d_pos,                // optional device pointer (batch start pos)
+    const int32_t* d_draft_tokens,       // optional [B-1] for rejection sampling
+    const float* d_draft_probs,          // optional [B-1, draft_vocab_size] normalized q_b(v)
+    const float* d_draft_q_sel,          // optional [B-1] q_b(draft_tokens[b])
+    const int32_t* d_draft_is_delta,     // optional [1] non-zero when prompt-lookup (q = delta_x)
+    const int32_t* inv_draft_vocab,      // optional [VOCAB_UNPADDED] real->draft idx (-1 if absent)
+    int draft_vocab_size,
     int B,
     cudaStream_t stream);
 
@@ -444,6 +452,10 @@ void launch_dspark_draft(
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
     float* out_draft_conf,         // optional [num_drafts] max softmax probability
+    const SampleConfig* sample_cfg,// optional device sampling config (inv_temp > 0 => stochastic draft!)
+    float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
+    float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
+    int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],

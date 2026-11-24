@@ -9,12 +9,12 @@ const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 
-const request_buffer_bytes: usize = 8 * 1024 * 1024;
-const prompt_render_bytes: usize = 8 * 1024 * 1024;
-const response_buffer_bytes: usize = 8 * 1024 * 1024;
-const content_buffer_bytes: usize = 4 * 1024 * 1024;
-const reasoning_buffer_bytes: usize = 4 * 1024 * 1024;
-const scratch_string_bytes: usize = 4 * 1024 * 1024;
+const request_buffer_bytes: usize = 32 * 1024 * 1024;
+const prompt_render_bytes: usize = 32 * 1024 * 1024;
+const response_buffer_bytes: usize = 16 * 1024 * 1024;
+const content_buffer_bytes: usize = 8 * 1024 * 1024;
+const reasoning_buffer_bytes: usize = 8 * 1024 * 1024;
+const scratch_string_bytes: usize = 16 * 1024 * 1024;
 const sse_frame_bytes: usize = 64 * 1024;
 const prompt_tokens_max: usize = 1_048_576;
 const stop_sequences_max: usize = 8;
@@ -450,9 +450,11 @@ fn read_http_request(fd: i32, buffer: []u8) ?ParsedHttp {
     }
 
     const body_start = hdr_end + 4;
-    if (body_start + content_len > buffer.len) return null;
+    if (body_start + content_len > buffer.len) {
+        return .{ .method = "__TOO_LARGE__", .path = path, .auth_header = auth_header, .body = "" };
+    }
     var body_iter: u32 = 0;
-    while (received < body_start + content_len and body_iter < 65536) : (body_iter += 1) {
+    while (received < body_start + content_len and body_iter < 262144) : (body_iter += 1) {
         const need = body_start + content_len - received;
         const n: isize = tiger.recv(fd, buffer[received..].ptr, @min(65536, need), 0);
         if (n <= 0) {
@@ -479,6 +481,10 @@ fn handle_connection(
     prng_state: *u64,
 ) void {
     const req = read_http_request(fd, buffers.request_buf) orelse return;
+    if (std.mem.eql(u8, req.method, "__TOO_LARGE__")) {
+        send_error_json(fd, 413, "Request body exceeds 32 MiB static HTTP buffer", "invalid_request_error", buffers.response_buf);
+        return;
+    }
 
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
         _ = send_all(fd, "HTTP/1.1 204 No Content\r\n" ++

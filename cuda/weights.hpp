@@ -119,8 +119,9 @@ struct DsparkWeights {
     // Precomputed folded draft projections for blazing fast Markov RNN argmax:
     // Optional pruned draft vocabulary (e.g. 32K/49K tokens -> 4-6x faster drafter, 100% lossless!)
     int draft_vocab_size = VOCAB_UNPADDED;
-    int32_t* draft_vocab_ids = nullptr; // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
-    LinearWeight unembed_draft;         // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
+    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
+    int32_t* inv_draft_vocab_ids = nullptr; // [VOCAB_UNPADDED] maps real vocab ID -> local idx or -1 (nullptr = identity)
+    LinearWeight unembed_draft;             // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
     LinearWeight fold_w;                // [draft_vocab_size, 256]  (NVFP4: only 4.7-7.0 MB!)
     float* fold_b = nullptr;            // [draft_vocab_size] F32
 

@@ -21,20 +21,41 @@ Complete consolidated engineering reference for `squid5090`: roofline analysis, 
 | **Lever 11: `B=2048` WGEMM + 2D-Tiled Short Conv** | Multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 576-CTA 4-tap FIR sconv (`-42.9 ms/chunk`) | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | **8,755 / 7,742 tok/s** *(9,181 chunk peak)* | **1M** (`23.22 GiB`) |
 | **Lever 12: Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** *(ablated)* | **332.5 tok/s** *(0 harmless diff)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
 | **Lever 13: Hybrid O(1) Prompt-Lookup + DSpark** | Zero-malloc 2-entry hash index (`8,192` ring, `min_match_len=16`), bypasses DSpark into `verify_b8_graph_exec` on verbatim matches | **589.5 tok/s** code<br>**771.6 tok/s** quote/RAG | **332.5 tok/s** | 259.0 tok/s | **8,755 / 7,742 tok/s** | **1M** (`23.22 GiB`) |
+| **Lever 14: Leviathan/Chen Rejection Sampling + KLD + 512K Recall** | Exact stochastic rejection sampling ($q_i(v)$ drafted in CUDA Graph + $\mathrm{norm}(\max(0,p-q))$ residual resampling), 32 MiB HTTP/render buffers, built-in FP64 `kld` eval, real 128K–512K needle recall | **547.0 / 444.9** (`T=0/1`, P1)<br>**610.5 / 518.5** copy (`T=0/1`) | **315.7 / 279.3** (`T=0/1`, P1)<br>**308.4 / 272.6** prose | 248.5 tok/s *(P1)* | **5,988 / 4,575 / 3,062 tok/s** *(128K/256K/512K)* | **512K real PASS**<br>**1M** (`23.23 GiB`) |
+
+### Built-In Exact FP64 KLD vs. Official `exact/bf16` (529 Multi-Domain Tokens)
+
+Evaluated via `squid5090 logits` + `squid5090 kld` across Python code, systems prose, math proofs, and chat (`ref_PPL = 2.5555`):
+
+| Mode | KV Format | Mean KLD (nats) | Median KLD | p95 KLD | Top-1 Match | Candidate PPL | ΔPPL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `exact` | `bf16` | **0.000000** | 0.000000 | 0.000000 | **100.00%** | 2.5555 | +0.0000 |
+| `exact` | `fp8` | 0.002682 | 0.000061 | 0.013487 | 99.05% | 2.5645 | +0.0090 |
+| `exact` | `q4` | 0.005170 | 0.000237 | 0.024269 | 97.73% | 2.5811 | +0.0256 |
+| `fp8` | `bf16` | 0.003544 | 0.000118 | 0.016707 | 99.24% | 2.5616 | +0.0061 |
+| **`fp8`** | **`fp8`** | **0.003031** | 0.000108 | 0.016044 | **98.49%** | 2.5706 | +0.0151 |
+| **`fp8`** | **`q4`** | **0.004969** | 0.000307 | 0.023981 | **97.16%** | 2.5820 | +0.0265 |
+| `nvfp4` | `bf16` | 0.015811 | 0.001053 | 0.075243 | 94.90% | 2.5761 | +0.0207 |
+| `nvfp4` | `fp8` | 0.016548 | 0.001192 | 0.082989 | 96.03% | 2.5900 | +0.0345 |
+| **`nvfp4`** | **`q4`** | **0.018413** | 0.001068 | 0.089071 | **95.84%** | 2.5952 | +0.0397 |
+
+- **Takeaway:** `q4` KV adds only `~0.002–0.005` KLD; most of `nvfp4`'s `0.0184` KLD comes from quantizing dense attention + L20–23 experts + `lm_head` to 4-bit. `--mode fp8 --kv q4` cuts KLD **3.7×** (`0.0050`) while still fitting 512K–1M contexts without host spill.
 
 ### Long-Context Scaling & Prefix Cache Latency (`--mode nvfp4 --kv q4`)
 
 | Workload / Context Depth | Prefill Latency / Rate | Decode Speed (`c=1`) | Total VRAM | Notes |
 |---|---:|---:|---:|---|
-| **Short Code (1,024 tok)** | `29.0 ms` | **589.5 tok/s** (`acc=73.1%`, `dl=3.82`) | **15.59 GiB** | Bit-exact parity; `lookup=10/268` |
-| **Verbatim Code Copy / RAG (568 tok)** | `91.2 ms` | **771.6 tok/s** (`acc=91.5%`, `dl=5.40`) | **15.59 GiB** | Bit-exact parity; `lookup=38/105` (+64.7 tok/s vs DSpark-only) |
-| **Live 16.0K HTTP cold warm-up** | `2,110.3 ms` (`7,600 tok/s`) | **383.3 tok/s** | **23.22 GiB** | Full 1M-ctx server over HTTP SSE |
-| **Live 16.1K HTTP Turn 1 (warm prefix)** | **`71.9 ms`** (`16,033` cached) | **446.7 tok/s** (`dl=3.10`) | **23.22 GiB** | `107.4 ms` end-to-end TTFT (1,600 gen tok) |
+| **Short Code (1,024 tok)** | `29.0 ms` | **589.5 tok/s** P0 / **547.0** P1 (`T=0`), **444.9** (`T=1.0`) | **15.59 GiB** | `acc=73.1%` (`T=0`), `63.9%` (`T=1.0` rejection sampling) |
+| **Verbatim Code Copy / RAG** | `59.7–91.2 ms` | **771.6 tok/s** P0 / **610.5** P1 (`T=0`), **518.5** (`T=1.0`) | **15.59 GiB** | Prompt-Lookup + DSpark (`acc=79.7–91.5%`) |
+| **Chat / Prose (512 tok)** | `28.0 ms` | **315.7 / 308.4** (`T=0`), **279.3 / 272.6** (`T=1.0`, P1) | **15.59 GiB** | Dedicated P0 chat: `332.5 tok/s` |
+| **Live 16.1K HTTP Turn 1 (warm prefix)** | **`71.9 ms`** (`16,033` cached) | **446.7 tok/s** (`dl=3.10`) | **23.22 GiB** | `107.4 ms` end-to-end TTFT; `32 MiB` static HTTP buffer |
 | **Cold 20K (`19,978` tok)** | **`2,281.9 ms`** (`8,755 tok/s`) | **453.6 tok/s** | **16.71 GiB** | `9,181 tok/s` `B=2048` chunk peak |
-| **Cold 64K Needle-in-a-Haystack (PASS)** | **`8,464.8 ms`** (`7,742 tok/s`) | **317.6–331.0 tok/s** | **16.71 GiB** | Verbatim needle recall PASS |
+| **Real 64K Needle (PASS)** | **`8,464.8 ms`** (`7,742 tok/s`) | **317.6–331.0 tok/s** | **16.71 GiB** | Verbatim needle recall PASS |
+| **Real 128K Needle (PASS)** | **`21,887.8 ms`** (`5,988 tok/s`) | **166.6 tok/s** | **17.40 GiB** | Verbatim recall PASS (`COBALT-FALCON-7492`) |
+| **Real 256K Needle (PASS)** | **`57,288.3 ms`** (`4,575 tok/s`) | **123.9 tok/s** | **17.90 GiB** | Verbatim recall PASS (`OBSIDIAN-HERON-3815`) |
+| **Real 512K Needle (PASS)** | **`171,127.7 ms`** (`3,062 tok/s`) | **74.4 tok/s** | **20.30 GiB** | Verbatim recall PASS (`VERMILION-LYNX-9064`) |
 | **Warm 82.5K turn (past 65K cap)** | **`62.4 ms`** (`82,454` cached) | **237.5 tok/s** | **23.22 GiB** | **>1,400× faster** than cold prefill |
-| **Cold 131K (`129,984` tok)** | **`19,971.5 ms`** (`6,509 tok/s`) | **236.4–284.8 tok/s** | **16.71 GiB** | Sustained >6.5K tok/s across 130K tokens |
-| **256K / 512K / 1M (`1,048,000` `longctx`)** | — | **228.1 / 163.7 / 108.0 tok/s** (`B=4 @dl=2.5`) | **17.8 / 20.4 / 23.22 GiB** | `B=1`: `119.8 / 79.5 / 48.5 tok/s`; 0 host spill |
+| **Synthetic `longctx` 256K / 512K / 1M (`1,048,000`)** | *zeroed KV* | **`B=1`: 114.6 / 74.6 / 45.7 tok/s** (`P1`)<br>*`B=4 @dl=2.5` synthetic: 214.1 / 154.3 / 102.4 (`P1`), 108.0 (`P0`)* | **17.9 / 20.3 / 23.23 GiB** | Real KV alloc & step latency (`96.1` in `ledger.jsonl` was pre-PDL Lever 7C) |
 
 ---
 

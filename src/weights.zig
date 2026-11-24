@@ -618,11 +618,25 @@ pub const ModelWeights = struct {
                     draft_vocab_host.len * @sizeOf(i32),
                 ));
 
+                // Inverse LUT [VOCAB_UNPADDED] -> draft idx or -1 for exact Leviathan/Chen rejection sampling
+                self.dspark.inv_draft_vocab_ids = self.arena.alloc_many(i32, constants.vocab_unpadded_count);
+                const h_inv = tiger.alloc_host_zeroed(i32, constants.vocab_unpadded_count);
+                defer tiger.free_host_slice(i32, h_inv);
+                @memset(h_inv, -1);
+                for (draft_vocab_host, 0..) |tok_id, idx| {
+                    tiger.assert(tok_id >= 0 and tok_id < constants.vocab_unpadded_count);
+                    h_inv[@intCast(tok_id)] = @intCast(idx);
+                }
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(
+                    @ptrCast(self.dspark.inv_draft_vocab_ids.?),
+                    @ptrCast(h_inv.ptr),
+                    h_inv.len * @sizeOf(i32),
+                ));
+
                 const row_bytes: usize = constants.hidden_dim * 2;
                 const h_sub = tiger.alloc_host_zeroed(u8, @as(usize, draft_vocab_count) * row_bytes);
                 defer tiger.free_host_slice(u8, h_sub);
                 for (draft_vocab_host, 0..) |tok_id, idx| {
-                    tiger.assert(tok_id >= 0 and tok_id < constants.vocab_unpadded_count);
                     const src_off: usize = @as(usize, @intCast(tok_id)) * row_bytes;
                     @memcpy(h_sub[idx * row_bytes ..][0..row_bytes], h_unembed[src_off..][0..row_bytes]);
                 }
@@ -631,6 +645,7 @@ pub const ModelWeights = struct {
             } else {
                 self.dspark.draft_vocab_size = constants.vocab_unpadded_count;
                 self.dspark.draft_vocab_ids = null;
+                self.dspark.inv_draft_vocab_ids = null;
                 const usable_bytes: usize = @as(usize, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(d_stage, @ptrCast(h_unembed.ptr), usable_bytes));
                 self.dspark.unembed_draft = self.unembed;
@@ -983,6 +998,7 @@ fn compute_total_vram_bytes(
 
         if (has_pruned_draft_vocab) {
             total += tiger.align_up_u64(@as(u64, draft_vocab_count) * 4, a); // draft_vocab_ids
+            total += tiger.align_up_u64(@as(u64, constants.vocab_unpadded_count) * 4, a); // inv_draft_vocab_ids
             total += constants.linear_weight_vram_bytes(draft_vocab_count, constants.hidden_dim, mtp_kind); // unembed_draft
         }
         total += tiger.align_up_u64(@as(u64, draft_vocab_count) * 4, a); // fold_b

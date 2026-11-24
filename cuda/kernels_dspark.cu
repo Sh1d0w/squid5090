@@ -651,7 +651,10 @@ markov_fold_argmax_stage1_kernel(
     int32_t* __restrict__ blk_idx,
     float* __restrict__ blk_cm,
     float* __restrict__ blk_csum,
+    float* __restrict__ out_step_probs,
+    const SampleConfig* __restrict__ sample_cfg,
     int V) {
+    const bool write_logits = (out_step_probs != nullptr) && (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f);
     __shared__ __half s_lh[256];
     __shared__ float s_lf[256];
     int tid = threadIdx.x;
@@ -710,6 +713,7 @@ markov_fold_argmax_stage1_kernel(
             float total = base_logits[row] + (fold_b ? fold_b[row] : 0.0f) + acc;
             if (total > bv) { bv = total; bi = row; }
             float cap = fast_tanh(total * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+            if (write_logits) out_step_probs[row] = cap;
             if (cap > cm) {
                 csum = (csum > 0.0f) ? (csum * __expf(cm - cap) + 1.0f) : 1.0f;
                 cm = cap;
@@ -747,7 +751,14 @@ __global__ void markov_fold_argmax_stage2_kernel(
     const float* __restrict__ blk_csum,
     const int32_t* __restrict__ draft_vocab_ids, // optional remap to real vocab ID
     int32_t* __restrict__ out_tok,
-    float* __restrict__ out_conf) {
+    float* __restrict__ out_conf,
+    float* __restrict__ out_step_probs,
+    float* __restrict__ out_q_sel,
+    int32_t* __restrict__ d_draft_is_delta,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    int step_idx,
+    int V) {
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
@@ -781,6 +792,35 @@ __global__ void markov_fold_argmax_stage2_kernel(
     __shared__ int32_t si[8];
     if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; scm[tid >> 5] = cm; scs[tid >> 5] = csum; }
     __syncthreads();
+
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && out_step_probs != nullptr);
+    if (!do_sample) {
+        if (tid == 0) {
+            bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
+            for (int w = 1; w < 8; ++w) {
+                if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
+                if (scs[w] > 0.0f) {
+                    float nm = fmaxf(cm, scm[w]);
+                    csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
+                    cm = nm;
+                }
+            }
+            *out_tok = draft_vocab_ids ? draft_vocab_ids[bi] : bi;
+            if (out_conf) *out_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+            if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        }
+        return;
+    }
+
+    __shared__ float s_max_cap;
+    __shared__ float s_conf;
+    __shared__ int32_t s_greedy;
+    __shared__ float hist_sum[256];
+    __shared__ uint32_t hist_cnt[256];
+    __shared__ float s_tau;
+    __shared__ float s_inv_z;
+    __shared__ int32_t s_picked;
+
     if (tid == 0) {
         bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
         for (int w = 1; w < 8; ++w) {
@@ -791,8 +831,107 @@ __global__ void markov_fold_argmax_stage2_kernel(
                 cm = nm;
             }
         }
-        *out_tok = draft_vocab_ids ? draft_vocab_ids[bi] : bi;
-        if (out_conf) *out_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+        s_max_cap = cm;
+        s_greedy = bi;
+        s_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+    }
+    __syncthreads();
+
+    const float max_cap = s_max_cap;
+    const float inv_temp = sample_cfg->inv_temp;
+    const float top_p = sample_cfg->top_p;
+    const int32_t top_k = sample_cfg->top_k;
+    const uint64_t draft_seed = sample_cfg->seed ^ 0xD5A2C1B39E3779B9ULL;
+    const int32_t pos = (d_pos ? (*d_pos) : 0) + step_idx;
+
+    constexpr float HIST_RANGE = 20.0f;
+    constexpr float HIST_SCALE = 256.0f / HIST_RANGE;
+
+    if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
+        hist_sum[tid] = 0.0f;
+        hist_cnt[tid] = 0u;
+        __syncthreads();
+        for (int row = tid; row < V; row += 256) {
+            float d = (max_cap - out_step_probs[row]) * inv_temp;
+            if (d < HIST_RANGE) {
+                int bin = (int)(d * HIST_SCALE);
+                if (bin < 0) bin = 0;
+                else if (bin > 255) bin = 255;
+                atomicAdd(&hist_sum[bin], __expf(-d));
+                atomicAdd(&hist_cnt[bin], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float total_z = 0.0f;
+            for (int k = 0; k < 256; ++k) total_z += hist_sum[k];
+            float cum_z = 0.0f;
+            uint32_t cum_c = 0u;
+            int cut_bin = 255;
+            const float target_z = (top_p > 0.0f && top_p < 1.0f) ? (top_p * total_z) : total_z;
+            for (int k = 0; k < 256; ++k) {
+                cum_z += hist_sum[k];
+                cum_c += hist_cnt[k];
+                const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
+                const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);
+                if (hit_p || hit_k) { cut_bin = k; break; }
+            }
+            s_tau = max_cap - ((float)(cut_bin + 1) / HIST_SCALE) / inv_temp;
+        }
+        __syncthreads();
+    } else {
+        if (tid == 0) s_tau = max_cap - HIST_RANGE / inv_temp;
+        __syncthreads();
+    }
+
+    const float tau = s_tau;
+    float local_z = 0.0f;
+    float best_s = -1e30f;
+    int32_t best_t = s_greedy;
+    for (int row = tid; row < V; row += 256) {
+        float l = out_step_probs[row];
+        if (l >= tau) {
+            float e = __expf((l - max_cap) * inv_temp);
+            out_step_probs[row] = e;
+            local_z += e;
+            float sc = (l - max_cap) * inv_temp + hash_gumbel(draft_seed, pos, row);
+            if (sc > best_s) { best_s = sc; best_t = row; }
+        } else {
+            out_step_probs[row] = 0.0f;
+        }
+    }
+    local_z = warp_sum(local_z);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+        int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
+        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
+    }
+    if ((tid & 31) == 0) { scs[tid >> 5] = local_z; sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
+    __syncthreads();
+    if (tid == 0) {
+        float tot_z = 0.0f;
+        best_s = sv[0]; best_t = si[0];
+        for (int w = 0; w < 8; ++w) {
+            tot_z += scs[w];
+            if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
+        }
+        s_inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
+        s_picked = best_t;
+    }
+    __syncthreads();
+
+    const float inv_z = s_inv_z;
+    for (int row = tid; row < V; row += 256) {
+        out_step_probs[row] *= inv_z;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int32_t pk = s_picked;
+        *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
+        if (out_q_sel) *out_q_sel = out_step_probs[pk];
+        if (out_conf) *out_conf = s_conf;
+        if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
     }
 }
 
@@ -870,7 +1009,9 @@ void launch_dspark_draft(
     void* ctx_k[MTP_LAYERS], void* ctx_v[MTP_LAYERS],
     const __half* ctx_ks[MTP_LAYERS], const __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt, float* split_buf,
-    const float* f_ring, float* ws, int32_t* out_draft_tokens, float* out_draft_conf, cudaStream_t stream) {
+    const float* f_ring, float* ws, int32_t* out_draft_tokens, float* out_draft_conf,
+    const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
+    int32_t* out_draft_is_delta, cudaStream_t stream) {
     const DsparkWeights& dw = mw.dspark;
 
     // Partition preallocated DSpark workspace (in floats):
@@ -987,18 +1128,23 @@ void launch_dspark_draft(
             c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state, raw_rnn);
 
         const float* bl_i = base_logits + (size_t)i * Vd;
+        float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * Vd) : nullptr;
         if (dw.fold_w.kind == WeightKind::NVFP4) {
             markov_fold_argmax_stage1_kernel<2><<<MARKOV_BLOCKS, 256, 0, stream>>>(
                 dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum, Vd);
+                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                dp_i, sample_cfg, Vd);
         } else {
             markov_fold_argmax_stage1_kernel<0><<<MARKOV_BLOCKS, 256, 0, stream>>>(
                 dw.fold_w.data, nullptr, 1.0f,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum, Vd);
+                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                dp_i, sample_cfg, Vd);
         }
         markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
             blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
-            out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr);
+            out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr,
+            dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
+            sample_cfg, d_pos, i, Vd);
     }
 }
 

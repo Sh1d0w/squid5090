@@ -315,6 +315,7 @@ struct CDsparkWeights {
     void* hidden_out_b;
     int32_t draft_vocab_size;
     int32_t* draft_vocab_ids;
+    int32_t* inv_draft_vocab_ids;
     CLinearWeight unembed_draft;
     CLinearWeight fold_w;
     float* fold_b;
@@ -372,6 +373,7 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
     dw.hidden_out_b = static_cast<__nv_bfloat16*>(c.hidden_out_b);
     dw.draft_vocab_size = c.draft_vocab_size;
     dw.draft_vocab_ids = c.draft_vocab_ids;
+    dw.inv_draft_vocab_ids = c.inv_draft_vocab_ids;
     dw.unembed_draft = to_lw(c.unembed_draft);
     dw.fold_w = to_lw(c.fold_w);
     dw.fold_b = c.fold_b;
@@ -712,9 +714,12 @@ void squid_launch_mega_mlp_post_next_depth_norm(
 void squid_launch_lm_head_argmax(
     const CLinearWeight* unembed, const float* x, int32_t* out_tokens, float* out_logits,
     float* scratch_vals, int32_t* scratch_idxs, const SampleConfig* sample_cfg, const int32_t* d_pos,
+    const int32_t* d_draft_tokens, const float* d_draft_probs, const float* d_draft_q_sel,
+    const int32_t* d_draft_is_delta, const int32_t* inv_draft_vocab, int32_t draft_vocab_size,
     int32_t B, void* stream) {
     launch_lm_head_argmax(to_lw(*unembed), x, out_tokens, out_logits, scratch_vals, scratch_idxs,
-                          sample_cfg, d_pos, B, static_cast<cudaStream_t>(stream));
+                          sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel,
+                          d_draft_is_delta, inv_draft_vocab, draft_vocab_size, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_dspark_commit(
@@ -737,7 +742,9 @@ void squid_launch_dspark_draft(
     const int32_t* d_anchor_token, const int32_t* d_pos, int32_t num_drafts,
     void* const* ctx_k, void* const* ctx_v, const void* const* ctx_ks, const void* const* ctx_vs,
     const int32_t* ctx_cap, uint8_t global_kv_fmt, float* split_buf,
-    const float* f_ring, float* workspace, int32_t* out_draft_tokens, float* out_draft_conf, void* stream) {
+    const float* f_ring, float* workspace, int32_t* out_draft_tokens, float* out_draft_conf,
+    const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
+    int32_t* out_draft_is_delta, void* stream) {
     ModelWeights mw;
     mw.embed = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed));
     mw.embed_norm = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed_norm));
@@ -749,7 +756,8 @@ void squid_launch_dspark_draft(
     int cap[MTP_LAYERS] = {ctx_cap[0], ctx_cap[1], ctx_cap[2]};
     launch_dspark_draft(mw, d_anchor_token, d_pos, num_drafts, ck, cv, cks, cvs, cap,
                         static_cast<KVFormat>(global_kv_fmt), split_buf, f_ring, workspace,
-                        out_draft_tokens, out_draft_conf, static_cast<cudaStream_t>(stream));
+                        out_draft_tokens, out_draft_conf, sample_cfg, out_draft_probs,
+                        out_draft_q_sel, out_draft_is_delta, static_cast<cudaStream_t>(stream));
 }
 
 int32_t squid_adaptive_graph_create(

@@ -31,6 +31,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var model_name: []const u8 = "inkling-2-mini";
     var model_name_explicit: bool = false;
     var ablation_path: []const u8 = "";
+    var out_path: []const u8 = "";
+    var ref_path: []const u8 = "";
     var effort: []const u8 = "none";
     var api_key: []const u8 = "";
     if (tiger.getenv("SQUID_API_KEY")) |env_key| api_key = std.mem.span(env_key);
@@ -86,6 +88,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--ablation") and arg_i + 1 < argv.len) {
             arg_i += 1;
             ablation_path = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--out") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            out_path = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--ref") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            ref_path = std.mem.span(argv[arg_i]);
         } else if (std.mem.eql(u8, arg, "--effort") and arg_i + 1 < argv.len) {
             arg_i += 1;
             effort = std.mem.span(argv[arg_i]);
@@ -206,7 +214,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         prompt_len = tokenizer.encode_into(input_slice, true, &scratch, prompt_ids_buf);
     } else {
         if (tokens_file.len > 0) {
-            const file_buf = tiger.alloc_host_zeroed(u8, 8 * 1024 * 1024);
+            const file_buf = tiger.alloc_host_zeroed(u8, 32 * 1024 * 1024);
             defer tiger.free_host_slice(u8, file_buf);
             const loaded = read_file_into(tokens_file, file_buf) orelse {
                 tiger.print_stderr("Failed to read --tokens-file '{s}'\n", .{tokens_file});
@@ -254,6 +262,151 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .raw_thinking = raw_thinking,
             .keep_history_thinking = keep_history_thinking,
         });
+    }
+
+    if (std.mem.eql(u8, command, "logits")) {
+        if (out_path.len == 0 or prompt_len < 2) {
+            tiger.print_stderr("Usage: squid5090 logits <model_dir> (--prompt TEXT | --tokens-file PATH) --out <file.bin> [--mode exact] [--kv bf16]\n", .{});
+            return 1;
+        }
+        const vocab: usize = constants.vocab_unpadded_count;
+        const n_pos: usize = prompt_len;
+        const logits_host = tiger.alloc_host_zeroed(f32, n_pos * vocab);
+        defer tiger.free_host_slice(f32, logits_host);
+        engine.eval_logits_chunked(prompt_ids_buf[0..n_pos], logits_host);
+
+        var pz: [1024]u8 = undefined;
+        tiger.assert(out_path.len < pz.len);
+        @memcpy(pz[0..out_path.len], out_path);
+        pz[out_path.len] = 0;
+        const fd = tiger.open(@ptrCast(&pz), tiger.O_WRONLY | tiger.O_CREAT | tiger.O_TRUNC, @as(c_uint, 0o644));
+        if (fd < 0) {
+            tiger.print_stderr("Failed to open --out '{s}' for writing\n", .{out_path});
+            return 1;
+        }
+        defer _ = tiger.close(fd);
+        const raw_bytes: []const u8 = @as([*]const u8, @ptrCast(logits_host.ptr))[0 .. n_pos * vocab * @sizeOf(f32)];
+        tiger.write_fd_all(fd, raw_bytes);
+        tiger.print_stdout("[logits] wrote {d} positions x {d} vocab ({d:.1} MiB) to {s} (mode={s}, kv={s})\n", .{
+            n_pos, vocab, @as(f64, @floatFromInt(raw_bytes.len)) / (1024.0 * 1024.0), out_path, quant_mode.name(), kv_format.name(),
+        });
+        return 0;
+    }
+
+    if (std.mem.eql(u8, command, "kld")) {
+        if (ref_path.len == 0 or prompt_len < 2) {
+            tiger.print_stderr("Usage: squid5090 kld <model_dir> (--prompt TEXT | --tokens-file PATH) --ref <ref_logits.bin> [--mode nvfp4] [--kv q4]\n", .{});
+            return 1;
+        }
+        const vocab: usize = constants.vocab_unpadded_count;
+        const n_pos: usize = prompt_len;
+        const cand_logits = tiger.alloc_host_zeroed(f32, n_pos * vocab);
+        defer tiger.free_host_slice(f32, cand_logits);
+        engine.eval_logits_chunked(prompt_ids_buf[0..n_pos], cand_logits);
+
+        var pz: [1024]u8 = undefined;
+        tiger.assert(ref_path.len < pz.len);
+        @memcpy(pz[0..ref_path.len], ref_path);
+        pz[ref_path.len] = 0;
+        const fd = tiger.open(@ptrCast(&pz), tiger.O_RDONLY);
+        if (fd < 0) {
+            tiger.print_stderr("Failed to open --ref '{s}'\n", .{ref_path});
+            return 1;
+        }
+        defer _ = tiger.close(fd);
+
+        const ref_row = tiger.alloc_host_zeroed(f32, vocab);
+        defer tiger.free_host_slice(f32, ref_row);
+        const kld_vals = tiger.alloc_host_zeroed(f64, n_pos);
+        defer tiger.free_host_slice(f64, kld_vals);
+
+        var sum_kld: f64 = 0.0;
+        var sum_nll_ref: f64 = 0.0;
+        var sum_nll_cand: f64 = 0.0;
+        var nll_cnt: usize = 0;
+        var top1_match: usize = 0;
+        const row_bytes: usize = vocab * @sizeOf(f32);
+        const ref_bytes_ptr: [*]u8 = @ptrCast(ref_row.ptr);
+
+        var p_i: usize = 0;
+        while (p_i < n_pos) : (p_i += 1) {
+            var got: usize = 0;
+            while (got < row_bytes) {
+                const n = tiger.read(fd, ref_bytes_ptr + got, row_bytes - got);
+                if (n <= 0) {
+                    tiger.print_stderr("Unexpected EOF reading --ref at pos {d}\n", .{p_i});
+                    return 1;
+                }
+                got += @intCast(n);
+            }
+            const c_row = cand_logits[p_i * vocab ..][0..vocab];
+
+            var max_r: f64 = -1e30;
+            var max_c: f64 = -1e30;
+            var arg_r: usize = 0;
+            var arg_c: usize = 0;
+            var v: usize = 0;
+            while (v < vocab) : (v += 1) {
+                const rv: f64 = ref_row[v];
+                const cv: f64 = c_row[v];
+                if (rv > max_r) { max_r = rv; arg_r = v; }
+                if (cv > max_c) { max_c = cv; arg_c = v; }
+            }
+            if (arg_r == arg_c) top1_match += 1;
+
+            var z_r: f64 = 0.0;
+            var z_c: f64 = 0.0;
+            v = 0;
+            while (v < vocab) : (v += 1) {
+                z_r += @exp(@as(f64, ref_row[v]) - max_r);
+                z_c += @exp(@as(f64, c_row[v]) - max_c);
+            }
+            const log_zr = max_r + @log(z_r);
+            const log_zc = max_c + @log(z_c);
+
+            var kl: f64 = 0.0;
+            v = 0;
+            while (v < vocab) : (v += 1) {
+                const log_p = @as(f64, ref_row[v]) - log_zr;
+                const log_q = @as(f64, c_row[v]) - log_zc;
+                const p_prob = @exp(log_p);
+                kl += p_prob * (log_p - log_q);
+            }
+            if (kl < 0.0) kl = 0.0;
+            kld_vals[p_i] = kl;
+            sum_kld += kl;
+
+            if (p_i + 1 < n_pos) {
+                const nxt: usize = @intCast(prompt_ids_buf[p_i + 1]);
+                if (nxt < vocab) {
+                    sum_nll_ref += -( @as(f64, ref_row[nxt]) - log_zr );
+                    sum_nll_cand += -( @as(f64, c_row[nxt]) - log_zc );
+                    nll_cnt += 1;
+                }
+            }
+        }
+
+        // Insertion sort kld_vals for median & p95
+        var si: usize = 1;
+        while (si < n_pos) : (si += 1) {
+            const key = kld_vals[si];
+            var sj: usize = si;
+            while (sj > 0 and kld_vals[sj - 1] > key) : (sj -= 1) kld_vals[sj] = kld_vals[sj - 1];
+            kld_vals[sj] = key;
+        }
+        const mean_kld = sum_kld / @as(f64, @floatFromInt(n_pos));
+        const med_kld = kld_vals[n_pos / 2];
+        const p95_kld = kld_vals[(n_pos * 95) / 100];
+        const max_kld = kld_vals[n_pos - 1];
+        const ppl_ref = @exp(sum_nll_ref / @as(f64, @floatFromInt(@max(nll_cnt, 1))));
+        const ppl_cand = @exp(sum_nll_cand / @as(f64, @floatFromInt(@max(nll_cnt, 1))));
+        const top1_pct = 100.0 * @as(f64, @floatFromInt(top1_match)) / @as(f64, @floatFromInt(n_pos));
+
+        tiger.print_stdout(
+            "[kld] mode={s} kv={s} pos={d} | mean_KLD={d:.6} med={d:.6} p95={d:.6} max={d:.6} | top1={d:.2}% | ref_PPL={d:.4} cand_PPL={d:.4} (dPPL={d:.4})\n",
+            .{ quant_mode.name(), kv_format.name(), n_pos, mean_kld, med_kld, p95_kld, max_kld, top1_pct, ppl_ref, ppl_cand, ppl_cand - ppl_ref },
+        );
+        return 0;
     }
 
     if (std.mem.eql(u8, command, "longctx")) {
@@ -310,6 +463,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         var r: usize = 0;
         while (r < clamped_runs) : (r += 1) {
+            if (temperature > 0.0 and seed == 0) {
+                engine.sample_params.seed = tiger.hash_pair_u64(tiger.clock_monotonic_ns() ^ @as(u64, r));
+            }
             const st = engine.generate(prompt_ids_buf[0..prompt_len], max_tokens, mtp, out_tokens_buf, null, null);
             const dec_toks: f64 = @floatFromInt(if (st.generated_tokens > 0) st.generated_tokens - 1 else 0);
             const tps: f64 = if (st.decode_ms > 0.0) (dec_toks * 1000.0 / st.decode_ms) else 0.0;
@@ -343,8 +499,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             0.5 * (speeds[clamped_runs / 2 - 1] + speeds[clamped_runs / 2]);
 
         tiger.print_stdout(
-            "MEDIAN: {d:.2} tok/s | min={d:.2} max={d:.2} | prefill={d:.2}ms | acc={d:.1}% dl={d:.2} | mode={s} mtp={d} graph={d}\n",
-            .{ median, speeds[0], speeds[clamped_runs - 1], last_prefill, last_acc, last_dl, quant_mode.name(), mtp, @as(u8, if (use_graphs) 1 else 0) },
+            "MEDIAN: {d:.2} tok/s | min={d:.2} max={d:.2} | prefill={d:.2}ms | acc={d:.1}% dl={d:.2} | mode={s} kv={s} temp={d:.2} mtp={d} graph={d}\n",
+            .{ median, speeds[0], speeds[clamped_runs - 1], last_prefill, last_acc, last_dl, quant_mode.name(), kv_format.name(), temperature, mtp, @as(u8, if (use_graphs) 1 else 0) },
         );
         print_token_csv("TOKENS:", sample_tokens[0..sample_len]);
         if (need_tokenizer) print_decoded(&tokenizer, sample_tokens[0..sample_len]);
@@ -427,8 +583,10 @@ fn print_usage() void {
             "Usage:\n" ++
             "  squid5090 serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.80] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n" ++
             "  squid5090 generate <model_dir> (--prompt TEXT | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 512] [--ctx 8192]\n" ++
-            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
+            "  squid5090 bench    <model_dir> (--prompt TEXT | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.80] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 512] [--runs 6] [--ctx 8192]\n" ++
             "  squid5090 longctx  <model_dir> [--mode nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n" ++
+            "  squid5090 logits   <model_dir> (--prompt TEXT | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 8192]\n" ++
+            "  squid5090 kld      <model_dir> (--prompt TEXT | --tokens-file PATH) --ref FILE [--mode nvfp4] [--kv q4] [--ctx 8192]\n" ++
             "  squid5090 tokenize <model_dir> --prompt TEXT [--raw]\n",
     );
 }

@@ -96,6 +96,9 @@ comptime {
 }
 
 pub const O_RDONLY: i32 = 0;
+pub const O_WRONLY: i32 = 1;
+pub const O_CREAT: i32 = 0x40;
+pub const O_TRUNC: i32 = 0x200;
 pub const SEEK_SET: i32 = 0;
 pub const SEEK_END: i32 = 2;
 pub const PROT_READ: i32 = 1;

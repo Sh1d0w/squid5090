@@ -70,6 +70,7 @@ pub const CDsparkWeights = extern struct {
     hidden_out_b: ?*anyopaque = null,
     draft_vocab_size: i32 = 0,
     draft_vocab_ids: ?[*]i32 = null,
+    inv_draft_vocab_ids: ?[*]i32 = null,
     unembed_draft: CLinearWeight = .{},
     fold_w: CLinearWeight = .{},
     fold_b: ?[*]f32 = null,
@@ -449,6 +450,12 @@ pub extern "c" fn squid_launch_lm_head_argmax(
     scratch_idxs: [*]i32,
     sample_cfg: ?*const CSampleConfig,
     d_pos: ?*const i32,
+    d_draft_tokens: ?[*]const i32,
+    d_draft_probs: ?[*]const f32,
+    d_draft_q_sel: ?[*]const f32,
+    d_draft_is_delta: ?*const i32,
+    inv_draft_vocab: ?[*]const i32,
+    draft_vocab_size: i32,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -488,6 +495,10 @@ pub extern "c" fn squid_launch_dspark_draft(
     workspace: [*]f32,
     out_draft_tokens: [*]i32,
     out_draft_conf: ?[*]f32,
+    sample_cfg: ?*const CSampleConfig,
+    out_draft_probs: ?[*]f32,
+    out_draft_q_sel: ?[*]f32,
+    out_draft_is_delta: ?*i32,
     stream: ?*anyopaque,
 ) void;
 
