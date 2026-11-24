@@ -327,7 +327,7 @@ __device__ __forceinline__ void store_kv_head_128(
         if (lane == 0) sm[warp] = wm;
         __syncthreads();
         float amax = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
-        float sc = fmaxf(amax / 448.0f, 1e-8f);
+        float sc = fmaxf(amax / 448.0f, 1e-7f);
         if (tid == 0) scales[(size_t)slot * NUM_KV_HEADS + h] = __float2half(sc);
         static_cast<uint8_t*>(cache)[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = float_to_e4m3(val / sc);
     } else {
@@ -338,7 +338,7 @@ __device__ __forceinline__ void store_kv_head_128(
         __syncthreads();
         int g = tid >> 6; // 0 (dims 0..63) or 1 (dims 64..127)
         float gmax = fmaxf(sm[g * 2], sm[g * 2 + 1]);
-        float sc = fmaxf(gmax / 7.0f, 1e-8f);
+        float sc = fmaxf(gmax / 7.0f, 1e-7f);
         if ((tid & 63) == 0) scales[(size_t)slot * KV_Q4_SCALES_PER_TOK + h * 2 + g] = __float2half(sc);
         int q = max(-7, min(7, __float2int_rn(val / sc))) + 7; // 0..14
         int q_odd = __shfl_xor_sync(0xffffffffu, q, 1);

@@ -1154,7 +1154,7 @@ relative_attention_gated_inline_kernel(
         #pragma unroll
         for (int w = 1; w < 8; ++w) g_m = fmaxf(g_m, sm_m[w]);
 
-        int base_hb = (h * MAX_VERIFY_B + b) * KV_SPLIT_K;
+        int base_hb = (h * MAX_VERIFY_B + b) * KV_TOTAL_SPLITS;
         const float* s_m_in = split_buf + SPLIT_M_OFF;
         const float* s_d_in = split_buf + SPLIT_D_OFF;
         const float* s_o_in = split_buf + SPLIT_O_OFF;
@@ -1356,6 +1356,7 @@ route_select_and_group_kernel(
         for (int off = 16; off > 0; off >>= 1) {
             cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, off));
         }
+        cand = min(cand, NUM_EXPERTS - 1);
         float sel = 0.0f;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {

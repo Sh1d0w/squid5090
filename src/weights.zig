@@ -867,17 +867,28 @@ fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.Quant
         if (sz_i64 <= 0 or @mod(sz_i64, 4) != 0) continue;
         _ = tiger.lseek(fd, 0, tiger.SEEK_SET);
         const count: usize = @intCast(@divExact(sz_i64, 4));
+        if (count == 0 or count > constants.vocab_unpadded_count) continue;
         const ids = tiger.alloc_host_zeroed(i32, count);
         const raw_dst: [*]u8 = @ptrCast(ids.ptr);
         const want_bytes: usize = count * 4;
         var got: usize = 0;
         var iter: u32 = 0;
-        while (got < want_bytes and iter < 1024) : (iter += 1) {
+        while (got < want_bytes and iter < 4096) : (iter += 1) {
             const n: isize = tiger.read(fd, raw_dst + got, want_bytes - got);
+            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
             if (n <= 0) break;
             got += @intCast(n);
         }
-        if (got == want_bytes) return ids;
+        if (got == want_bytes) {
+            var all_valid: bool = true;
+            for (ids) |id| {
+                if (id < 0 or id >= @as(i32, @intCast(constants.vocab_unpadded_count))) {
+                    all_valid = false;
+                    break;
+                }
+            }
+            if (all_valid) return ids;
+        }
         tiger.free_host_slice(i32, ids);
     }
     return null;

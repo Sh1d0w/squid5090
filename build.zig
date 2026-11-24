@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Compile all 4 Blackwell CUDA translation units in parallel with full
+    // Compile all 5 Blackwell CUDA translation units in parallel with full
     // content-addressed Zig caching (including header dependency tracking).
     const cuda_headers = [_][]const u8{
         "cuda/config.hpp",
@@ -97,7 +97,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run squid5090 with arbitrary CLI arguments");
     run_step.dependOn(&run_cmd.step);
 
-    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 3 ...]`
+    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 7 ...]`
     const serve_cmd = b.addRunArtifact(exe);
     serve_cmd.step.dependOn(b.getInstallStep());
     serve_cmd.addArg("serve");
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
     const serve_step = b.step("serve", "Start the native Zig OpenAI HTTP/SSE API server");
     serve_step.dependOn(&serve_cmd.step);
 
-    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 3 ...]`
+    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 7 ...]`
     const bench_cmd = b.addRunArtifact(exe);
     bench_cmd.step.dependOn(b.getInstallStep());
     bench_cmd.addArg("bench");

@@ -243,7 +243,10 @@ dspark_global_attn_bulk_splitk_kernel(
     int p = *d_pos;
     if (p <= 0) return;
 
-    int first = (p > cap) ? (p - cap) : 0;
+    // Reserve MTP_MAX_DRAFTS (7) slots of ring slack so rejected future draft tokens
+    // written ahead of *d_pos are never read as valid history when p > cap.
+    int max_win = max(0, cap - MTP_MAX_DRAFTS);
+    int first = (p > max_win) ? (p - max_win) : 0;
     int total_len = p - first;
     int split = blockIdx.y;
     int chunk = (total_len + KV_SPLIT_K - 1) / KV_SPLIT_K;
@@ -815,7 +818,7 @@ __global__ void markov_fold_argmax_stage2_kernel(
     __shared__ float s_max_cap;
     __shared__ float s_conf;
     __shared__ int32_t s_greedy;
-    __shared__ float hist_sum[256];
+    __shared__ unsigned long long hist_sum[256];
     __shared__ uint32_t hist_cnt[256];
     __shared__ float s_tau;
     __shared__ float s_inv_z;
@@ -837,10 +840,23 @@ __global__ void markov_fold_argmax_stage2_kernel(
     }
     __syncthreads();
 
+    const int32_t top_k = sample_cfg->top_k;
+    if (top_k == 1) {
+        for (int row = tid; row < V; row += 256) out_step_probs[row] = (row == s_greedy) ? 1.0f : 0.0f;
+        __syncthreads();
+        if (tid == 0) {
+            int32_t pk = s_greedy;
+            *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
+            if (out_q_sel) *out_q_sel = 1.0f;
+            if (out_conf) *out_conf = s_conf;
+            if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        }
+        return;
+    }
+
     const float max_cap = s_max_cap;
     const float inv_temp = sample_cfg->inv_temp;
     const float top_p = sample_cfg->top_p;
-    const int32_t top_k = sample_cfg->top_k;
     const uint64_t draft_seed = sample_cfg->seed ^ 0xD5A2C1B39E3779B9ULL;
     const int32_t pos = (d_pos ? (*d_pos) : 0) + step_idx;
 
@@ -848,7 +864,7 @@ __global__ void markov_fold_argmax_stage2_kernel(
     constexpr float HIST_SCALE = 256.0f / HIST_RANGE;
 
     if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
-        hist_sum[tid] = 0.0f;
+        hist_sum[tid] = 0ULL;
         hist_cnt[tid] = 0u;
         __syncthreads();
         for (int row = tid; row < V; row += 256) {
@@ -857,20 +873,21 @@ __global__ void markov_fold_argmax_stage2_kernel(
                 int bin = (int)(d * HIST_SCALE);
                 if (bin < 0) bin = 0;
                 else if (bin > 255) bin = 255;
-                atomicAdd(&hist_sum[bin], __expf(-d));
+                unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
+                atomicAdd(&hist_sum[bin], fp);
                 atomicAdd(&hist_cnt[bin], 1u);
             }
         }
         __syncthreads();
         if (tid == 0) {
-            float total_z = 0.0f;
-            for (int k = 0; k < 256; ++k) total_z += hist_sum[k];
-            float cum_z = 0.0f;
+            double total_z = 0.0;
+            for (int k = 0; k < 256; ++k) total_z += (double)hist_sum[k];
+            double cum_z = 0.0;
             uint32_t cum_c = 0u;
             int cut_bin = 255;
-            const float target_z = (top_p > 0.0f && top_p < 1.0f) ? (top_p * total_z) : total_z;
+            const double target_z = (top_p > 0.0f && top_p < 1.0f) ? ((double)top_p * total_z) : total_z;
             for (int k = 0; k < 256; ++k) {
-                cum_z += hist_sum[k];
+                cum_z += (double)hist_sum[k];
                 cum_c += hist_cnt[k];
                 const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
                 const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);

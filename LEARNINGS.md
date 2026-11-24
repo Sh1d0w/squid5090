@@ -8,7 +8,7 @@ Complete consolidated engineering reference for `squid5090`: roofline analysis, 
 
 ## 1. Benchmark Summary & Full Progression (Single RTX 5090, 32 GiB GDDR7)
 
-### End-to-End Hill-Climb (`76.6 → 589.5 / 771.6 tok/s`)
+### End-to-End Hill-Climb (`76.6 → 589.5 / 771.6 tok/s`, Levers 0–13 at dedicated `P0`, Lever 14 unified matrix at `P1`)
 
 | Milestone / Lever | Core Change | Code (`c=1`) | Chat (`c=1`) | `mtp=0` | Prefill (20K / 64K) | Max Ctx / VRAM |
 |---|---|---:|---:|---:|---:|---|
@@ -19,13 +19,26 @@ Complete consolidated engineering reference for `squid5090`: roofline analysis, 
 | **Lever 9: Blackwell PDL + TC `mma.m16n8k16` Decode** | `cudaLaunchAttributeProgrammaticStreamSerialization` + `pdl_wait_fenced`, register-permuted TC `moe_up_tc` / 144-CTA `moe_down_tc` / dense NVFP4 GEMVs | 470.2 tok/s | 307.3 tok/s | **259.0–262.8 tok/s** | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
 | **Lever 10: Adaptive `{2,4,8}` Switch Graph + Overlap** | Markov online softmax confidence, CUDA 13.1 `cudaGraphCondTypeSwitch`, overlapped next-round drafting | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | 5,077 / 4,637 tok/s | **1M** (`22.7 GiB`) |
 | **Lever 11: `B=2048` WGEMM + 2D-Tiled Short Conv** | Multi-stage `cp.async` `128×128×64` grouped MoE GEMM + 576-CTA 4-tap FIR sconv (`-42.9 ms/chunk`) | 585.9 tok/s | **332.5 tok/s** | 259.0–262.8 tok/s | **8,755 / 7,742 tok/s** *(9,181 chunk peak)* | **1M** (`23.22 GiB`) |
-| **Lever 12: Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** *(ablated)* | **332.5 tok/s** *(0 harmless diff)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
-| **Lever 13: Hybrid O(1) Prompt-Lookup + DSpark** | Zero-malloc 2-entry hash index (`8,192` ring, `min_match_len=16`), bypasses DSpark into `verify_b8_graph_exec` on verbatim matches | **589.5 tok/s** code<br>**771.6 tok/s** quote/RAG | **332.5 tok/s** | 259.0 tok/s | **8,755 / 7,742 tok/s** | **1M** (`23.22 GiB`) |
-| **Lever 14: Leviathan/Chen Rejection Sampling + KLD + 512K Recall** | Exact stochastic rejection sampling ($q_i(v)$ drafted in CUDA Graph + $\mathrm{norm}(\max(0,p-q))$ residual resampling), 32 MiB HTTP/render buffers, built-in FP64 `kld` eval, real 128K–512K needle recall | **547.0 / 444.9** (`T=0/1`, P1)<br>**610.5 / 518.5** copy (`T=0/1`) | **315.7 / 279.3** (`T=0/1`, P1)<br>**308.4 / 272.6** prose | 248.5 tok/s *(P1)* | **5,988 / 4,575 / 3,062 tok/s** *(128K/256K/512K)* | **512K real PASS**<br>**1M** (`23.23 GiB`) |
+| **Lever 12: Runtime-Gated Fisher-LDA `--ablation`** | 1.8 MB gated projection fused into decode & prefill inside single `VRAMArena` | **541.1 tok/s** *(ablated)* | **332.5 tok/s** *(0 diff 53/53)* | 259.0 tok/s | 8,755 / 7,742 tok/s | **1M** (`23.22 GiB`) |
+| **Lever 13: Hybrid O(1) Prompt-Lookup + DSpark** | Zero-malloc 2-entry hash index (`8,192` ring, `min_match_len=16`), bypasses DSpark into `verify_b8_graph_exec` on verbatim matches | **589.5 tok/s** code<br>**771.6 tok/s** quote/RAG *(P0)* | **332.5 tok/s** *(P0)* | 259.0 tok/s | **8,755 / 7,742 tok/s** | **1M** (`23.22 GiB`) |
+| **Lever 14: Rejection Sampling + Long-Ctx KLD + 512K Recall + Hardening** | Exact Leviathan/Chen rejection sampling (`q_i(v)` drafted in CUDA Graph + deterministic fixed-point top-p + residual resampling), FP32-accum FP8 GEMV, 32 MiB HTTP/chunked tokenizer, streaming FP64 `kld` eval (`7,784` tok), real 128K–512K needle recall | **547.0 / 444.9** (`T=0/1`, P1)<br>**610.5 / 518.5** copy (`T=0/1`, P1) | **315.7 / 279.3** (`T=0/1`, P1)<br>**308.4 / 272.6** prose (`P1`) | 248.5 tok/s *(P1)* | **5,988 / 4,575 / 3,062 tok/s** *(128K/256K/512K)* | **512K real PASS**<br>**1M** (`23.23 GiB`) |
 
-### Built-In Exact FP64 KLD vs. Official `exact/bf16` (529 Multi-Domain Tokens)
+### Built-In Exact FP64 KLD vs. Official `exact/bf16`
 
-Evaluated via `squid5090 logits` + `squid5090 kld` across Python code, systems prose, math proofs, and chat (`ref_PPL = 2.5555`):
+#### A. Long-Context Reproducible Corpus — [`tools/kld_corpus.txt`](tools/kld_corpus.txt) (`7,784` tokens, 7.6× past 1,024-tok local window)
+Directly stresses the 8 quantized global KV layers across Python, C++/CUDA, Zig, math, and cross-section recall (`ref_PPL = 2.7048`):
+
+| Mode | KV Format | Mean KLD (nats) | Median KLD | p95 KLD | Top-1 Match | Candidate PPL | ΔPPL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `exact` | `bf16` | **0.000000** | 0.000000 | 0.000000 | **100.00%** | 2.7048 | +0.0000 |
+| `exact` | `fp8` | 0.003509 | 0.000323 | 0.015505 | 98.39% | 2.7007 | -0.0041 |
+| `exact` | `q4` | 0.007752 | 0.000891 | 0.034746 | 97.15% | 2.7063 | +0.0015 |
+| **`fp8`** | **`fp8`** | **0.006028** | 0.000656 | 0.024474 | **97.44%** | 2.7000 | -0.0048 |
+| **`fp8`** | **`q4`** | **0.009178** | 0.001104 | 0.039785 | **96.80%** | 2.7091 | +0.0043 |
+| `nvfp4` | `fp8` | 0.022998 | 0.002948 | 0.095089 | 94.99% | 2.7485 | +0.0437 |
+| **`nvfp4`** | **`q4`** | **0.026291** | 0.003453 | 0.110257 | **94.81%** | 2.7607 | +0.0559 |
+
+#### B. Short-Context Reference (`529` tokens, inside 1,024-tok local window, `ref_PPL = 2.5555`)
 
 | Mode | KV Format | Mean KLD (nats) | Median KLD | p95 KLD | Top-1 Match | Candidate PPL | ΔPPL |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -39,7 +52,7 @@ Evaluated via `squid5090 logits` + `squid5090 kld` across Python code, systems p
 | `nvfp4` | `fp8` | 0.016548 | 0.001192 | 0.082989 | 96.03% | 2.5900 | +0.0345 |
 | **`nvfp4`** | **`q4`** | **0.018413** | 0.001068 | 0.089071 | **95.84%** | 2.5952 | +0.0397 |
 
-- **Takeaway:** `q4` KV adds only `~0.002–0.005` KLD; most of `nvfp4`'s `0.0184` KLD comes from quantizing dense attention + L20–23 experts + `lm_head` to 4-bit. `--mode fp8 --kv q4` cuts KLD **3.7×** (`0.0050`) while still fitting 512K–1M contexts without host spill.
+- **Takeaway:** Even 7.6× beyond the 1,024-token local window (`7,784` tokens), `q4` global KV adds only `+0.0032–0.0078` KLD (`ΔPPL <= +0.0043` in `fp8/q4`). Most of `nvfp4`'s KLD (`0.0184` short / `0.0263` long) comes from quantizing dense attention + L20–23 experts + `lm_head` to 4-bit; `--mode fp8 --kv q4` cuts KLD **2.9–3.7×** while still fitting 512K–1M contexts without host spill.
 
 ### Long-Context Scaling & Prefix Cache Latency (`--mode nvfp4 --kv q4`)
 
@@ -86,8 +99,8 @@ Checkpoint: `thinkingmachines/Inkling-2-Mini` (`model-00001-of-00001.safetensors
 | Attention Dense + Router (24 layers) | 1.308 GB (BF16) | 0.654 GB (FP8) | 0.368 GB (NVFP4) |
 | Controllers + Norms + SConv + AttnRes | 0.058 GB | 0.058 GB | 0.058 GB |
 | Embedding + LM Head (`unembed`) | 1.852 GB (BF16) | 1.389 GB | 1.187 GB (BF16 + NVFP4) |
-| DSpark MTP (3 layers + Markov) | 0.636 GB (BF16) | 0.320 GB (FP8) | ~0.240 GB (NVFP4 + 32K head) |
-| **Total Resident Weights** | **18.18 GiB** | **16.85 GiB** | **14.57 GiB** (`13.70 GiB` w/ host embed) |
+| DSpark MTP (3 layers + Markov) | 0.636 GB (BF16) | ~0.240 GB (NVFP4 + 32K head) | ~0.240 GB (NVFP4 + 32K head) |
+| **Total Resident Weights** | **18.28 GiB** | **16.85 GiB** | **14.57 GiB** (`13.70 GiB` w/ host embed) |
 
 ### 2.3 Decode Bandwidth Roofline (`B=1` & Speculative `B=2..8`)
 
@@ -99,7 +112,7 @@ Checkpoint: `thinkingmachines/Inkling-2-Mini` (`model-00001-of-00001.safetensors
 | **Total Bytes / Token (`B=1`)** | **5,465.6 MB** | **3,694.5 MB** | **2,800.3 MB** |
 | **Raw BW Ceiling (`1,512.9 GB/s` / `1,792 GB/s` spec)** | **277 / 328 tok/s** | **410 / 485 tok/s** | **540 / 640 tok/s** |
 
-- **Why `nvfp4` dense + LM head mattered so much:** In the official `exact` checkpoint, BF16 attention + LM head are **64.8%** of all decode traffic (`3,542 MB`), dwarfing the MoE experts (`1,839 MB`). Quantizing them to NVFP4 nearly doubled the single-token ceiling before speculation even began.
+- **Why `nvfp4` dense + LM head mattered so much:** In the official `exact` checkpoint, BF16 attention + router + controllers + LM head are **66.3%** of all decode traffic (`3,626.3 MB`), dwarfing the MoE experts (`1,839.3 MB`). Quantizing them to NVFP4 nearly doubled the single-token ceiling before speculation even began.
 - **Why speculation (`B=2..8`) breaks past `~265 tok/s`:** Across 48 visits with activation/KV/sconv/norm overhead, `B=1` saturates at `259–268 tok/s`. In a `B = K + 1` verify pass, dense weights and LM head are read **once** (`B×` amortized) and MoE experts deduplicate across consecutive correlated tokens (empirical unique-expert multiplier $u(4)\approx 2.8$, $u(8)\approx 4.5\text{--}4.9$ vs i.i.d. $3.64 / 6.45$):
 
 | Speculative Regime (`nvfp4`) | Verify `B` | Accepted `a` | Est. `u(B)` | Verify + Draft MB | MB / Accepted Tok | **Roofline (`1,513 GB/s`)** | **Achieved `squid5090`** |
@@ -149,13 +162,13 @@ We used `inference-optimisation-skill` (0xSero / Sybil Solutions) as the core op
 ### What We Learned & Applied
 - **Ceilings first (`ceilings.md`):** Measured real copy BW (`1,512.9 GB/s`) before writing kernels.
 - **Lever ordering (`SKILL.md` §3, `levers.md`):** Decode graphs → native 4-bit quant (`NVFP4`) → 32K draft vocab pruning → GPU-side argmax/verify → decode-style TC Split-K verify attention → per-workload adaptive draft depth → explicit prefix caching (`cached_tokens > 0`) → stage-level prefill profiling (`SQUID_PROF_PREFILL=1`) → grouped MoE weight reuse → static memory arenas with headroom.
-- **Measurement discipline (`methodology.md`):** Real tokenizer counts (not SSE chunks), dedicated `P0` GPU state, `a / step_time` separation, 1-ULP `M=1` vs `M=k` numeric distinction, and 64K verbatim needle verification.
+- **Measurement discipline (`methodology.md`):** Real tokenizer counts (not SSE chunks), dedicated `P0` vs. shared `P1` GPU state, `a / step_time` separation, 1-ULP `M=1` vs `M=k` numeric distinction, built-in FP64 KLD (`7,784` tok), and real 64K–512K verbatim needle verification.
 
 ### What We Did *Not* Apply Yet (Remaining Headroom)
 1. **Native Blackwell FP8 / INT8 Tensor Core Prefill Dense GEMMs (`levers.md`):** `launch_prefill_gemm_h` currently dequantizes to FP16 scratch and runs FP16 `cublasGemmEx` (`dense_tc = 29.5 ms` at `B=2048`). Switching to native Blackwell FP8 `cublasLtMatmul` (labelled lossy trade) could shave `~12–15 ms/chunk` toward **`10,000+ tok/s`** prefill.
 2. **SASS / `cuobjdump --dump-sass` ISA Audit (`levers.md`, `methodology.md`):** We tuned PTX/CUDA, but haven't yet inspected `sm_120a` SASS on `moe_down_tc_kernel` and `p_wgemm_kernel` for hidden register spills or bank conflicts.
 3. **Multi-User Continuous Batching (`cN`, `SKILL.md` §3.4):** `squid5090` is intentionally single-slot (`c=1`) for peak responsiveness and 1M context. Supporting `c2`–`c4` requires paged global KV and per-slot sconv/local-KV ring banks.
-4. **Automated Interleaved `control → candidate → control` Bootstrap-CI Harness & Full 1M 3-Needle Soak (`methodology.md`, `publishing.md`):** We ran 3–6-run medians, 64K real needle PASS, 131K real prefill, and 1M `longctx` scaling, but haven't yet run an automated bootstrap-95%-CI harness or a real 1,048,000-token 3-needle prefill soak.
+4. **Automated Interleaved `control → candidate → control` Bootstrap-CI Harness & Full 1M Multi-Needle Soak (`methodology.md`, `publishing.md`):** We ran 3–6-run medians, 64K/128K/256K/512K single-needle PASSes (50% depth), and 1M `longctx` scaling, but haven't yet run an automated bootstrap-95%-CI harness or a real 1,048,000-token multi-depth needle soak.
 5. **Wider Prompt-Lookup Verify Graph (`B=16`) + Early-Exit Markov RNN:** Extending prompt-lookup hits from `B=8` (`771.6 tok/s`) to `B=16` could push long code-copy/RAG bursts past `1,000 tok/s`, and early-exiting Markov steps `3..6` on low draft-0 confidence could save `~100–150 µs` on chat steps.
 
 *(Stack-specific items in the skill that do not apply: Triton/Inductor/DeepGEMM JIT caches — we are AOT native Zig/CUDA with `~3 s` startup; vLLM/SGLang/llama.cpp flags; Intel Xe/AMD ROCm/unified-memory cgroup workarounds; external FA2/oneDNN swaps incompatible with Inkling-2-Mini's L2-clipped Q/K/R + rel-bias + sinks + Q4 KV.)*
@@ -192,8 +205,8 @@ Core `squid5090` requires zero Python. The offline generator in `tools/` runs cl
 # 1. Sync isolated offline environment (CUDA 13.0 PyTorch + Inkling-2-Mini transformers + Optuna)
 uv sync --project tools
 
-# 2. Build squid5090 (used by `search` and `verify` for fast refusal evaluation)
-zig build -Doptimize=ReleaseFast
+# 2. Build squid5090 (defaults to -Doptimize=fast / ReleaseFast)
+zig build
 
 # 3. Run the end-to-end pipeline
 export SQUID_MODEL_DIR=/opt/models/inkling-2-mini
@@ -226,28 +239,29 @@ uv run tools/refusal_eval.py --compare "$WORK/refusals-original.json" "$WORK/ref
 
 ```text
 squid5090/
-├── build.zig                 # Native Zig build (parallel content-hashed nvcc sm_120a + Zig ReleaseFast)
-├── README.md                 # Simple comparison table & Linux build/install quickstart
+├── build.zig                 # Native Zig build (parallel content-hashed nvcc sm_120a + Zig .fast)
+├── LICENSE / NOTICE          # Apache-2.0 license and complete open-source attributions
+├── README.md                 # Benchmarks, KLD frontier, & Linux build/install quickstart
 ├── LITE.md                   # Plain-English 3Blue1Brown-style visual guide to optimization & abliteration
 ├── LEARNINGS.md              # Consolidated technical reference, hardware ceilings & skill audit
-├── NOTICE                    # Open-source attributions
-├── PLAN.md / ledger.jsonl    # Historical hill-climb experiment log
+├── PLAN.md / ledger.jsonl    # Historical archive (v0–Lever 7C) & machine-readable experiment ledger
 ├── deploy/squid5090.service  # Persistent systemd service unit
 ├── cuda/                     # Native Blackwell sm_120a CUDA kernels & C-ABI bridge
 │   ├── kernels_common.cuh    # Blackwell PTX (e2m1, e4m3, m16n8k16, ldmatrix, PDL), Q4/FP8 KV, TC Split-K
-│   ├── kernels_gemv.cu       # PDL + TC mma.m16n8k16 MoE & dense NVFP4 GEMVs, 99%-BW lm_head
+│   ├── kernels_gemv.cu       # PDL + TC mma.m16n8k16 MoE & dense NVFP4/FP8 GEMVs, rejection sampling, 99%-BW lm_head
 │   ├── kernels_inkling.cu    # Mega-fused depth-attn/sconv/ablation, 1-launch controllers, router, attention
 │   ├── kernels_dspark.cu     # DSpark 3-layer drafter, TC base logits, folded Markov head + online softmax
 │   ├── kernels_prefill.cu    # B=2048 128x128x64 cp.async WGEMM, 2D-tiled sconv, FlashAttention, ablation
 │   └── cuda_abi.cu           # Thin extern "C" bridge + CUDA 13.1 cudaGraphCondTypeSwitch manager
 ├── src/                      # 100% TigerStyle Zig engine & zero-malloc OpenAI server
 │   ├── tiger.zig / constants.zig / cuda.zig / vram_arena.zig / safetensors.zig
-│   ├── tokenizer.zig         # Flat open-addressed BPE tokenizer (32.8M tok/s) & Inkling chat/tool template
+│   ├── tokenizer.zig         # Flat open-addressed BPE tokenizer (32.8M tok/s, chunked >2 MiB) & Inkling template
 │   ├── weights.zig           # Two-pass single-VRAMArena weight + optional ablation loader
-│   ├── engine.zig            # Single runtime VRAMArena, Switch Graph, PromptLookupIndex, Prefix Cache
-│   ├── server.zig            # Zero-malloc static-buffer POSIX HTTP/1.1 + SSE OpenAI API server
-│   └── main.zig              # Single-binary CLI (serve, generate, bench, longctx, tokenize)
-└── tools/                    # Optional offline uv Python abliteration & refusal-eval toolchain
+│   ├── engine.zig            # Single runtime VRAMArena, Switch Graph, PromptLookupIndex, Prefix Cache, streaming logits
+│   ├── server.zig            # Zero-malloc static-buffer POSIX HTTP/1.1 + SSE OpenAI API server (32 MiB)
+│   └── main.zig              # Single-binary CLI (serve, generate, bench, longctx, logits, kld, tokenize)
+└── tools/                    # Reproducible KLD corpus + optional offline uv Python abliteration & refusal-eval toolchain
+    ├── kld_corpus.txt        # 7,784-token multi-domain KLD evaluation corpus (>1K global KV)
     ├── pyproject.toml        # uv project (CUDA 13.0 PyTorch + Inkling-2-Mini transformers + Optuna)
     ├── ablate.py / inkling_ref.py / refusal_eval.py
 ```

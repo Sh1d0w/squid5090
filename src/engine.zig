@@ -33,7 +33,7 @@ pub const GenerateStats = struct {
 
 /// Zero-malloc O(1) n-gram prompt-lookup drafter (inspired by Atomic Engine's hybrid lookup + DSpark fallback).
 /// Keeps a recent 8,192-token ring and a 16,384-slot two-entry hash index (~320 KiB host RAM, 0 VRAM).
-/// On a >=6-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
+/// On a >=16-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
 /// bypassing the DSpark neural pass completely (~5 ns CPU lookup vs ~400 us GPU draft).
 const PromptLookupIndex = struct {
     const hist_cap: usize = 8_192;
@@ -889,6 +889,12 @@ pub const Engine = struct {
         };
 
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
+        // Invalidate any stale checkpoints past the branch point `start_pos` BEFORE prefill writes new KV!
+        if (self.prefix_cache.enabled and shield_tokens == 0) {
+            for (&self.prefix_cache.checkpoints) |*ckpt| {
+                if (ckpt.valid and ckpt.pos > start_pos) ckpt.valid = false;
+            }
+        }
         const rem_tokens: u32 = prompt_len - start_pos;
         if (self.use_graphs and rem_tokens > constants.mtp_block_size_max) {
             self.ensure_prefill_b8_graph(use_mtp);
@@ -967,9 +973,10 @@ pub const Engine = struct {
 
         // --- DECODE ---
         var prev_fed_tok: i32 = first_tok;
+        var decode_stop_now: bool = false;
         const decode_start_ns: u64 = tiger.clock_monotonic_ns();
         if (!use_mtp) {
-            while (stats.generated_tokens < max_new_tokens) {
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.b1_graph_exec.?, self.stream));
                 } else {
@@ -990,9 +997,15 @@ pub const Engine = struct {
                 stats.last_token_id = tok;
                 self.current_position += 1;
                 if (on_token) |cb| {
-                    if (!cb(callback_context.?, tok)) break;
+                    if (!cb(callback_context.?, tok)) {
+                        decode_stop_now = true;
+                        break;
+                    }
                 }
-                if (tok == constants.eos_token_id) break;
+                if (tok == constants.eos_token_id) {
+                    decode_stop_now = true;
+                    break;
+                }
             }
         } else if (use_adaptive) {
             // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
@@ -1005,7 +1018,7 @@ pub const Engine = struct {
             }
 
             var draft_in_flight: bool = false;
-            while (stats.generated_tokens < max_new_tokens) {
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + constants.mtp_block_size_max <= self.context_tokens_max) {
                 var lookup_hit: bool = false;
                 if (self.use_prompt_lookup) {
                     const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
@@ -1055,15 +1068,14 @@ pub const Engine = struct {
                         self.prefix_cache.session_tokens[self.prefix_cache.session_len] = fed;
                         self.prefix_cache.session_len += 1;
                     }
-                    prev_fed_tok = self.h_accepted.?[n_acc - 1];
                 }
+                prev_fed_tok = self.h_accepted.?[n_acc - 1];
 
                 stats.spec_steps += 1;
                 stats.total_drafts += @intCast(chosen_w_i32 - 1);
                 stats.total_accepted += (n_acc - 1);
                 self.current_position += n_acc_i32;
 
-                var stop_now: bool = false;
                 var idx: u32 = 0;
                 while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
                     const tok: i32 = self.h_accepted.?[idx];
@@ -1073,24 +1085,24 @@ pub const Engine = struct {
                     stats.last_token_id = tok;
                     if (on_token) |cb| {
                         if (!cb(callback_context.?, tok)) {
-                            stop_now = true;
+                            decode_stop_now = true;
                             break;
                         }
                     }
                     if (tok == constants.eos_token_id) {
-                        stop_now = true;
+                        decode_stop_now = true;
                         break;
                     }
                 }
-                if (stop_now) break;
+                if (decode_stop_now) break;
             }
-            // Drain any trailing overlapped draft cleanly before returning
+            // Drain any trailing overlapped draft cleanly before returning or falling back to B=1 tail
             if (draft_in_flight) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
             }
         } else {
             const batch: i32 = @intCast(num_drafts + 1);
-            while (stats.generated_tokens < max_new_tokens) {
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + @as(u32, @intCast(batch)) <= self.context_tokens_max) {
                 if (self.use_graphs) {
                     tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.spec_graph_exec[num_drafts].?, self.stream));
                 } else {
@@ -1141,15 +1153,14 @@ pub const Engine = struct {
                         self.prefix_cache.session_tokens[self.prefix_cache.session_len] = fed;
                         self.prefix_cache.session_len += 1;
                     }
-                    prev_fed_tok = self.h_accepted.?[n_acc - 1];
                 }
+                prev_fed_tok = self.h_accepted.?[n_acc - 1];
 
                 stats.spec_steps += 1;
                 stats.total_drafts += num_drafts;
                 stats.total_accepted += (n_acc - 1);
                 self.current_position += n_acc_i32;
 
-                var stop_now: bool = false;
                 var idx: u32 = 0;
                 while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
                     const tok: i32 = self.h_accepted.?[idx];
@@ -1158,16 +1169,43 @@ pub const Engine = struct {
                     stats.last_token_id = tok;
                     if (on_token) |cb| {
                         if (!cb(callback_context.?, tok)) {
-                            stop_now = true;
+                            decode_stop_now = true;
                             break;
                         }
                     }
                     if (tok == constants.eos_token_id) {
-                        stop_now = true;
+                        decode_stop_now = true;
                         break;
                     }
                 }
-                if (stop_now) break;
+                if (decode_stop_now) break;
+            }
+        }
+        // Safe B=1 tail when within <mtp_block_size_max tokens of context_tokens_max:
+        // prevents speculative verify from wrapping global KV indices onto slots 0..6!
+        if (use_mtp and !decode_stop_now and stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(&prev_fed_tok), @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) < self.context_tokens_max) {
+                self.record_target_forward(1, true, true, false);
+                cuda.squid_launch_inc_pos_and_copy_tok(self.d_pos, &self.d_tokens[0], &self.d_next_tokens[0], self.stream);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_next_tokens), @sizeOf(i32), self.stream));
+                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+
+                if (self.prefix_cache.enabled and shield_tokens == 0 and self.prefix_cache.session_len < self.context_tokens_max) {
+                    self.prefix_cache.session_tokens[self.prefix_cache.session_len] = prev_fed_tok;
+                    self.prefix_cache.session_len += 1;
+                }
+                const tok: i32 = self.h_accepted.?[0];
+                prev_fed_tok = tok;
+                if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
+                stats.generated_tokens += 1;
+                stats.last_token_id = tok;
+                self.current_position += 1;
+                if (on_token) |cb| {
+                    if (!cb(callback_context.?, tok)) break;
+                }
+                if (tok == constants.eos_token_id) break;
             }
         }
         stats.decode_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - decode_start_ns)) / 1_000_000.0;
@@ -1931,6 +1969,49 @@ pub const Engine = struct {
         }
     }
 
+    pub const LogitsChunkCallbackFn = *const fn (context: *anyopaque, pos_offset: usize, chunk_logits: []const f32, count: usize) bool;
+
+    /// Stream exact post-softcap FP32 logits in 8-token chunks (6.2 MiB host RAM regardless of context length!).
+    pub fn eval_logits_streaming(
+        self: *Engine,
+        tokens: []const i32,
+        chunk_buf: []f32,
+        on_chunk: LogitsChunkCallbackFn,
+        callback_context: *anyopaque,
+    ) bool {
+        const vocab: usize = constants.vocab_unpadded_count;
+        tiger.assert(tokens.len > 0 and tokens.len < self.context_tokens_max);
+        tiger.assert(chunk_buf.len >= constants.mtp_block_size_max * vocab);
+        self.reset();
+
+        const dump_cfg: cuda.CSampleConfig = .{ .inv_temp = -1.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&dump_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        defer {
+            const zero_cfg: cuda.CSampleConfig = .{ .inv_temp = 0.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
+
+        var i: usize = 0;
+        while (i < tokens.len) {
+            const batch: usize = @min(@as(usize, constants.mtp_block_size_max), tokens.len - i);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(tokens[i..].ptr), batch * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.record_target_forward(@intCast(batch), false, true, false);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(
+                @ptrCast(chunk_buf.ptr),
+                @ptrCast(self.lm_logits),
+                batch * vocab * @sizeOf(f32),
+                self.stream,
+            ));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            self.current_position += @intCast(batch);
+            if (!on_chunk(callback_context, i, chunk_buf[0 .. batch * vocab], batch)) return false;
+            i += batch;
+        }
+        return true;
+    }
+
     /// Evaluate exact post-softcap FP32 logits [tokens.len, VOCAB_UNPADDED] for KLD / PPL quality eval.
     pub fn eval_logits_chunked(self: *Engine, tokens: []const i32, out_logits_host: []f32) void {
         const vocab: usize = constants.vocab_unpadded_count;
@@ -1940,6 +2021,11 @@ pub const Engine = struct {
 
         const dump_cfg: cuda.CSampleConfig = .{ .inv_temp = -1.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&dump_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+        defer {
+            const zero_cfg: cuda.CSampleConfig = .{ .inv_temp = 0.0, .top_p = 1.0, .top_k = 0, .pad = 0, .seed = 0 };
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_sample_cfg), @ptrCast(&zero_cfg), @sizeOf(cuda.CSampleConfig), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+        }
 
         var i: usize = 0;
         while (i < tokens.len) {

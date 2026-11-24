@@ -569,22 +569,27 @@ linear_fp8_h_kernel(
         wh[7] = cvt_e4m3x2_to_half2(uint16_t(w16.w >> 16));
 
         int koff = v << 4;
+        float2 wf[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) wf[j] = __half22float2(wh[j]);
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
             const uint4* x4 = reinterpret_cast<const uint4*>(x_h + (size_t)b * K + koff);
             uint4 xv0 = __ldg(x4), xv1 = __ldg(x4 + 1);
             const __half2* xb0 = reinterpret_cast<const __half2*>(&xv0);
             const __half2* xb1 = reinterpret_cast<const __half2*>(&xv1);
-            __half2 p0 = __hmul2(wh[0], xb0[0]);
-            __half2 p1 = __hmul2(wh[1], xb0[1]);
-            p0 = __hfma2(wh[2], xb0[2], p0);
-            p1 = __hfma2(wh[3], xb0[3], p1);
-            p0 = __hfma2(wh[4], xb1[0], p0);
-            p1 = __hfma2(wh[5], xb1[1], p1);
-            p0 = __hfma2(wh[6], xb1[2], p0);
-            p1 = __hfma2(wh[7], xb1[3], p1);
-            float2 pf = __half22float2(__hadd2(p0, p1));
-            acc[b] += pf.x + pf.y;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 xf = __half22float2(xb0[j]);
+                acc[b] = fmaf(wf[j].x, xf.x, acc[b]);
+                acc[b] = fmaf(wf[j].y, xf.y, acc[b]);
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 xf = __half22float2(xb1[j]);
+                acc[b] = fmaf(wf[4 + j].x, xf.x, acc[b]);
+                acc[b] = fmaf(wf[4 + j].y, xf.y, acc[b]);
+            }
         }
     }
     #pragma unroll
@@ -733,20 +738,21 @@ linear_fp8_f32_kernel(
         wh[6] = cvt_e4m3x2_to_half2(uint16_t(w16.w & 0xFFFFu));
         wh[7] = cvt_e4m3x2_to_half2(uint16_t(w16.w >> 16));
         int koff = v << 4;
+        float2 wf[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) wf[j] = __half22float2(wh[j]);
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
             const float4* xf = reinterpret_cast<const float4*>(x + (size_t)b * K + koff);
             float4 f0 = __ldg(xf), f1 = __ldg(xf + 1), f2 = __ldg(xf + 2), f3 = __ldg(xf + 3);
-            __half2 p0 = __hmul2(wh[0], __floats2half2_rn(f0.x, f0.y));
-            __half2 p1 = __hmul2(wh[1], __floats2half2_rn(f0.z, f0.w));
-            p0 = __hfma2(wh[2], __floats2half2_rn(f1.x, f1.y), p0);
-            p1 = __hfma2(wh[3], __floats2half2_rn(f1.z, f1.w), p1);
-            p0 = __hfma2(wh[4], __floats2half2_rn(f2.x, f2.y), p0);
-            p1 = __hfma2(wh[5], __floats2half2_rn(f2.z, f2.w), p1);
-            p0 = __hfma2(wh[6], __floats2half2_rn(f3.x, f3.y), p0);
-            p1 = __hfma2(wh[7], __floats2half2_rn(f3.z, f3.w), p1);
-            float2 pf = __half22float2(__hadd2(p0, p1));
-            acc[b] += pf.x + pf.y;
+            acc[b] = fmaf(wf[0].x, f0.x, acc[b]); acc[b] = fmaf(wf[0].y, f0.y, acc[b]);
+            acc[b] = fmaf(wf[1].x, f0.z, acc[b]); acc[b] = fmaf(wf[1].y, f0.w, acc[b]);
+            acc[b] = fmaf(wf[2].x, f1.x, acc[b]); acc[b] = fmaf(wf[2].y, f1.y, acc[b]);
+            acc[b] = fmaf(wf[3].x, f1.z, acc[b]); acc[b] = fmaf(wf[3].y, f1.w, acc[b]);
+            acc[b] = fmaf(wf[4].x, f2.x, acc[b]); acc[b] = fmaf(wf[4].y, f2.y, acc[b]);
+            acc[b] = fmaf(wf[5].x, f2.z, acc[b]); acc[b] = fmaf(wf[5].y, f2.w, acc[b]);
+            acc[b] = fmaf(wf[6].x, f3.x, acc[b]); acc[b] = fmaf(wf[6].y, f3.y, acc[b]);
+            acc[b] = fmaf(wf[7].x, f3.z, acc[b]); acc[b] = fmaf(wf[7].y, f3.w, acc[b]);
         }
     }
     #pragma unroll
@@ -945,15 +951,18 @@ lm_head_stage1_kernel(
                 wh[6] = cvt_e4m3x2_to_half2(uint16_t(w16.w & 0xFFFFu));
                 wh[7] = cvt_e4m3x2_to_half2(uint16_t(w16.w >> 16));
                 int koff = v << 4;
+                float2 wf[8];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) wf[j] = __half22float2(wh[j]);
                 #pragma unroll
                 for (int b = 0; b < B_CONST; ++b) {
                     const __half2* xb = reinterpret_cast<const __half2*>(s_xh + b * HIDDEN + koff);
-                    __half2 p0 = __hmul2(wh[0], xb[0]), p1 = __hmul2(wh[1], xb[1]);
-                    p0 = __hfma2(wh[2], xb[2], p0); p1 = __hfma2(wh[3], xb[3], p1);
-                    p0 = __hfma2(wh[4], xb[4], p0); p1 = __hfma2(wh[5], xb[5], p1);
-                    p0 = __hfma2(wh[6], xb[6], p0); p1 = __hfma2(wh[7], xb[7], p1);
-                    float2 pf = __half22float2(__hadd2(p0, p1));
-                    acc[b] += pf.x + pf.y;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        float2 xf = __half22float2(xb[j]);
+                        acc[b] = fmaf(wf[j].x, xf.x, acc[b]);
+                        acc[b] = fmaf(wf[j].y, xf.y, acc[b]);
+                    }
                 }
             }
         } else {
@@ -1175,15 +1184,14 @@ __global__ void lm_head_stage2_argmax_kernel(
     int draft_vocab_size,
     int V,
     int B) {
-    pdl_wait();
-    pdl_trigger();
+    pdl_wait_fenced(0u);
     int b = blockIdx.x;
     if (b >= B) return;
     int tid = threadIdx.x;
     float bv = -1e30f;
     int32_t bi = 0;
     for (int i = tid; i < LM_HEAD_BLOCKS; i += 256) {
-        float v = blk_max_val[b * LM_HEAD_BLOCKS + i];
+        float v = ld_dep_f32(blk_max_val + b * LM_HEAD_BLOCKS + i);
         int32_t idx = blk_max_idx[b * LM_HEAD_BLOCKS + i];
         if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
     }
@@ -1198,7 +1206,7 @@ __global__ void lm_head_stage2_argmax_kernel(
     if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
     __syncthreads();
 
-    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && out_logits != nullptr);
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
     if (!do_sample) {
         if (tid == 0) {
             bv = sv[0]; bi = si[0];
@@ -1212,7 +1220,7 @@ __global__ void lm_head_stage2_argmax_kernel(
 
     __shared__ float s_max_val;
     __shared__ int32_t s_max_idx;
-    __shared__ float hist_sum[256];
+    __shared__ unsigned long long hist_sum[256];
     __shared__ uint32_t hist_cnt[256];
     __shared__ float s_tau;
     __shared__ float s_inv_z;
@@ -1243,31 +1251,32 @@ __global__ void lm_head_stage2_argmax_kernel(
     constexpr float HIST_SCALE = 256.0f / HIST_RANGE; // 12.8 bins/nat
 
     if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
-        hist_sum[tid] = 0.0f;
+        hist_sum[tid] = 0ULL;
         hist_cnt[tid] = 0u;
         __syncthreads();
 
         for (int row = tid; row < V; row += 256) {
-            float d = (max_logit - logits[row]) * inv_temp;
+            float d = (max_logit - ld_dep_f32(logits + row)) * inv_temp;
             if (d < HIST_RANGE) {
                 int bin = (int)(d * HIST_SCALE);
                 if (bin < 0) bin = 0;
                 else if (bin > 255) bin = 255;
-                atomicAdd(&hist_sum[bin], __expf(-d));
+                unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
+                atomicAdd(&hist_sum[bin], fp);
                 atomicAdd(&hist_cnt[bin], 1u);
             }
         }
         __syncthreads();
 
         if (tid == 0) {
-            float total_z = 0.0f;
-            for (int k = 0; k < 256; ++k) total_z += hist_sum[k];
-            float cum_z = 0.0f;
+            double total_z = 0.0;
+            for (int k = 0; k < 256; ++k) total_z += (double)hist_sum[k];
+            double cum_z = 0.0;
             uint32_t cum_c = 0u;
             int cut_bin = 255;
-            const float target_z = (top_p > 0.0f && top_p < 1.0f) ? (top_p * total_z) : total_z;
+            const double target_z = (top_p > 0.0f && top_p < 1.0f) ? ((double)top_p * total_z) : total_z;
             for (int k = 0; k < 256; ++k) {
-                cum_z += hist_sum[k];
+                cum_z += (double)hist_sum[k];
                 cum_c += hist_cnt[k];
                 const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
                 const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);
@@ -1290,7 +1299,7 @@ __global__ void lm_head_stage2_argmax_kernel(
     if (d_draft_tokens != nullptr && b < B - 1) {
         float local_z = 0.0f;
         for (int row = tid; row < V; row += 256) {
-            float l = logits[row];
+            float l = ld_dep_f32(logits + row);
             if (l >= tau) local_z += __expf((l - max_logit) * inv_temp);
         }
         local_z = warp_sum(local_z);
@@ -1305,7 +1314,7 @@ __global__ void lm_head_stage2_argmax_kernel(
             s_draft_tok = x;
             int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
             s_is_delta = is_d;
-            float lx = (x >= 0 && x < V) ? logits[x] : -1e30f;
+            float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
             float px = (lx >= tau) ? (__expf((lx - max_logit) * inv_temp) * inv_z) : 0.0f;
             float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[b] : 1.0f);
             float u_acc = hash_u01(seed ^ 0x517CC1B727220A95ULL, pos, 0x5A5A5A5A);
@@ -1323,7 +1332,7 @@ __global__ void lm_head_stage2_argmax_kernel(
         float best_s = -1e30f;
         int32_t best_t = -1;
         for (int row = tid; row < V; row += 256) {
-            float l = logits[row];
+            float l = ld_dep_f32(logits + row);
             if (l >= tau) {
                 float pv = __expf((l - max_logit) * inv_temp) * inv_z;
                 float qv = 0.0f;
@@ -1336,7 +1345,7 @@ __global__ void lm_head_stage2_argmax_kernel(
                     }
                 }
                 float diff = pv - qv;
-                if (diff > 1e-12f) {
+                if (diff > 0.0f) {
                     float sc = __logf(diff) + hash_gumbel(seed, pos, row);
                     if (sc > best_s) { best_s = sc; best_t = row; }
                 }
@@ -1355,7 +1364,9 @@ __global__ void lm_head_stage2_argmax_kernel(
             for (int w = 1; w < 8; ++w) {
                 if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
             }
-            out_tokens[b] = (best_t >= 0) ? best_t : greedy_idx;
+            // Never emit rejected draft token x on degeneracy fallback
+            int32_t fallback = (greedy_idx != x) ? greedy_idx : ((x > 0) ? (x - 1) : 1);
+            out_tokens[b] = (best_t >= 0) ? best_t : fallback;
         }
         return;
     }
@@ -1364,7 +1375,7 @@ __global__ void lm_head_stage2_argmax_kernel(
     float best_s = -1e30f;
     int32_t best_t = greedy_idx;
     for (int row = tid; row < V; row += 256) {
-        float l = logits[row];
+        float l = ld_dep_f32(logits + row);
         if (l >= tau) {
             float sc = (l - max_logit) * inv_temp + hash_gumbel(seed, pos, row);
             if (sc > best_s) { best_s = sc; best_t = row; }

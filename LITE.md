@@ -1,10 +1,12 @@
 # `squid5090` Explained Simply (`LITE.md`)
 
-> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec to 589–771 tokens/sec** with **1,000,000-token memory** on one RTX 5090 — and how to surgically remove refusals using a **1.8 MB geometric "bouncer"** without breaking the model's brain.*
+> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec** (`exact`, `B=1`) up to **589–771 tokens/sec** (greedy code/copy at dedicated `P0` clocks; **273–519 tok/s** across prose, chat, code, and copy at `temp=1.0`) with **1,000,000-token memory** on one RTX 5090 — and how to surgically remove refusals using a **1.8 MB geometric "bouncer"** with `0` diff on `53/53` tested harmless chat prompts.*
+>
+> **Attribution:** Key Blackwell kernel techniques (PDL overlap, Tensor Core `mma.m16n8k16` decode GEMVs, `128×128×64` MoE prefill, `{2, 4, 8}` CUDA Graph switch drafting) and the 1.8 MB runtime-gated Fisher-LDA abliteration method were adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0). Hybrid prompt-lookup drafting was inspired by [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine) (MIT). See [`NOTICE`](NOTICE).
 
 ---
 
-## Part 1: Why LLMs Are Slow — And How We Made One 8× Faster
+## Part 1: Why LLMs Are Slow — And How We Made One Up to 8× Faster
 
 ### Picture a Factory With a Tiny Doorway
 
@@ -15,7 +17,7 @@ Connecting the warehouse to the calculators is a single hallway — **memory ban
 Now watch what happens in the two phases of an LLM conversation:
 
 1. **Reading your prompt (Prefill):** You hand the factory 20,000 words all at once. It brings each crate of weights through the hallway *once* and uses it on all 20,000 words. The calculators run full-blast. **Prefill is limited by math speed.**
-2. **Writing the reply (Decode):** The factory can only write **one word (token) at a time**, because word #2 depends on word #1. To produce *that single word*, it has to haul **billions of weights** all the way through the hallway, do one quick multiplication per number, and throw them away — while 95% of the calculators sit completely idle! **Decode is limited by the hallway.**
+2. **Writing the reply (Decode):** The factory can only write **one word (token) at a time**, because word #2 depends on word #1. To produce *that single word*, it has to haul **billions of weights** all the way through the hallway, do one quick multiplication per number, and throw them away — while ~90% of the calculators sit completely idle! **Decode is limited by the hallway.**
 
 ```text
   PREFILL (20,000 tokens at once — Compute-Bound)
@@ -27,7 +29,7 @@ Now watch what happens in the two phases of an LLM conversation:
   DECODE (1 token at a time — Bandwidth-Bound)
   ┌───────────────────┐     1,513 GB/s     ┌─────────────────────────────┐
   │  VRAM Warehouse   │══▶ 2.8 GB / tok ══▶│  Tensor Cores: █░░░░░░░░░   │
-  │  (Model Weights)  │  used ONCE, tossed │   95% IDLE  -> bottleneck!  │
+  │  (Model Weights)  │  used ONCE, tossed │   90% IDLE  -> bottleneck!  │
   └───────────────────┘                    └─────────────────────────────┘
 ```
 
@@ -69,7 +71,7 @@ Normally, generating one token requires the CPU to shout ~600 separate tiny inst
 If the hallway is the bottleneck, shrinking every box from 16 bits down to **4 bits** lets you move **4× as many weights per second**:
 
 - **Weights (`NVFP4`):** We pack the model's weights into Blackwell's native 4-bit floating-point format. The RTX 5090 has dedicated hardware circuits that unpack 4-bit numbers straight into 16-bit numbers in a single clock cycle — cutting traffic from `5.47 GB` down to `2.80 GB` per token and shrinking the whole model to **14.6 GiB**.
-- **1,000,000-Token Memory (`Q4 KV`):** Inkling-2-Mini has a clever hybrid design: out of 48 layer steps, 36 only look back at the last 1,024 words (tiny fixed memory!), and only 8 unique layers actually store the entire conversation history. By compressing that long-term history into 4-bit numbers (`Q4`), a **1,048,576-token** conversation fits in **23.2 GiB** — with nearly 9 GiB to spare on a 32 GiB card!
+- **1,000,000-Token Memory (`Q4 KV`):** Inkling-2-Mini has a clever hybrid design: out of 48 layer steps, **40** only look back at the last 1,024 words (tiny fixed BF16 memory!), and only **8** global visits actually store the entire conversation history (`40 + 8 = 48`). By compressing that long-term history into 4-bit numbers (`Q4`), a **1,048,576-token** conversation fits in **23.2 GiB** — with nearly 9 GiB to spare on a 32 GiB card!
 - **Instant Multi-Turn Memory (Prefix Cache):** When you send Turn 2 of a 16,000-word coding session, why re-read the first 16,000 words? We snapshot the tiny local state to regular system RAM (`0` extra VRAM), so Turn 2 picks up where Turn 1 left off in **72 milliseconds** instead of 2.1 seconds.
 
 ```text
@@ -96,9 +98,9 @@ If the hallway is the bottleneck, shrinking every box from 16 bits down to **4 b
   <img src="assets/lite-speculative.gif" alt="3Blue1Brown-style animation of the RTX 5090 memory hallway and 8-token lossless speculative decoding" width="820"/>
 </p>
 
-After Steps 1–3, generating 1 token at a time hits the hallway's speed limit: **`~263 tok/s`**. So how did we reach **`589.5 tok/s`** on code and **`771.6 tok/s`** when editing/quoting code?
+After Steps 1–3, generating 1 token at a time in `nvfp4` hits the hallway's practical limit: **`~260 tok/s`** (up from `144 tok/s` in unquantized `exact` mode). So how did we reach **`589.5 tok/s`** on greedy code (`444.9 tok/s` at `temp=1.0`) and **`771.6 tok/s`** when editing/quoting code (`273–279 tok/s` on chat/prose at `temp=1.0`)?
 
-Remember those **95% idle calculators** inside the factory? Checking **8 tokens at the exact same time** only requires hauling the weights through the hallway **once** — so verifying 8 words costs barely more time than generating 1 word!
+Remember those **~90% idle calculators** inside the factory? Checking **8 tokens at the exact same time** only requires hauling the weights through the hallway **once** — so verifying 8 words costs barely more time than generating 1 word!
 
 So we pair the big model with **two lightning-fast "drafters"** (guessers):
 
@@ -162,7 +164,7 @@ Then we timed every stage inside a 2,048-token chunk — and got a shock: a tiny
 
 ## Part 2: Abliteration, Explained Geometrically (3Blue1Brown Style)
 
-Now for the second half: **what is abliteration, why do normal methods ruin Inkling-2-Mini, and how does a tiny 1.8 MB file fix refusals with *zero* loss of intelligence on normal prompts?**
+Now for the second half: **what is abliteration, why do normal methods hurt Inkling-2-Mini, and how does a tiny 1.8 MB file suppress refusals while leaving `53/53` tested harmless chat prompts unchanged (`KL <= 0.03` on general text)?**
 
 ### Picture a 2,304-Dimensional Room
 
@@ -228,7 +230,7 @@ If you just checked *"is $y$ pointing along $r$?"*, you'd get false alarms — b
 Now the bouncer's rule is dead simple:
 > **Only intervene if $d_v \cdot y$ is more than $k$ standard deviations above normal harmless text** (typically $k \approx 2\text{--}4\sigma$).
 
-- On normal coding, math, and chat: $y$ stays comfortably inside the harmless pancake → the bouncer says **"Not a refusal — pass straight through untouched!"** Output is **bit-for-bit identical** to the unmodified model.
+- On normal coding, math, and chat: $y$ usually stays comfortably inside the harmless pancake → the bouncer says **"Not a refusal — pass straight through untouched!"** Output was **bit-for-bit identical on `53/53` tested harmless chat prompts** (with general-text KL drift capped at `<= 0.03` during Optuna search).
 - When a refusal begins to form: $y$ pops way outside the pancake → the bouncer steps in!
 
 ```text
@@ -247,7 +249,7 @@ Now the bouncer's rule is dead simple:
       │       ╭──╯  ·  ·  ○ coding prompt ·  ·   ·  ·       ╰──╮  Harmless Cloud
       │       ╰──╮    ·  ·   μ_harmless  ·   ·  ·  ○ chat   ╭──╯  ("squished pancake")
       │          ╰──────────────────────────────────────────╯
-      │             ▲ stays BELOW τ_v -> 0 intervention -> 0.000 KL drift!
+      │             ▲ stays BELOW τ_v -> 0 intervention (0 diff on 53/53 harmless!)
       └─────────────────────────────────────────────────────────────────────────▶
                                Wide harmless variance direction
 ```
@@ -292,7 +294,7 @@ flowchart LR
     OPT --> EV["squid5090 serve:<br/>Refusal Eval @ 500+ tok/s"]
     KL --> EXP["5. export<br/>(1.8 MB .safetensors)"]
     EV --> EXP
-    EXP --> SRV["squid5090 --ablation<br/>(541 tok/s, 0 harmless drift)"]
+    EXP --> SRV["squid5090 --ablation<br/>(0 diff on 53/53 harmless)"]
 ```
 
 ### Copy-Paste Recipe (with `uv`)
@@ -300,7 +302,7 @@ flowchart LR
 ```bash
 # 1. One-time setup (isolated uv env — core squid5090 still uses ZERO Python!)
 uv sync --project tools
-zig build -Doptimize=ReleaseFast
+zig build                     # defaults to ReleaseFast (-Doptimize=fast)
 
 # 2. Generate your own 1.8 MB abliterated safetensors
 export SQUID_MODEL_DIR=/opt/models/inkling-2-mini
@@ -315,9 +317,9 @@ uv run --project tools tools/ablate.py search     --work "$WORK" --batches 12 --
 uv run --project tools tools/ablate.py show       --work "$WORK" --top 20
 uv run --project tools tools/ablate.py export     --work "$WORK" --trial <N> --out "$WORK/my-abliterated.safetensors"
 
-# 3. Serve it at 541 tok/s and run the 32-prompt refusal check
+# 3. Serve with the 1.8 MB sidecar (temp=1.0 default; 541 tok/s greedy code peak) and run the 32-prompt refusal check
 ./zig-out/bin/squid5090 serve /opt/models/inkling-2-mini \
-  --mode nvfp4 --kv q4 --ctx 1048576 --mtp 7 --ablation "$WORK/my-abliterated.safetensors"
+  --mode nvfp4 --kv q4 --ctx 524288 --mtp 7 --ablation "$WORK/my-abliterated.safetensors"
 uv run tools/refusal_eval.py --base-url http://127.0.0.1:8000/v1 --label mine
 ```
 

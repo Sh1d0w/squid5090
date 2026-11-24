@@ -2,7 +2,7 @@ squid5090
 Copyright (c) 2026 tensorfish
 
 This project includes kernel designs and inference features adapted from the
-following Apache-2.0 licensed open-source projects:
+following open-source projects:
 
 1. satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
    https://github.com/satellitedown/inkling-2-mini-abliterated-ingine

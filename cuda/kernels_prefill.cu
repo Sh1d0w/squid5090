@@ -42,14 +42,13 @@ __global__ void p_f32_to_f16_kernel(const float* __restrict__ src, __half* __res
 __global__ void p_dequant_nvfp4_to_f16_kernel(
     const uint8_t* __restrict__ w_data,
     const uint8_t* __restrict__ w_scales,
-    float global_scale,
     __half* __restrict__ out_f16,
     size_t total_blocks) {
     size_t bidx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (bidx >= total_blocks) return;
     uint2 w8 = __ldg(reinterpret_cast<const uint2*>(w_data) + bidx);
-    float sc = cvt_e4m3_to_float(__ldg(w_scales + bidx)) * global_scale;
-    __half2 hsc = __float2half2_rn(sc);
+    // Keep e2m1 * e4m3 exact in FP16 and apply global_scale via cuBLAS alpha in FP32!
+    __half2 hsc = __float2half2_rn(cvt_e4m3_to_float(__ldg(w_scales + bidx)));
     __half2 h[8];
     cvt_e2m1x8_to_half2x4(w8.x, h[0], h[1], h[2], h[3]);
     cvt_e2m1x8_to_half2x4(w8.y, h[4], h[5], h[6], h[7]);
@@ -71,8 +70,8 @@ __global__ void p_dequant_fp8_to_f16_kernel(
     int row = (int)(idx / (K >> 1));
     float sc = __ldg(row_scales + row);
     uint16_t raw2 = __ldg(reinterpret_cast<const uint16_t*>(w_data) + idx);
-    __half2 h2 = cvt_e4m3x2_to_half2(raw2);
-    reinterpret_cast<__half2*>(out_f16)[idx] = __hmul2(h2, __float2half2_rn(sc));
+    float2 f = __half22float2(cvt_e4m3x2_to_half2(raw2));
+    reinterpret_cast<__half2*>(out_f16)[idx] = __floats2half2_rn(f.x * sc, f.y * sc);
 }
 
 __global__ void p_dequant_bf16_to_f16_kernel(
@@ -418,6 +417,7 @@ __global__ void p_route_topk_only_kernel(
         for (int off = 16; off > 0; off >>= 1) {
             cand = min(cand, __shfl_xor_sync(0xffffffffu, cand, off));
         }
+        cand = min(cand, NUM_EXPERTS - 1);
         float sel = 0.0f;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -699,11 +699,14 @@ p_wgemm_kernel(
                 sc[nt][2] = __low2half2(hi);
                 sc[nt][3] = __high2half2(hi);
             } else {
+                // Store raw UE8M0 bytes in sc_u8 via sc; decode in FP32 to avoid FP16 underflow/Inf*0=NaN!
                 const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
-                const __half2 s0 = __float2half2_rn(cvt_ue8m0_to_float(ms[0]));
-                const __half2 s1 = __float2half2_rn(cvt_ue8m0_to_float(ms[1]));
-                sc[nt][0] = s0; sc[nt][1] = s0;
-                sc[nt][2] = s1; sc[nt][3] = s1;
+                const uint32_t u0 = (uint32_t)ms[0];
+                const uint32_t u1 = (uint32_t)ms[1];
+                sc[nt][0] = *reinterpret_cast<const __half2*>(&u0);
+                sc[nt][1] = sc[nt][0];
+                sc[nt][2] = *reinterpret_cast<const __half2*>(&u1);
+                sc[nt][3] = sc[nt][2];
             }
         }
     };
@@ -727,8 +730,11 @@ p_wgemm_kernel(
                 const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
                 const uint32_t w0 = (c >> 1) ? q.y : q.x;
                 const uint32_t w1 = (c >> 1) ? q.w : q.z;
-                __half2 h0 = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w0 >> (16 * (c & 1)))), s);
-                __half2 h1 = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w1 >> (16 * (c & 1)))), s);
+                const float sf = cvt_ue8m0_to_float(static_cast<uint8_t>(*reinterpret_cast<const uint32_t*>(&s)));
+                float2 f0 = __half22float2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w0 >> (16 * (c & 1)))));
+                float2 f1 = __half22float2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w1 >> (16 * (c & 1)))));
+                __half2 h0 = __floats2half2_rn(f0.x * sf, f0.y * sf);
+                __half2 h1 = __floats2half2_rn(f1.x * sf, f1.y * sf);
                 b[kk][nt][0] = *reinterpret_cast<const uint32_t*>(&h0);
                 b[kk][nt][1] = *reinterpret_cast<const uint32_t*>(&h1);
             }
@@ -1280,7 +1286,7 @@ void launch_prefill_gemm_h(
     if (w.kind == WeightKind::NVFP4) {
         size_t total_blocks = (size_t)w.rows * (w.cols >> 4);
         p_dequant_nvfp4_to_f16_kernel<<<(int)((total_blocks + 255) / 256), 256, 0, stream>>>(
-            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, w_f16_scratch, total_blocks);
+            static_cast<const uint8_t*>(w.data), w.scales, w_f16_scratch, total_blocks);
     } else if (w.kind == WeightKind::FP8) {
         size_t total_pairs = (size_t)w.rows * (w.cols >> 1);
         p_dequant_fp8_to_f16_kernel<<<(int)((total_pairs + 255) / 256), 256, 0, stream>>>(
@@ -1291,7 +1297,7 @@ void launch_prefill_gemm_h(
             static_cast<const __nv_bfloat16*>(w.data), w_f16_scratch, n);
     }
 
-    float alpha = 1.0f, beta = 0.0f;
+    float alpha = (w.kind == WeightKind::NVFP4) ? w.global_scale : 1.0f, beta = 0.0f;
     cublasHandle_t h = get_cublas(stream);
     cublasStatus_t st = cublasGemmEx(
         h, CUBLAS_OP_T, CUBLAS_OP_N,

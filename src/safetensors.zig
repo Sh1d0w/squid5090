@@ -258,7 +258,7 @@ fn parse_raw_json_string(data: []const u8, pos: *usize) Span {
     while (pos.* < data.len) {
         const c = data[pos.*];
         if (c == '\\') {
-            pos.* += 2;
+            pos.* = @min(pos.* + 2, data.len);
             continue;
         }
         if (c == '"') {
