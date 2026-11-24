@@ -24,5 +24,16 @@ following Apache-2.0 licensed open-source projects:
      tools/pyproject.toml), adapted to run via `uv` and evaluate refusals via
      `squid5090 serve`.
 
-2. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
+2. AtomicBot-ai/atomic-engine (MIT License, llama.cpp fork)
+   https://github.com/AtomicBot-ai/atomic-engine/tree/codex/expert-weight-source
+   - Inspiration for hybrid prompt-lookup speculative drafting with DSpark
+     fallback (implemented from scratch as a zero-malloc O(1) hash-indexed
+     PromptLookupIndex in src/engine.zig).
+
+3. sybil-solutions/inference-optimisation-skill
+   https://github.com/sybil-solutions/inference-optimisation-skill
+   - Hardware-ceiling roofline methodology, noise-controlled hill-climbing
+     workflow, and lever prioritization documented in OPTIMIZATIONS.md.
+
+4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

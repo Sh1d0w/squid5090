@@ -245,6 +245,7 @@ zig build run -- tokenize /opt/models/inkling-2-mini --prompt "Hello, world!"
 | `--kv` | `auto` \| `bf16` \| `fp8` \| `q4` | Global KV cache format (`auto`: `bf16` for `exact`, `fp8` up to 448K, `q4` above 448K) |
 | `--mtp` | `0..7` | Built-in DSpark MTP draft count (`0` = autoregressive, `7` = adaptive `{2, 4, 8}` switch verify, default for `serve`) |
 | `--spec-threshold` | float (`0.80` default) | Markov confidence threshold for adaptive `{2, 4, 8}` verify (`0.0` forces fixed `B=8`) |
+| `--no-prompt-lookup` | flag | Disable hybrid O(1) prompt-lookup drafting (on by default; skips DSpark on `>=16`-token matches) |
 | `--ablation` | file path | Optional 1.8 MB runtime-gated Fisher-LDA ablation `.safetensors` (fused into decode & prefill; auto-sets model name to `inkling-2-mini-abliterated`) |
 | `--ctx` | integer (up to `1048576`) | Maximum context window to allocate |
 | `--embed-host` | flag | Pin BF16 embedding table (0.86 GiB) in zero-copy mapped host RAM (auto-enabled `>512K`) |
@@ -295,12 +296,16 @@ We followed a hardware-first, roofline-driven hill-climbing methodology (full de
 | **Lever 10 — Adaptive `{2, 4, 8}` Switch Graph + Overlapped Drafting** | Added online softmax confidence scoring in the DSpark Markov head, device-side `{2, 4, 8}` branch selection via CUDA 13.1 Graph Conditional Switch (`cudaGraphCondTypeSwitch`), and next-round draft overlap during host D2H/SSE sync. | **Code: `585.9 tok/s`** (`acc=72.5%`, `dl=3.80`); **Chat: `332.5 tok/s`**; **16K live HTTP: `446.7 tok/s`** |
 | **Lever 11 — `128×128×64` Multi-Stage `cp.async` Prefill MoE + 2D-Tiled Short Conv** | Replaced `B=512` prefill MoE with `B=2048` multi-stage `cp.async` Blackwell WGEMM (`cvt.rn.f16x2.e2m1x2` + FP16 MMA) and parallelized the 4-tap FIR short-conv across 32-token time tiles (`576 CTAs` vs `9`). | **Chunk peak: `9,181 tok/s`**; **20K: `8,755 tok/s`**; **64K Needle PASS: `7,742 tok/s`**; **131K: `6,509 tok/s`** |
 | **Lever 12 — Runtime-Gated Fisher-LDA Ablation (`--ablation`)** | Fused optional 1.8 MB directional ablation tensors into post-attention and post-MLP residual kernels in both decode and prefill inside the single weight `VRAMArena`. | **0 divergence** on harmless prompts, **541.1 tok/s** ablated code decode |
+| **Lever 13 — Hybrid O(1) Prompt-Lookup + DSpark Drafter** | Added a zero-malloc 2-entry hash index (`8,192`-token ring, `min_match_len = 16`, 0 VRAM) that skips DSpark on verbatim suffix hits and verifies 7 tokens directly via `verify_b8_graph_exec`, falling back seamlessly to adaptive `{2, 4, 8}` DSpark on misses. | **Code: `589.5 tok/s`** (`+3.3 tok/s`, bit-exact); **Code quote/RAG: `706.9 → 771.6 tok/s`** (`+9.2%`, `91.5%` acc, bit-exact) |
 
 ---
 
-## Attribution & License
+## Guides, Attribution & License
 
-See [`NOTICE`](NOTICE) for full Apache-2.0 attributions, including kernel designs and runtime-gated ablation schema adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0) and the [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) architecture specification.
+- **[`LITE.md`](LITE.md)** — Plain-English high-level guide to LLM inference optimization, what we built, and why/how abliteration works.
+- **[`OPTIMIZATIONS.md`](OPTIMIZATIONS.md)** — Audit of what we learned from [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill) and what unexploited levers remain.
+- **[`LEARNINGS.md`](LEARNINGS.md)** — Deep-dive technical write-up of all Blackwell CUDA kernels, pitfalls, and Fisher-LDA abliteration math + `uv` workflow.
+- **[`NOTICE`](NOTICE)** — Full attributions for [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0), [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine/tree/codex/expert-weight-source) (MIT, hybrid prompt-lookup + DSpark inspiration), [`sybil-solutions/inference-optimisation-skill`](https://github.com/sybil-solutions/inference-optimisation-skill), and [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache-2.0).
 
 ---
 
@@ -312,8 +317,10 @@ squid5090/
 ├── deploy/
 │   └── squid5090.service     # Persistent systemd service unit for the OpenAI API server
 ├── README.md                 # Quickstart, OpenAI server guide & optimization walkthrough
-├── LEARNINGS.md              # Deep-dive GPU optimization & Fisher-LDA abliteration learnings + workflow
-├── NOTICE                    # Apache-2.0 attributions
+├── LITE.md                   # High-level plain-English guide to optimization & abliteration
+├── OPTIMIZATIONS.md          # Audit vs. sybil-solutions/inference-optimisation-skill (applied + remaining gaps)
+├── LEARNINGS.md              # Deep-dive GPU optimization & Fisher-LDA abliteration learnings + uv workflow
+├── NOTICE                    # Open-source attributions
 ├── THEORY.md                 # Measured RTX 5090 hardware & roofline ceilings
 ├── PLAN.md                   # Optimization roadmap & full experiment table
 ├── ledger.jsonl              # Structured JSONL log of every experiment & gate

@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var runs: u32 = 6;
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
     var use_graphs: bool = true;
+    var use_prompt_lookup: bool = true;
     var embed_on_host: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
@@ -105,6 +106,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             embed_on_host = true;
         } else if (std.mem.eql(u8, arg, "--no-graph")) {
             use_graphs = false;
+        } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
+            use_prompt_lookup = false;
         } else if (std.mem.eql(u8, arg, "--raw")) {
             raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--raw-thinking")) {
@@ -208,6 +211,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var engine: engine_mod.Engine = .{};
     engine.init(&model_weights, ctx, use_graphs, kv_format);
     engine.spec_threshold = spec_threshold;
+    engine.use_prompt_lookup = use_prompt_lookup;
     defer engine.deinit();
 
     if (std.mem.eql(u8, command, "serve")) {
@@ -254,8 +258,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const dl: f64 = if (st.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(st.spec_steps))) else 1.0;
 
         tiger.print_stdout(
-            "[gen] prompt={d} gen={d} prefill={d:.2}ms decode={d:.2}ms speed={d:.2} tok/s | mtp={d} acc={d:.1}% dl={d:.2}\n",
-            .{ st.prompt_tokens, st.generated_tokens, st.prefill_ms, st.decode_ms, tps, mtp, acc_pct, dl },
+            "[gen] prompt={d} gen={d} prefill={d:.2}ms decode={d:.2}ms speed={d:.2} tok/s | mtp={d} acc={d:.1}% dl={d:.2} lookup={d}/{d}\n",
+            .{ st.prompt_tokens, st.generated_tokens, st.prefill_ms, st.decode_ms, tps, mtp, acc_pct, dl, st.lookup_steps, st.spec_steps },
         );
         print_token_csv("TOKENS:", out_tokens_buf[0..st.generated_tokens]);
         if (need_tokenizer) print_decoded(&tokenizer, out_tokens_buf[0..st.generated_tokens]);

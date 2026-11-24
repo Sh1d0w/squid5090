@@ -18,9 +18,94 @@ pub const GenerateStats = struct {
     prefill_ms: f64 = 0.0,
     decode_ms: f64 = 0.0,
     spec_steps: u32 = 0,
+    lookup_steps: u32 = 0,
     total_drafts: u32 = 0,
     total_accepted: u32 = 0,
     last_token_id: i32 = -1,
+};
+
+/// Zero-malloc O(1) n-gram prompt-lookup drafter (inspired by Atomic Engine's hybrid lookup + DSpark fallback).
+/// Keeps a recent 8,192-token ring and a 16,384-slot two-entry hash index (~320 KiB host RAM, 0 VRAM).
+/// On a >=6-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
+/// bypassing the DSpark neural pass completely (~5 ns CPU lookup vs ~400 us GPU draft).
+const PromptLookupIndex = struct {
+    const hist_cap: usize = 8_192;
+    const hist_mask: usize = hist_cap - 1;
+    const table_cap: usize = 16_384;
+    const table_mask: usize = table_cap - 1;
+    const min_match_len: u32 = 16;
+
+    hist: [hist_cap]i32 = @splat(0),
+    count: u32 = 0,
+    gen: u16 = 0,
+    table_hash: [table_cap]u64 = @splat(0),
+    table_pos0: [table_cap]u32 = @splat(0),
+    table_pos1: [table_cap]u32 = @splat(0),
+    table_gen: [table_cap]u16 = @splat(0),
+
+    fn reset(self: *PromptLookupIndex) void {
+        self.count = 0;
+        self.gen +%= 1;
+        if (self.gen == 0) {
+            @memset(&self.table_gen, 0);
+            self.gen = 1;
+        }
+    }
+
+    inline fn hash4(a: i32, b: i32, c: i32, d: i32) u64 {
+        var h: u64 = @as(u64, @bitCast(@as(i64, a))) *% 0x9E3779B97F4A7C15;
+        h = (h ^ @as(u64, @bitCast(@as(i64, b)))) *% 0xBF58476D1CE4E5B9;
+        h = (h ^ @as(u64, @bitCast(@as(i64, c)))) *% 0x94D049BB133111EB;
+        h = (h ^ @as(u64, @bitCast(@as(i64, d)))) *% 0x9E3779B97F4A7C15;
+        return h ^ (h >> 31);
+    }
+
+    inline fn at(self: *const PromptLookupIndex, abs_idx: u32) i32 {
+        return self.hist[abs_idx & hist_mask];
+    }
+
+    fn push(self: *PromptLookupIndex, tok: i32) void {
+        const idx = self.count;
+        self.hist[idx & hist_mask] = tok;
+        self.count = idx + 1;
+        if (self.count >= 4) {
+            const h = hash4(self.at(self.count - 4), self.at(self.count - 3), self.at(self.count - 2), self.at(self.count - 1));
+            const slot: usize = @intCast(h & table_mask);
+            if (self.table_gen[slot] == self.gen and self.table_hash[slot] == h) {
+                self.table_pos1[slot] = self.table_pos0[slot];
+                self.table_pos0[slot] = self.count;
+            } else {
+                self.table_hash[slot] = h;
+                self.table_pos0[slot] = self.count;
+                self.table_pos1[slot] = 0;
+                self.table_gen[slot] = self.gen;
+            }
+        }
+    }
+
+    fn match(self: *const PromptLookupIndex, out_drafts: *[constants.mtp_draft_count_max]i32) bool {
+        const n = self.count;
+        if (n < min_match_len + constants.mtp_draft_count_max + 1) return false;
+        const h = hash4(self.at(n - 4), self.at(n - 3), self.at(n - 2), self.at(n - 1));
+        const slot: usize = @intCast(h & table_mask);
+        if (self.table_gen[slot] != self.gen or self.table_hash[slot] != h) return false;
+
+        const cand: u32 = if (self.table_pos0[slot] == n) self.table_pos1[slot] else self.table_pos0[slot];
+        if (cand < min_match_len) return false;
+        if (cand + constants.mtp_draft_count_max >= n) return false;
+        const win_lo: u32 = if (n > hist_cap) (n - @as(u32, @intCast(hist_cap))) else 0;
+        if (cand - min_match_len < win_lo) return false;
+
+        var k: u32 = 1;
+        while (k <= min_match_len) : (k += 1) {
+            if (self.at(cand - k) != self.at(n - k)) return false;
+        }
+        var j: u32 = 0;
+        while (j < constants.mtp_draft_count_max) : (j += 1) {
+            out_drafts[j] = self.at(cand + j);
+        }
+        return true;
+    }
 };
 
 const prefix_checkpoint_count: usize = 4;
@@ -70,18 +155,22 @@ pub const Engine = struct {
     b1_graph_exec: ?*anyopaque = null,
     spec_graph_exec: [constants.mtp_draft_count_max + 1]?*anyopaque = @splat(null),
     draft_graph_exec: ?*anyopaque = null,
+    verify_b8_graph_exec: ?*anyopaque = null,
     adaptive_graph: ?*anyopaque = null,
     adaptive_graph_threshold: f32 = -1.0,
     spec_threshold: f32 = 0.80,
+    use_prompt_lookup: bool = true,
     prefill_b8_graph_exec: [2]?*anyopaque = .{ null, null },
 
-    // Pinned host readback buffers (zero-malloc decode loop)
+    // Pinned host readback/upload buffers (zero-malloc decode loop)
     h_accepted: ?[*]i32 = null,
     h_num_accepted: ?*i32 = null,
     h_chosen_width: ?*i32 = null,
+    h_lookup_drafts: ?[*]i32 = null,
 
     // Multi-checkpoint host-RAM prefix KV cache (zero extra VRAM!)
     prefix_cache: PrefixCache = .{},
+    prompt_lookup: PromptLookupIndex = .{},
 
     // Per-visit KV caches and sconv rings
     kv_cap: [constants.visit_count]i32 = @splat(0),
@@ -279,6 +368,9 @@ pub const Engine = struct {
         var h_cw_raw: ?*anyopaque = null;
         tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_cw_raw, @sizeOf(i32), 0));
         self.h_chosen_width = @ptrCast(@alignCast(h_cw_raw.?));
+        var h_ld_raw: ?*anyopaque = null;
+        tiger.assert_cuda(cuda.squid_cuda_malloc_host_pinned(&h_ld_raw, constants.mtp_draft_count_max * @sizeOf(i32), 0));
+        self.h_lookup_drafts = @ptrCast(@alignCast(h_ld_raw.?));
 
         self.hidden = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
         self.prelude = self.arena.alloc_many(f32, b_max * constants.hidden_dim);
@@ -384,6 +476,7 @@ pub const Engine = struct {
             g.* = null;
         }
         if (self.draft_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
+        if (self.verify_b8_graph_exec) |g| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(g));
         if (self.adaptive_graph) |g| tiger.assert_cuda(cuda.squid_adaptive_graph_destroy(g));
         for (&self.prefill_b8_graph_exec) |*g| {
             if (g.*) |exec| tiger.assert_cuda(cuda.squid_cuda_graph_destroy(exec));
@@ -392,6 +485,7 @@ pub const Engine = struct {
         if (self.h_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_num_accepted) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         if (self.h_chosen_width) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
+        if (self.h_lookup_drafts) |p| tiger.assert_cuda(cuda.squid_cuda_free_host(@ptrCast(p)));
         self.deinit_prefix_cache();
         self.arena.deinit();
         if (self.done_event) |e| tiger.assert_cuda(cuda.squid_cuda_event_destroy(e));
@@ -869,18 +963,48 @@ pub const Engine = struct {
                 if (tok == constants.eos_token_id) break;
             }
         } else if (use_adaptive) {
-            // Overlapped Adaptive {2, 4, 8} Speculative Decode via CUDA Graph Conditional Switch!
-            // Enqueue round 0 draft, then each round launches: verify_switch -> record done_event -> NEXT draft -> sync done_event!
-            tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
+            // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
+            // Seed prompt-lookup ring with trailing prompt tokens + first_tok (<=8192 tok -> <25 us CPU).
+            if (self.use_prompt_lookup) {
+                self.prompt_lookup.reset();
+                const seed_start: usize = if (prompt.len > PromptLookupIndex.hist_cap) (prompt.len - PromptLookupIndex.hist_cap) else 0;
+                for (prompt[seed_start..]) |ptok| self.prompt_lookup.push(ptok);
+                self.prompt_lookup.push(first_tok);
+            }
+
+            var draft_in_flight: bool = false;
             while (stats.generated_tokens < max_new_tokens) {
-                tiger.assert_cuda(cuda.squid_adaptive_graph_launch(self.adaptive_graph.?, self.stream));
-                tiger.assert_cuda(cuda.squid_cuda_event_record(self.done_event, self.stream));
-                // Overlap next round's DSpark draft while host reads verified tokens & emits SSE!
-                tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
-                tiger.assert_cuda(cuda.squid_cuda_event_sync(self.done_event));
+                var lookup_hit: bool = false;
+                if (self.use_prompt_lookup) {
+                    const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
+                    if (self.prompt_lookup.match(out_ptr)) {
+                        lookup_hit = true;
+                        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                            @ptrCast(self.d_drafts),
+                            @ptrCast(self.h_lookup_drafts.?),
+                            constants.mtp_draft_count_max * @sizeOf(i32),
+                            self.stream,
+                        ));
+                        tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.verify_b8_graph_exec.?, self.stream));
+                        tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+                        draft_in_flight = false;
+                        stats.lookup_steps += 1;
+                    }
+                }
+                if (!lookup_hit) {
+                    if (!draft_in_flight) {
+                        tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
+                    }
+                    tiger.assert_cuda(cuda.squid_adaptive_graph_launch(self.adaptive_graph.?, self.stream));
+                    tiger.assert_cuda(cuda.squid_cuda_event_record(self.done_event, self.stream));
+                    // Overlap next round's DSpark draft while host reads verified tokens & emits SSE!
+                    tiger.assert_cuda(cuda.squid_cuda_graph_launch(self.draft_graph_exec.?, self.stream));
+                    draft_in_flight = true;
+                    tiger.assert_cuda(cuda.squid_cuda_event_sync(self.done_event));
+                }
 
                 const n_acc_i32: i32 = self.h_num_accepted.?.*;
-                const chosen_w_i32: i32 = self.h_chosen_width.?.*;
+                const chosen_w_i32: i32 = if (lookup_hit) constants.mtp_block_size_max else self.h_chosen_width.?.*;
                 tiger.assert(chosen_w_i32 == 2 or chosen_w_i32 == 4 or chosen_w_i32 == 8);
                 tiger.assert(n_acc_i32 >= 1 and n_acc_i32 <= chosen_w_i32);
                 const n_acc: u32 = @intCast(n_acc_i32);
@@ -904,6 +1028,7 @@ pub const Engine = struct {
                 var idx: u32 = 0;
                 while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
                     const tok: i32 = self.h_accepted.?[idx];
+                    if (self.use_prompt_lookup) self.prompt_lookup.push(tok);
                     if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
                     stats.generated_tokens += 1;
                     stats.last_token_id = tok;
@@ -920,8 +1045,10 @@ pub const Engine = struct {
                 }
                 if (stop_now) break;
             }
-            // Drain the trailing overlapped draft cleanly before returning
-            tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            // Drain any trailing overlapped draft cleanly before returning
+            if (draft_in_flight) {
+                tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
+            }
         } else {
             const batch: i32 = @intCast(num_drafts + 1);
             while (stats.generated_tokens < max_new_tokens) {
@@ -2307,6 +2434,17 @@ pub const Engine = struct {
             );
             tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.draft_graph_exec));
             tiger.assert(self.draft_graph_exec != null);
+        }
+
+        if (self.verify_b8_graph_exec == null) {
+            tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
+            cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, constants.mtp_draft_count_max, self.stream);
+            self.record_target_forward(constants.mtp_block_size_max, true, true);
+            cuda.squid_launch_spec_verify(self.d_next_tokens, self.d_drafts, constants.mtp_block_size_max, self.d_accepted, self.d_num_acc, self.d_pos, self.d_anchor, self.stream);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_num_accepted.?), @ptrCast(self.d_num_acc), @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_d2h_async(@ptrCast(self.h_accepted.?), @ptrCast(self.d_accepted), constants.mtp_block_size_max * @sizeOf(i32), self.stream));
+            tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.verify_b8_graph_exec));
+            tiger.assert(self.verify_b8_graph_exec != null);
         }
 
         if (self.adaptive_graph != null and self.adaptive_graph_threshold == self.spec_threshold) return;
