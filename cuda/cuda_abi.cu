@@ -314,6 +314,8 @@ struct CDsparkWeights {
     void* hidden_out_w;
     void* hidden_out_b;
     int32_t draft_vocab_size;
+    int32_t draft_vocab_cap;
+    int32_t* d_draft_vocab_size;
     int32_t* draft_vocab_ids;
     int32_t* inv_draft_vocab_ids;
     CLinearWeight unembed_draft;
@@ -372,6 +374,8 @@ static DsparkWeights to_dw(const CDsparkWeights& c) {
     dw.hidden_out_w = static_cast<__nv_bfloat16*>(c.hidden_out_w);
     dw.hidden_out_b = static_cast<__nv_bfloat16*>(c.hidden_out_b);
     dw.draft_vocab_size = c.draft_vocab_size;
+    dw.draft_vocab_cap = c.draft_vocab_cap;
+    dw.d_draft_vocab_size = c.d_draft_vocab_size;
     dw.draft_vocab_ids = c.draft_vocab_ids;
     dw.inv_draft_vocab_ids = c.inv_draft_vocab_ids;
     dw.unembed_draft = to_lw(c.unembed_draft);
@@ -865,6 +869,21 @@ int32_t squid_adaptive_graph_destroy(void* graph_raw) {
     return 0;
 }
 
+void squid_launch_dspark_gather_shortlist(
+    const CLinearWeight* unembed,
+    const CLinearWeight* unembed_draft,
+    int32_t* draft_vocab_ids,
+    int32_t* d_draft_vocab_size,
+    const int32_t* d_new_ids,
+    int32_t dst_offset,
+    int32_t count,
+    void* stream) {
+    LinearWeight ud = to_lw(*unembed_draft);
+    launch_dspark_gather_shortlist(
+        to_lw(*unembed), ud, draft_vocab_ids, d_draft_vocab_size,
+        d_new_ids, dst_offset, count, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_spec_verify(
     const int32_t* target_preds, const int32_t* draft_tokens, int32_t B,
     int32_t* out_accepted, int32_t* out_num_accepted, int32_t* d_pos, int32_t* d_next_anchor, void* stream) {
@@ -1013,6 +1032,29 @@ void squid_launch_prefill_moe_down_h(
         to_eb(*w2), static_cast<const __half*>(act_h),
         expert_offsets, sorted_tok, sorted_slot, sorted_w,
         out_slots, B, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_prefill_dspark_commit(
+    const CDsparkWeights* dw_in, const float* taps,
+    void* const* ctx_k, void* const* ctx_v,
+    void* const* ctx_ks, void* const* ctx_vs,
+    const int32_t* ctx_cap, uint8_t global_kv_fmt,
+    float* f_ring,
+    void* mix_h0, void* mix_h1, void* mix_h2,
+    float* scratch_kv, void* w_f16_scratch,
+    int32_t B, const int32_t* d_pos, void* stream) {
+    DsparkWeights dw = to_dw(*dw_in);
+    void* ck[MTP_LAYERS] = {ctx_k[0], ctx_k[1], ctx_k[2]};
+    void* cv[MTP_LAYERS] = {ctx_v[0], ctx_v[1], ctx_v[2]};
+    __half* cks[MTP_LAYERS] = {static_cast<__half*>(ctx_ks[0]), static_cast<__half*>(ctx_ks[1]), static_cast<__half*>(ctx_ks[2])};
+    __half* cvs[MTP_LAYERS] = {static_cast<__half*>(ctx_vs[0]), static_cast<__half*>(ctx_vs[1]), static_cast<__half*>(ctx_vs[2])};
+    int cap[MTP_LAYERS] = {ctx_cap[0], ctx_cap[1], ctx_cap[2]};
+    launch_prefill_dspark_commit(
+        dw, taps, ck, cv, cks, cvs, cap, static_cast<KVFormat>(global_kv_fmt),
+        f_ring,
+        static_cast<__half*>(mix_h0), static_cast<__half*>(mix_h1), static_cast<__half*>(mix_h2),
+        scratch_kv, static_cast<__half*>(w_f16_scratch),
+        B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
 } // extern "C"

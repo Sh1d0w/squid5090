@@ -9,13 +9,17 @@ following open-source projects:
    - Runtime-gated Fisher-LDA directional ablation tensor schema & projection formula
      (optional `--ablation <path.safetensors>` support in src/weights.zig,
      cuda/kernels_inkling.cu, and cuda/kernels_prefill.cu).
-   - Blackwell Programmatic Dependent Launch (PDL) overlap pattern and register-
-     permuted Tensor Core `mma.m16n8k16` decode MoE and dense NVFP4 GEMV structure
-     (cuda/kernels_common.cuh, cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
+   - Blackwell Programmatic Dependent Launch (PDL) overlap pattern, 16-CTA cluster
+     DSMEM/`mbarrier` BF16 controller & router kernels (`mapa.shared::cluster`,
+     `st.async.weak.shared::cluster`), spill-free 16-column `U=3` FP8/NVFP4
+     `mma.m16n8k16` GEMVs & LM-head, and 128-CTA multi-block stochastic LM-head
+     sampling with 64-bit Gumbel precision (cuda/kernels_common.cuh,
+     cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
    - Device-side adaptive `{2, 4, 8}` DSpark speculative verify width selection via
-     CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`) and Markov-head
-     online softmax confidence scoring (cuda/kernels_dspark.cu, cuda/cuda_abi.cu,
-     src/engine.zig).
+     CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`), Top-K `1024`
+     multi-CTA radix Markov candidate selection, dynamic context shortlist
+     extension, and Markov-head online softmax confidence scoring
+     (cuda/kernels_dspark.cu, cuda/cuda_abi.cu, src/weights.zig, src/engine.zig).
    - Multi-stage `cp.async` `128x128x64` grouped MoE GEMM pipeline structure for
      prefill, specialized for Blackwell `cvt.rn.f16x2.e2m1x2` + FP16 MMA
      (cuda/kernels_prefill.cu).

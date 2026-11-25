@@ -64,22 +64,42 @@ __global__ void p_dequant_fp8_to_f16_kernel(
     const float* __restrict__ row_scales,
     __half* __restrict__ out_f16,
     int N, int K) {
+    // Vectorized 16 FP8 -> 16 FP16 (uint4 load -> 2x uint4 stores) per thread!
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = (size_t)N * (K >> 1);
+    size_t chunks_per_row = (size_t)(K >> 4);
+    size_t total = (size_t)N * chunks_per_row;
     if (idx >= total) return;
-    int row = (int)(idx / (K >> 1));
-    float sc = __ldg(row_scales + row);
-    uint16_t raw2 = __ldg(reinterpret_cast<const uint16_t*>(w_data) + idx);
-    float2 f = __half22float2(cvt_e4m3x2_to_half2(raw2));
-    reinterpret_cast<__half2*>(out_f16)[idx] = __floats2half2_rn(f.x * sc, f.y * sc);
+    int row = (int)(idx / chunks_per_row);
+    __half2 hsc = __float2half2_rn(__ldg(row_scales + row));
+    uint4 q = __ldg(reinterpret_cast<const uint4*>(w_data) + idx);
+    const uint32_t ws[4] = {q.x, q.y, q.z, q.w};
+    __half2 h[8];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        h[2 * i + 0] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(ws[i] & 0xFFFFu)), hsc);
+        h[2 * i + 1] = __hmul2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(ws[i] >> 16)), hsc);
+    }
+    uint4* dst = reinterpret_cast<uint4*>(out_f16) + idx * 2;
+    dst[0] = *reinterpret_cast<const uint4*>(&h[0]);
+    dst[1] = *reinterpret_cast<const uint4*>(&h[4]);
 }
 
 __global__ void p_dequant_bf16_to_f16_kernel(
     const __nv_bfloat16* __restrict__ w_data,
     __half* __restrict__ out_f16,
-    size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out_f16[i] = __float2half(__bfloat162float(w_data[i]));
+    size_t total_vec8) {
+    // Vectorized 8 BF16 -> 8 FP16 (uint4 load -> uint4 store) per thread!
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_vec8) return;
+    uint4 q = __ldg(reinterpret_cast<const uint4*>(w_data) + idx);
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&q);
+    __half2 h[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float2 f = __bfloat1622float2(b[i]);
+        h[i] = __floats2half2_rn(f.x, f.y);
+    }
+    reinterpret_cast<uint4*>(out_f16)[idx] = *reinterpret_cast<const uint4*>(&h[0]);
 }
 
 __device__ __forceinline__ float load_sconv_src(
@@ -239,20 +259,17 @@ p_ablate_post_res_kernel(
     if (pre_tap_out) *reinterpret_cast<float4*>(pre_tap_out + (size_t)b * HIDDEN + c4) = res_v;
 }
 
-// Scatter 8-token tap slots [s*4 + tap_slot, 8, HIDDEN] from contiguous [B, HIDDEN] in 1 launch!
+// Copy tap slot into flat [4, B, HIDDEN] layout (arbitrary B, coalesced!) for 1-shot batched DSpark commit!
 __global__ void p_copy_taps_chunked_kernel(
     const float* __restrict__ src, // [B, HIDDEN]
-    float* __restrict__ dst_taps,  // [n_sub, 4, 8, HIDDEN]
+    float* __restrict__ dst_taps,  // [4, B, HIDDEN]
     int tap_slot,
     int B) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = (size_t)B * HIDDEN;
-    if (idx >= total) return;
-    int b = (int)(idx / HIDDEN);
-    int c = (int)(idx % HIDDEN);
-    int s = b >> 3;
-    int sb = b & 7;
-    dst_taps[((size_t)(s * 4 + tap_slot) * 8 + sb) * HIDDEN + c] = src[idx];
+    size_t total_f4 = ((size_t)B * HIDDEN) >> 2;
+    if (idx >= total_f4) return;
+    float* dst = dst_taps + (size_t)tap_slot * B * HIDDEN;
+    reinterpret_cast<float4*>(dst)[idx] = reinterpret_cast<const float4*>(src)[idx];
 }
 
 // Batched B<=256 Controller Prep (1 stream, grid = B, block = 256):
@@ -699,14 +716,14 @@ p_wgemm_kernel(
                 sc[nt][2] = __low2half2(hi);
                 sc[nt][3] = __high2half2(hi);
             } else {
-                // Store raw UE8M0 bytes in sc_u8 via sc; decode in FP32 to avoid FP16 underflow/Inf*0=NaN!
+                // Convert UE8M0 power-of-2 scales once to FP16 (clamped at 65504 to stay 100% NaN-free!)
                 const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
-                const uint32_t u0 = (uint32_t)ms[0];
-                const uint32_t u1 = (uint32_t)ms[1];
-                sc[nt][0] = *reinterpret_cast<const __half2*>(&u0);
-                sc[nt][1] = sc[nt][0];
-                sc[nt][2] = *reinterpret_cast<const __half2*>(&u1);
-                sc[nt][3] = sc[nt][2];
+                const __half2 h0 = __float2half2_rn(fminf(cvt_ue8m0_to_float(ms[0]), 65504.0f));
+                const __half2 h1 = __float2half2_rn(fminf(cvt_ue8m0_to_float(ms[1]), 65504.0f));
+                sc[nt][0] = h0;
+                sc[nt][1] = h0;
+                sc[nt][2] = h1;
+                sc[nt][3] = h1;
             }
         }
     };
@@ -727,14 +744,12 @@ p_wgemm_kernel(
                 b[kk][nt][0] = *reinterpret_cast<const uint32_t*>(&h0);
                 b[kk][nt][1] = *reinterpret_cast<const uint32_t*>(&h1);
             } else {
-                const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
-                const uint32_t w0 = (c >> 1) ? q.y : q.x;
-                const uint32_t w1 = (c >> 1) ? q.w : q.z;
-                const float sf = cvt_ue8m0_to_float(static_cast<uint8_t>(*reinterpret_cast<const uint32_t*>(&s)));
-                float2 f0 = __half22float2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w0 >> (16 * (c & 1)))));
-                float2 f1 = __half22float2(cvt_e4m3x2_to_half2(static_cast<uint16_t>(w1 >> (16 * (c & 1)))));
-                __half2 h0 = __floats2half2_rn(f0.x * sf, f0.y * sf);
-                __half2 h1 = __floats2half2_rn(f1.x * sf, f1.y * sf);
+                // Load ONLY the 2 uint16_t pairs this lane owns (4x less SMEM traffic than uint4!) + 1-inst HMUL2!
+                const unsigned char* rp = ws + row * C::WSTRIDE + kc;
+                const uint16_t u0 = *reinterpret_cast<const uint16_t*>(rp + c * 2);
+                const uint16_t u1 = *reinterpret_cast<const uint16_t*>(rp + 8 + c * 2);
+                __half2 h0 = __hmul2(cvt_e4m3x2_to_half2(u0), s);
+                __half2 h1 = __hmul2(cvt_e4m3x2_to_half2(u1), s);
                 b[kk][nt][0] = *reinterpret_cast<const uint32_t*>(&h0);
                 b[kk][nt][1] = *reinterpret_cast<const uint32_t*>(&h1);
             }
@@ -830,14 +845,10 @@ static void dispatch_wgemm_tm(
         x_h, expert_offsets, sorted_tok, sorted_slot, sorted_w, out_act_h, out_slots);
 }
 
-// 1-launch batched B<=2048 global dynamic short conv for BOTH K (blockIdx.y=0) and V (blockIdx.y=1) in-place!
-__global__ void p_dynamic_sconv_kv_inplace_kernel(
-    float* __restrict__ k_proj,
-    float* __restrict__ v_proj,
-    const __nv_bfloat16* __restrict__ k_sw,
-    const __nv_bfloat16* __restrict__ v_sw,
-    const float* __restrict__ k_taps,
-    const float* __restrict__ v_taps,
+// Commit the final <=16 raw K & V tokens into their 16-slot sconv rings (100% race-free after fused prep_store!).
+__global__ void p_kv_ring_commit_kernel(
+    const float* __restrict__ k_proj,
+    const float* __restrict__ v_proj,
     float* __restrict__ k_ring,
     float* __restrict__ v_ring,
     int B,
@@ -845,46 +856,114 @@ __global__ void p_dynamic_sconv_kv_inplace_kernel(
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= KV_DIM) return;
     int is_v = blockIdx.y;
-    float* x = is_v ? v_proj : k_proj;
-    const __nv_bfloat16* sw = is_v ? v_sw : k_sw;
-    const float* taps = is_v ? v_taps : k_taps;
+    const float* x = is_v ? v_proj : k_proj;
     float* ring = is_v ? v_ring : k_ring;
-
-    int head = c / HEAD_DIM;
     int pos0 = *d_pos;
-    float sw0 = __bfloat162float(sw[0 * KV_DIM + c]);
-    float sw1 = __bfloat162float(sw[1 * KV_DIM + c]);
-    float sw2 = __bfloat162float(sw[2 * KV_DIM + c]);
-    float sw3 = __bfloat162float(sw[3 * KV_DIM + c]);
-
-    float h1 = (pos0 >= 1) ? ring[((pos0 - 1) & 15) * KV_DIM + c] : 0.0f;
-    float h2 = (pos0 >= 2) ? ring[((pos0 - 2) & 15) * KV_DIM + c] : 0.0f;
-    float h3 = (pos0 >= 3) ? ring[((pos0 - 3) & 15) * KV_DIM + c] : 0.0f;
-
-    for (int b = 0; b < B; ++b) {
-        float cur = x[(size_t)b * KV_DIM + c];
-        int p = pos0 + b;
-        if (b >= B - 16) {
-            ring[(p & 15) * KV_DIM + c] = cur;
-        }
-        const float* dt = taps + (size_t)b * 32 + head * 4;
-        float acc = cur * (sw0 + dt[0])
-                  + h1  * (sw1 + dt[1])
-                  + h2  * (sw2 + dt[2])
-                  + h3  * (sw3 + dt[3]);
-        x[(size_t)b * KV_DIM + c] = (acc + cur) * INV_SQRT_9;
-        h3 = h2; h2 = h1; h1 = cur;
+    int b0 = max(0, B - 16);
+    for (int b = b0; b < B; ++b) {
+        ring[((pos0 + b) & 15) * KV_DIM + c] = x[(size_t)b * KV_DIM + c];
     }
 }
 
-// 1-launch batched B<=512 global Q/R/K clip (with log-pos tau) + V RMSNorm + KV store (BF16/FP8/Q4)!
-// Grid = dim3(64, B), Block = 128
+// 1-launch FUSED 2D-parallel Local static sconv + Q/R/K clip + V RMSNorm + BF16 KV store (ALL 170 SMs!)
+// Eliminates both 4-SM serial static_sconv_kernel launches AND DRAM round-trips of k_proj/v_proj!
+__global__ void __launch_bounds__(128)
+p_local_sconv_prep_store_kernel(
+    float* __restrict__ qrgs,
+    const float* __restrict__ k_proj,
+    const float* __restrict__ v_proj,
+    const __nv_bfloat16* __restrict__ k_sconv_w,
+    const __nv_bfloat16* __restrict__ v_sconv_w,
+    const float* __restrict__ k_ring,
+    const float* __restrict__ v_ring,
+    const __nv_bfloat16* __restrict__ q_clip_scale,
+    const __nv_bfloat16* __restrict__ rel_clip_scale,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    int kv_cap,
+    const int32_t* __restrict__ d_pos) {
+    int kind_id = blockIdx.x;
+    int b = blockIdx.y;
+    int tid = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int pos0 = *d_pos;
+    int p = pos0 + b;
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+    __shared__ float sm[4];
+    __shared__ float factor;
+
+    if (kind_id < 24) {
+        int h = kind_id;
+        float* qp = qrgs + (size_t)b * QRGS_STRIDE + h * HEAD_DIM;
+        float val = qp[tid] * __bfloat162float(q_clip_scale[h * HEAD_DIM + tid]);
+        float sq = warp_sum(val * val);
+        if (lane == 0) sm[warp] = sq;
+        __syncthreads();
+        if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
+        __syncthreads();
+        qp[tid] = val * factor;
+    } else if (kind_id < 48) {
+        if (tid >= D_REL) return;
+        int h = kind_id - 24;
+        float* rp = qrgs + (size_t)b * QRGS_STRIDE + Q_DIM + h * D_REL;
+        float val = rp[tid] * __bfloat162float(rel_clip_scale[h * D_REL + tid]);
+        float sq = val * val;
+        #pragma unroll
+        for (int off = 8; off > 0; off >>= 1) sq += __shfl_xor_sync(0xFFFFu, sq, off);
+        rp[tid] = val * fminf(REL_CLIP / (sqrtf(sq) + 1e-6f), 1.0f);
+    } else {
+        bool is_v = (kind_id >= 56);
+        int h = is_v ? (kind_id - 56) : (kind_id - 48);
+        int c = h * HEAD_DIM + tid;
+        const float* x = is_v ? v_proj : k_proj;
+        const float* ring = is_v ? v_ring : k_ring;
+        const __nv_bfloat16* sw = is_v ? v_sconv_w : k_sconv_w;
+
+        auto get_hist = [&](int bi) -> float {
+            if (bi >= 0) return x[(size_t)bi * KV_DIM + c];
+            int ph = pos0 + bi;
+            return (ph >= 0) ? ring[(ph & 15) * KV_DIM + c] : 0.0f;
+        };
+        float h0 = get_hist(b - 3);
+        float h1 = get_hist(b - 2);
+        float h2 = get_hist(b - 1);
+        float cur = x[(size_t)b * KV_DIM + c];
+        float wc0 = __bfloat162float(sw[c * 4 + 0]);
+        float wc1 = __bfloat162float(sw[c * 4 + 1]);
+        float wc2 = __bfloat162float(sw[c * 4 + 2]);
+        float wc3 = __bfloat162float(sw[c * 4 + 3]);
+        float val = (wc0 * h0 + wc1 * h1 + wc2 * h2 + wc3 * cur + cur) * INV_SQRT_5;
+
+        float sq = warp_sum(val * val);
+        if (lane == 0) sm[warp] = sq;
+        __syncthreads();
+        if (tid == 0) {
+            float tot = sm[0] + sm[1] + sm[2] + sm[3];
+            factor = is_v ? rsqrtf(tot / float(HEAD_DIM) + RMS_EPS)
+                          : fminf(QK_CLIP / (sqrtf(tot) + 1e-6f), 1.0f);
+        }
+        __syncthreads();
+        int slot = p % kv_cap;
+        __nv_bfloat16* dst = is_v ? v_cache : k_cache;
+        dst[(size_t)slot * KV_DIM + c] = __float2bfloat16(val * factor);
+    }
+}
+
+// 1-launch FUSED 2D-parallel Global dynamic sconv + Q/R/K clip (with log-pos tau) + V RMSNorm + KV store (BF16/FP8/Q4)!
+// Eliminates the 8-SM 2048-step serial p_dynamic_sconv_kv_inplace_kernel completely!
 template <int KV_FMT>
 __global__ void __launch_bounds__(128)
 p_global_attn_prep_store_kernel(
     float* __restrict__ qrgs,
-    const float* __restrict__ ck,
-    const float* __restrict__ cv,
+    const float* __restrict__ k_proj,
+    const float* __restrict__ v_proj,
+    const __nv_bfloat16* __restrict__ k_sw,
+    const __nv_bfloat16* __restrict__ v_sw,
+    const float* __restrict__ k_taps,
+    const float* __restrict__ v_taps,
+    const float* __restrict__ k_ring,
+    const float* __restrict__ v_ring,
     const __nv_bfloat16* __restrict__ q_clip_scale,
     const __nv_bfloat16* __restrict__ rel_clip_scale,
     void* __restrict__ k_cache,
@@ -898,7 +977,8 @@ p_global_attn_prep_store_kernel(
     int tid = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
-    int p = (*d_pos) + b;
+    int pos0 = *d_pos;
+    int p = pos0 + b;
     float ratio = fmaxf(float(p + 1) / float(LOG_SCALE_FLOOR), 1.0f);
     float tau = 1.0f + LOG_SCALE_ALPHA * logf(ratio);
     constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
@@ -924,27 +1004,166 @@ p_global_attn_prep_store_kernel(
         #pragma unroll
         for (int off = 8; off > 0; off >>= 1) sq += __shfl_xor_sync(0xFFFFu, sq, off);
         rp[tid] = val * fminf(REL_CLIP / (sqrtf(sq) + 1e-6f), 1.0f) * tau;
-    } else if (kind_id < 56) {
-        int h = kind_id - 48;
-        int c = h * HEAD_DIM + tid;
-        float val = ck[(size_t)b * KV_DIM + c];
-        float sq = warp_sum(val * val);
-        if (lane == 0) sm[warp] = sq;
-        __syncthreads();
-        if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
-        __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
     } else {
-        int h = kind_id - 56;
+        bool is_v = (kind_id >= 56);
+        int h = is_v ? (kind_id - 56) : (kind_id - 48);
         int c = h * HEAD_DIM + tid;
-        float val = cv[(size_t)b * KV_DIM + c];
+        const float* x = is_v ? v_proj : k_proj;
+        const float* ring = is_v ? v_ring : k_ring;
+        const __nv_bfloat16* sw = is_v ? v_sw : k_sw;
+        const float* dt = (is_v ? v_taps : k_taps) + (size_t)b * 32 + h * 4;
+
+        auto get_hist = [&](int bi) -> float {
+            if (bi >= 0) return x[(size_t)bi * KV_DIM + c];
+            int ph = pos0 + bi;
+            return (ph >= 0) ? ring[(ph & 15) * KV_DIM + c] : 0.0f;
+        };
+        float cur = x[(size_t)b * KV_DIM + c];
+        float h1 = get_hist(b - 1);
+        float h2 = get_hist(b - 2);
+        float h3 = get_hist(b - 3);
+        float sw0 = __bfloat162float(sw[0 * KV_DIM + c]);
+        float sw1 = __bfloat162float(sw[1 * KV_DIM + c]);
+        float sw2 = __bfloat162float(sw[2 * KV_DIM + c]);
+        float sw3 = __bfloat162float(sw[3 * KV_DIM + c]);
+        float acc = cur * (sw0 + dt[0]) + h1 * (sw1 + dt[1]) + h2 * (sw2 + dt[2]) + h3 * (sw3 + dt[3]);
+        float val = (acc + cur) * INV_SQRT_9;
+
         float sq = warp_sum(val * val);
         if (lane == 0) sm[warp] = sq;
         __syncthreads();
-        if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
+        if (tid == 0) {
+            float tot = sm[0] + sm[1] + sm[2] + sm[3];
+            factor = is_v ? rsqrtf(tot / float(HEAD_DIM) + RMS_EPS)
+                          : fminf(QK_CLIP / (sqrtf(tot) + 1e-6f), 1.0f);
+        }
         __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
+        store_kv_head_128<KV_FMT>(
+            val * factor, p % kv_cap, h, tid,
+            is_v ? v_cache : k_cache,
+            is_v ? v_scale : k_scale, sm);
     }
+}
+
+// Batched DSpark Prefill Commit: mixes [4, B, HIDDEN] -> FP16 mix_h[0..2][B, HIDDEN] + last 16 f_ring slots!
+__global__ void __launch_bounds__(256)
+p_dspark_mix_h_kernel(
+    const float* __restrict__ taps,       // [4, B, HIDDEN]
+    int B,
+    const float* __restrict__ fuse_alpha, // [4, 4]
+    const __nv_bfloat16* __restrict__ n0,
+    const __nv_bfloat16* __restrict__ n1,
+    const __nv_bfloat16* __restrict__ n2,
+    const __nv_bfloat16* __restrict__ n3,
+    __half* __restrict__ mix_h0,
+    __half* __restrict__ mix_h1,
+    __half* __restrict__ mix_h2,
+    float* __restrict__ f_ring,           // [16, HIDDEN]
+    const int32_t* __restrict__ d_pos) {
+    int b = blockIdx.x;
+    int m = blockIdx.y; // 0..3
+    if (m == 3 && b < B - 16) return; // only last 16 tokens survive in 16-slot f_ring!
+    int tid = threadIdx.x;
+
+    const float a0 = fuse_alpha[m * 4 + 0];
+    const float a1 = fuse_alpha[m * 4 + 1];
+    const float a2 = fuse_alpha[m * 4 + 2];
+    const float a3 = fuse_alpha[m * 4 + 3];
+
+    const float* t0 = taps + ((size_t)0 * B + b) * HIDDEN;
+    const float* t1 = taps + ((size_t)1 * B + b) * HIDDEN;
+    const float* t2 = taps + ((size_t)2 * B + b) * HIDDEN;
+    const float* t3 = taps + ((size_t)3 * B + b) * HIDDEN;
+
+    float vals[9];
+    float sum_sq = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 9; ++i) {
+        int d = tid + i * 256;
+        float v = a0 * t0[d] + a1 * t1[d] + a2 * t2[d] + a3 * t3[d];
+        vals[i] = v;
+        sum_sq = fmaf(v, v, sum_sq);
+    }
+    sum_sq = warp_sum(sum_sq);
+    __shared__ float sm[8];
+    if ((tid & 31) == 0) sm[tid >> 5] = sum_sq;
+    __syncthreads();
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < 8; ++i) tot += sm[i];
+        inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+    }
+    __syncthreads();
+
+    const __nv_bfloat16* nw = (m == 0) ? n0 : (m == 1 ? n1 : (m == 2 ? n2 : n3));
+    float s = inv_rms;
+    if (m < 3) {
+        __half* dst = ((m == 0) ? mix_h0 : (m == 1 ? mix_h1 : mix_h2)) + (size_t)b * HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            int d = tid + i * 256;
+            dst[d] = __float2half(vals[i] * s * __bfloat162float(nw[d]));
+        }
+    } else {
+        float* dst = f_ring + (size_t)(((*d_pos) + b) & 15) * HIDDEN;
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            int d = tid + i * 256;
+            dst[d] = vals[i] * s * __bfloat162float(nw[d]);
+        }
+    }
+}
+
+template <int KV_FMT>
+__global__ void __launch_bounds__(128)
+p_dspark_store_ctx_kv_kernel(
+    const float* __restrict__ kv,
+    const __nv_bfloat16* __restrict__ k_norm,
+    void* __restrict__ k_cache,
+    void* __restrict__ v_cache,
+    __half* __restrict__ k_scale,
+    __half* __restrict__ v_scale,
+    int cap,
+    int B,
+    const int32_t* __restrict__ d_pos) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int pos = (*d_pos) + b;
+    // For local DSpark ring (cap < B): only the last `cap` tokens survive — skip overwritten early writes!
+    if (B > cap && b < B - cap) return;
+    int slot = pos % cap;
+
+    const float* kp = kv + (size_t)b * (2 * KV_DIM) + h * HEAD_DIM;
+    const float* vp = kv + (size_t)b * (2 * KV_DIM) + KV_DIM + h * HEAD_DIM;
+
+    __shared__ float sm[4];
+    store_kv_head_128<KV_FMT>(vp[tid], slot, h, tid, v_cache, v_scale, sm);
+    __syncthreads();
+
+    float kv_val = kp[tid];
+    float sq = warp_sum(kv_val * kv_val);
+    if ((tid & 31) == 0) sm[tid >> 5] = sq;
+    __syncthreads();
+    __shared__ float inv_rms;
+    if (tid == 0) inv_rms = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
+    __syncthreads();
+
+    __shared__ float kn[HEAD_DIM];
+    kn[tid] = kv_val * inv_rms * __bfloat162float(k_norm[tid]);
+    __syncthreads();
+
+    if (tid < 64) {
+        float freq = 1.0f / powf(MTP_ROPE_THETA, float(2 * tid) / float(HEAD_DIM));
+        float ang = float(pos) * freq;
+        float c = cosf(ang), s = sinf(ang);
+        float x0 = kn[tid], x1 = kn[tid + 64];
+        kn[tid]      = x0 * c - x1 * s;
+        kn[tid + 64] = x0 * s + x1 * c;
+    }
+    __syncthreads();
+    store_kv_head_128<KV_FMT>(kn[tid], slot, h, tid, k_cache, k_scale, sm);
 }
 
 // BLACKWELL TENSOR CORE FLASHATTENTION PREFILL (Global Q4/FP8/BF16 & Local SWA BF16!)
@@ -1288,13 +1507,13 @@ void launch_prefill_gemm_h(
         p_dequant_nvfp4_to_f16_kernel<<<(int)((total_blocks + 255) / 256), 256, 0, stream>>>(
             static_cast<const uint8_t*>(w.data), w.scales, w_f16_scratch, total_blocks);
     } else if (w.kind == WeightKind::FP8) {
-        size_t total_pairs = (size_t)w.rows * (w.cols >> 1);
-        p_dequant_fp8_to_f16_kernel<<<(int)((total_pairs + 255) / 256), 256, 0, stream>>>(
+        size_t total_chunks16 = (size_t)w.rows * (w.cols >> 4);
+        p_dequant_fp8_to_f16_kernel<<<(int)((total_chunks16 + 255) / 256), 256, 0, stream>>>(
             static_cast<const uint8_t*>(w.data), w.row_scales, w_f16_scratch, w.rows, w.cols);
     } else {
-        size_t n = (size_t)w.rows * w.cols;
-        p_dequant_bf16_to_f16_kernel<<<(int)((n + 255) / 256), 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(w.data), w_f16_scratch, n);
+        size_t total_vec8 = ((size_t)w.rows * w.cols) >> 3;
+        p_dequant_bf16_to_f16_kernel<<<(int)((total_vec8 + 255) / 256), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(w.data), w_f16_scratch, total_vec8);
     }
 
     float alpha = (w.kind == WeightKind::NVFP4) ? w.global_scale : 1.0f, beta = 0.0f;
@@ -1338,8 +1557,8 @@ void launch_prefill_sconv_post_res(
 }
 
 void launch_prefill_copy_taps(const float* src, float* dst_taps, int tap_slot, int B, cudaStream_t stream) {
-    int total = B * HIDDEN;
-    p_copy_taps_chunked_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, dst_taps, tap_slot, B);
+    int total_f4 = (B * HIDDEN) >> 2;
+    p_copy_taps_chunked_kernel<<<(total_f4 + 255) / 256, 256, 0, stream>>>(src, dst_taps, tap_slot, B);
 }
 
 void launch_prefill_local_sconv_prep_store(
@@ -1349,11 +1568,11 @@ void launch_prefill_local_sconv_prep_store(
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
     __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
     int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
-    launch_static_sconv(k_proj, k_sconv_w, k_ring, k_proj, B, KV_DIM, d_pos, stream);
-    launch_static_sconv(v_proj, v_sconv_w, v_ring, v_proj, B, KV_DIM, d_pos, stream);
-    launch_attn_prep_store(
-        qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale,
-        k_cache, v_cache, kv_cap, false, B, d_pos, stream);
+    p_local_sconv_prep_store_kernel<<<dim3(64, B), 128, 0, stream>>>(
+        qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
+        q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, d_pos);
+    p_kv_ring_commit_kernel<<<dim3(KV_DIM / 256, 2), 256, 0, stream>>>(
+        k_proj, v_proj, k_ring, v_ring, B, d_pos);
 }
 
 void launch_prefill_global_sconv_prep_store(
@@ -1375,21 +1594,61 @@ void launch_prefill_global_sconv_prep_store(
     launch_prefill_gemm_h(kw, in_k_h, k_taps, w_f16_scratch, B, stream);
     launch_prefill_gemm_h(vw, in_v_h, v_taps, w_f16_scratch, B, stream);
 
-    // 2. 1-launch causal dynamic sconv for K & V in-place
-    p_dynamic_sconv_kv_inplace_kernel<<<dim3(KV_DIM / 256, 2), 256, 0, stream>>>(
-        k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring, B, d_pos);
-
-    // 3. 1-launch Q/R/K clip (with log-pos tau) + V RMSNorm + quantized KV store
+    // 2. 1-launch fused 2D-parallel dynamic sconv + Q/R/K clip (with log-pos tau) + V RMSNorm + quantized KV store!
     dim3 grid(64, B);
     if (kv_fmt == KVFormat::FP8) {
         p_global_attn_prep_store_kernel<1><<<grid, 128, 0, stream>>>(
-            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
     } else if (kv_fmt == KVFormat::Q4) {
         p_global_attn_prep_store_kernel<2><<<grid, 128, 0, stream>>>(
-            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
     } else {
         p_global_attn_prep_store_kernel<0><<<grid, 128, 0, stream>>>(
-            qrgs, k_proj, v_proj, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+    }
+    p_kv_ring_commit_kernel<<<dim3(KV_DIM / 256, 2), 256, 0, stream>>>(
+        k_proj, v_proj, k_ring, v_ring, B, d_pos);
+}
+
+void launch_prefill_dspark_commit(
+    const DsparkWeights& dw,
+    const float* taps,
+    void* ctx_k[MTP_LAYERS],
+    void* ctx_v[MTP_LAYERS],
+    __half* ctx_ks[MTP_LAYERS],
+    __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* f_ring,
+    __half* mix_h0,
+    __half* mix_h1,
+    __half* mix_h2,
+    float* scratch_kv,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream) {
+    p_dspark_mix_h_kernel<<<dim3(B, 4), 256, 0, stream>>>(
+        taps, B, dw.fuse_alpha,
+        dw.layers[0].dflare_norm, dw.layers[1].dflare_norm, dw.layers[2].dflare_norm,
+        dw.markov_dflare_norm, mix_h0, mix_h1, mix_h2, f_ring, d_pos);
+    __half* mix_h[3] = {mix_h0, mix_h1, mix_h2};
+    for (int l = 0; l < MTP_LAYERS; ++l) {
+        launch_prefill_gemm_h(dw.layers[l].w_kv_ctx, mix_h[l], scratch_kv, w_f16_scratch, B, stream);
+        KVFormat lfmt = dw.layers[l].is_local ? KVFormat::BF16 : global_kv_fmt;
+        if (lfmt == KVFormat::FP8) {
+            p_dspark_store_ctx_kv_kernel<1><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], B, d_pos);
+        } else if (lfmt == KVFormat::Q4) {
+            p_dspark_store_ctx_kv_kernel<2><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], B, d_pos);
+        } else {
+            p_dspark_store_ctx_kv_kernel<0><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], B, d_pos);
+        }
     }
 }
 

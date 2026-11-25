@@ -117,13 +117,15 @@ struct DsparkWeights {
     __nv_bfloat16* hidden_out_b = nullptr; // [2304]
 
     // Precomputed folded draft projections for blazing fast Markov RNN argmax:
-    // Optional pruned draft vocabulary (e.g. 32K/49K tokens -> 4-6x faster drafter, 100% lossless!)
+    // Optional pruned draft vocabulary (32K base + 4096 dynamic context rows -> 100% lossless!)
     int draft_vocab_size = VOCAB_UNPADDED;
-    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_size] maps local idx -> real vocab ID (nullptr = identity)
-    int32_t* inv_draft_vocab_ids = nullptr; // [VOCAB_UNPADDED] maps real vocab ID -> local idx or -1 (nullptr = identity)
-    LinearWeight unembed_draft;             // [draft_vocab_size, 2304] (NVFP4: only 42-64 MB!)
-    LinearWeight fold_w;                // [draft_vocab_size, 256]  (NVFP4: only 4.7-7.0 MB!)
-    float* fold_b = nullptr;            // [draft_vocab_size] F32
+    int draft_vocab_cap = VOCAB_UNPADDED;
+    int32_t* d_draft_vocab_size = nullptr;  // device-side active count (nullptr = static draft_vocab_size)
+    int32_t* draft_vocab_ids = nullptr;     // [draft_vocab_cap] maps local idx -> real vocab ID (nullptr = identity)
+    int32_t* inv_draft_vocab_ids = nullptr; // unused with full-vocab sparse draft probs (kept for ABI compat)
+    LinearWeight unembed_draft;             // [draft_vocab_cap, 2304]
+    LinearWeight fold_w;                    // [VOCAB_UNPADDED, 256] BF16 (indexed by real token ID!)
+    float* fold_b = nullptr;                // [VOCAB_UNPADDED] F32 (indexed by real token ID!)
 
     DsparkLayerWeights layers[MTP_LAYERS];
 };

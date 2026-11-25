@@ -48,7 +48,8 @@ pub const kv_q4_group_size: u32 = 64;
 pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 2
 pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head; // 16
 pub const split_buffer_floats: u64 = 2_050_000;
-pub const dspark_workspace_floats: u64 = 2_000_000;
+pub const dspark_workspace_floats: u64 = 3_200_000;
+pub const dspark_dynamic_ctx_rows: u32 = 4096;
 
 pub const vram_alignment_bytes: u64 = 256;
 pub const qrgs_out_dim: u32 = query_dim + r_dim + query_dim + head_count; // 6552

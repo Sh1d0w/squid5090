@@ -106,29 +106,6 @@ struct Mxfp8Chunk32 {
     uint8_t s;
 };
 
-struct Fp8Chunk32 {
-    uint4 q0, q1;
-};
-
-__device__ __forceinline__ Fp8Chunk32 load_fp8_chunk32(const uint8_t* codes, int c) {
-    Fp8Chunk32 ch;
-    ch.q0 = ld_stream_u4(codes + (size_t)c * 32);
-    ch.q1 = ld_stream_u4(codes + (size_t)c * 32 + 16);
-    return ch;
-}
-
-// Lossless E4M3 -> FP16 unpack (every E4M3 finite value is bit-exact in FP16) for mma.m16n8k16.f32.f16!
-__device__ __forceinline__ void decode_fp8_chunk32_f16(const Fp8Chunk32& ch, uint32_t (&o)[16]) {
-    const uint32_t words[8] = {ch.q0.x, ch.q0.y, ch.q0.z, ch.q0.w, ch.q1.x, ch.q1.y, ch.q1.z, ch.q1.w};
-    #pragma unroll
-    for (int w = 0; w < 8; ++w) {
-        __half2 h0 = cvt_e4m3x2_to_half2(uint16_t(words[w] & 0xFFFFu));
-        __half2 h1 = cvt_e4m3x2_to_half2(uint16_t(words[w] >> 16));
-        o[2 * w + 0] = *reinterpret_cast<uint32_t*>(&h0);
-        o[2 * w + 1] = *reinterpret_cast<uint32_t*>(&h1);
-    }
-}
-
 __device__ __forceinline__ Nvfp4Chunk32 load_nvfp4_chunk32(
     const uint8_t* codes, const uint8_t* scales, int c) {
     Nvfp4Chunk32 ch;
@@ -563,33 +540,35 @@ qkvrg_fused_nvfp4_mma_kernel(
 // Every E4M3 weight converts losslessly to FP16 and accumulates in exact FP32!
 // ============================================================================
 
-template <bool ADD_RES, int ITERS>
-__global__ void __launch_bounds__(128)
+template <bool ADD_RES, int ITERS, int BLOCK = 128>
+__global__ void __launch_bounds__(BLOCK)
 linear_fp8_b1_pdl_kernel(
     const uint8_t* __restrict__ w_data,
     const float* __restrict__ row_scales,
     const __half* __restrict__ x_h,
     float* __restrict__ y,
     int N, int K, uint32_t zero) {
+    constexpr int RPB = BLOCK >> 4;
+    constexpr int PRE = (ITERS <= 9) ? ITERS : 6;
     int hw = threadIdx.x >> 4;
     int lane = threadIdx.x & 15;
-    int row = blockIdx.x * 8 + hw;
+    int row = blockIdx.x * RPB + hw;
     if (row >= N) return;
 
     const uint4* w_row = reinterpret_cast<const uint4*>(w_data + (size_t)row * K);
-    float rscale = row_scales[row];
+    float rscale = __ldg(row_scales + row);
 
-    // Prefetch first 3 weight chunks before PDL wait to overlap predecessor tail
-    uint4 w_pre[3];
+    // Prefetch weight chunks before PDL wait to overlap predecessor tail
+    uint4 w_pre[PRE];
     #pragma unroll
-    for (int p = 0; p < 3; ++p) w_pre[p] = ld_stream_u4(w_row + lane + p * 16);
+    for (int p = 0; p < PRE; ++p) w_pre[p] = ld_stream_u4(w_row + lane + p * 16);
     pdl_wait_fenced(zero);
     pdl_trigger();
 
     float acc = 0.0f;
     #pragma unroll
     for (int iter = 0; iter < ITERS; ++iter) {
-        uint4 w16 = (iter < 3) ? w_pre[iter] : ld_stream_u4(w_row + lane + iter * 16);
+        uint4 w16 = (iter < PRE) ? w_pre[iter] : ld_stream_u4(w_row + lane + iter * 16);
         int koff = (lane + iter * 16) << 4;
         uint4 xv0 = ld_dep_u4(x_h + koff);
         uint4 xv1 = ld_dep_u4(x_h + koff + 8);
@@ -657,18 +636,19 @@ qkvrg_fused_fp8_b1_pdl_kernel(
     }
 
     const uint4* w_row = reinterpret_cast<const uint4*>(w_data + (size_t)row * HIDDEN);
-    float rscale = rscales[row];
+    float rscale = __ldg(rscales + row);
 
-    uint4 w_pre[3];
+    // Issue all 9 streaming weight loads BEFORE pdl_wait_fenced so the entire row is in flight!
+    uint4 w_pre[9];
     #pragma unroll
-    for (int p = 0; p < 3; ++p) w_pre[p] = ld_stream_u4(w_row + lane + p * 16);
+    for (int p = 0; p < 9; ++p) w_pre[p] = ld_stream_u4(w_row + lane + p * 16);
     pdl_wait_fenced(zero);
     pdl_trigger();
 
     float acc = 0.0f;
     #pragma unroll
     for (int iter = 0; iter < 9; ++iter) {
-        uint4 w16 = (iter < 3) ? w_pre[iter] : ld_stream_u4(w_row + lane + iter * 16);
+        uint4 w16 = w_pre[iter];
         int koff = (lane + iter * 16) << 4;
         uint4 xv0 = ld_dep_u4(x_h + koff);
         uint4 xv1 = ld_dep_u4(x_h + koff + 8);
@@ -706,8 +686,12 @@ linear_fp8_mma_kernel(
     const __half* __restrict__ x_h,
     float* __restrict__ y,
     int N, uint32_t zero) {
-    constexpr int TOTAL_U = K_DIM / (128 * SPLITK);
-    static_assert(TOTAL_U * 128 * SPLITK == K_DIM);
+    constexpr int CPL = 16;             // 16 FP8 weights = 1 uint4 per lane
+    constexpr int SPAN = 4 * CPL;       // 64 cols per step
+    constexpr int KS = K_DIM / SPLITK;  // cols per warp
+    constexpr int NJ = KS / SPAN;
+    constexpr int U = 3;                // 3 steps = 48 bytes/lane in flight, zero register spills!
+    static_assert(KS * SPLITK == K_DIM && (NJ % U) == 0);
     __shared__ float cs[SPLITK][16][8];
 
     const int warp = threadIdx.x >> 5;
@@ -717,55 +701,55 @@ linear_fp8_mma_kernel(
     const int r0 = blockIdx.x * 16;
     const int ra = r0 + g, rb = r0 + g + 8;
     const bool la = (ra < N), lb = (rb < N);
-    const int c_warp = warp * (4 * TOTAL_U) + t;
+    const int c0 = warp * KS + t * CPL;
     const bool lx = (g < B_CONST);
+    const uint8_t* wa = w_data + (size_t)(la ? ra : 0) * K_DIM;
+    const uint8_t* wb = w_data + (size_t)(lb ? rb : 0) * K_DIM;
     const __half* xg = lx ? (x_h + (size_t)g * K_DIM) : nullptr;
 
-    Fp8Chunk32 A_cur, B_cur;
-    if (la) A_cur = load_fp8_chunk32(w_data + (size_t)ra * K_DIM, c_warp);
-    else { A_cur.q0 = make_uint4(0, 0, 0, 0); A_cur.q1 = make_uint4(0, 0, 0, 0); }
-    if (lb) B_cur = load_fp8_chunk32(w_data + (size_t)rb * K_DIM, c_warp);
-    else { B_cur.q0 = make_uint4(0, 0, 0, 0); B_cur.q1 = make_uint4(0, 0, 0, 0); }
-
-    pdl_wait_fenced(zero);
-    pdl_trigger();
-
     float d[4] = {0.f, 0.f, 0.f, 0.f};
-    #pragma unroll
-    for (int u = 0; u < TOTAL_U; ++u) {
-        Fp8Chunk32 A_nxt, B_nxt;
-        if (u + 1 < TOTAL_U) {
-            int c_nxt = c_warp + 4 * (u + 1);
-            if (la) A_nxt = load_fp8_chunk32(w_data + (size_t)ra * K_DIM, c_nxt);
-            else { A_nxt.q0 = make_uint4(0, 0, 0, 0); A_nxt.q1 = make_uint4(0, 0, 0, 0); }
-            if (lb) B_nxt = load_fp8_chunk32(w_data + (size_t)rb * K_DIM, c_nxt);
-            else { B_nxt.q0 = make_uint4(0, 0, 0, 0); B_nxt.q1 = make_uint4(0, 0, 0, 0); }
-        }
-        uint32_t xw[16];
-        int col = (c_warp + 4 * u) * 32;
-        if (lx) {
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = ld_dep_u4(xg + col + 8 * v);
-                xw[4 * v + 0] = q.x; xw[4 * v + 1] = q.y;
-                xw[4 * v + 2] = q.z; xw[4 * v + 3] = q.w;
-            }
-        } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[v] = 0;
-        }
-        uint32_t dep = (A_cur.q0.x ^ A_cur.q1.w ^ B_cur.q0.x ^ B_cur.q1.w ^ xw[0]) & zero;
-        uint32_t a[16], b[16];
-        decode_fp8_chunk32_f16(A_cur, a);
-        decode_fp8_chunk32_f16(B_cur, b);
+    #pragma unroll 1
+    for (int jb = 0; jb < NJ; jb += U) {
+        uint4 A[U], B[U], X[U][2];
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
-                                 a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
-                                 xw[2 * i] ^ dep, xw[2 * i + 1],
-                                 d[0], d[1], d[2], d[3]);
+        for (int u = 0; u < U; ++u) {
+            int col = c0 + (jb + u) * SPAN;
+            A[u] = la ? ld_stream_u4(wa + col) : make_uint4(0, 0, 0, 0);
+            B[u] = lb ? ld_stream_u4(wb + col) : make_uint4(0, 0, 0, 0);
         }
-        if (u + 1 < TOTAL_U) { A_cur = A_nxt; B_cur = B_nxt; }
+        if (jb == 0) {
+            pdl_wait_fenced(zero);
+            pdl_trigger();
+        }
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int col = c0 + (jb + u) * SPAN;
+            X[u][0] = lx ? ld_dep_u4(xg + col)     : make_uint4(0, 0, 0, 0);
+            X[u][1] = lx ? ld_dep_u4(xg + col + 8) : make_uint4(0, 0, 0, 0);
+        }
+        uint32_t dep = 0u;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w ^ X[u][0].x;
+        dep &= zero;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w};
+            const uint32_t bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+            const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
+                                    X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(aw[s] & 0xFFFFu));
+                __half2 a1 = cvt_e4m3x2_to_half2(uint16_t(aw[s] >> 16));
+                __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(bw[s] & 0xFFFFu));
+                __half2 b1 = cvt_e4m3x2_to_half2(uint16_t(bw[s] >> 16));
+                mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                     *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                     *reinterpret_cast<uint32_t*>(&a1), *reinterpret_cast<uint32_t*>(&b1),
+                                     xw[2 * s] ^ dep, xw[2 * s + 1],
+                                     d[0], d[1], d[2], d[3]);
+            }
+        }
     }
 
     cs[warp][g][2 * t]     = d[0];
@@ -782,7 +766,7 @@ linear_fp8_mma_kernel(
             float s = 0.f;
             #pragma unroll
             for (int w = 0; w < SPLITK; ++w) s += cs[w][r][m];
-            s *= row_scales[row];
+            s *= __ldg(row_scales + row);
             if constexpr (ADD_RES) y[(size_t)m * N + row] += s;
             else                   y[(size_t)m * N + row] = s;
         }
@@ -806,7 +790,11 @@ qkvrg_fused_fp8_mma_kernel(
     constexpr int T_Q = (N_Q + 15) / 16;                   // 410
     constexpr int T_K = KV_DIM / 16;                       // 64
     constexpr int SPLITK = 6;
-    constexpr int TOTAL_U = 3;                             // 6 * 3 * 128 = 2304 EXACT!
+    constexpr int CPL = 16;
+    constexpr int SPAN = 4 * CPL;                          // 64
+    constexpr int KS = HIDDEN / SPLITK;                    // 384
+    constexpr int NJ = KS / SPAN;                          // 6 (2 batches of U=3!)
+    constexpr int U = 3;
     __shared__ float cs[SPLITK][16][8];
 
     int blk = blockIdx.x;
@@ -829,55 +817,55 @@ qkvrg_fused_fp8_mma_kernel(
     const int t = lane & 3;
     const int ra = r0 + g, rb = r0 + g + 8;
     const bool la = (ra < N_out), lb = (rb < N_out);
-    const int c_base = warp * (4 * TOTAL_U) + t;
+    const int c0 = warp * KS + t * CPL;
     const bool lx = (g < B_CONST);
+    const uint8_t* wa = w_data + (size_t)(la ? ra : 0) * HIDDEN;
+    const uint8_t* wb = w_data + (size_t)(lb ? rb : 0) * HIDDEN;
     const __half* xg = lx ? (x_h + (size_t)g * HIDDEN) : nullptr;
 
-    Fp8Chunk32 A_cur, B_cur;
-    if (la) A_cur = load_fp8_chunk32(w_data + (size_t)ra * HIDDEN, c_base);
-    else { A_cur.q0 = make_uint4(0, 0, 0, 0); A_cur.q1 = make_uint4(0, 0, 0, 0); }
-    if (lb) B_cur = load_fp8_chunk32(w_data + (size_t)rb * HIDDEN, c_base);
-    else { B_cur.q0 = make_uint4(0, 0, 0, 0); B_cur.q1 = make_uint4(0, 0, 0, 0); }
-
-    pdl_wait_fenced(zero);
-    pdl_trigger();
-
     float d[4] = {0.f, 0.f, 0.f, 0.f};
-    #pragma unroll
-    for (int u = 0; u < TOTAL_U; ++u) {
-        Fp8Chunk32 A_nxt, B_nxt;
-        if (u + 1 < TOTAL_U) {
-            int c_nxt = c_base + 4 * (u + 1);
-            if (la) A_nxt = load_fp8_chunk32(w_data + (size_t)ra * HIDDEN, c_nxt);
-            else { A_nxt.q0 = make_uint4(0, 0, 0, 0); A_nxt.q1 = make_uint4(0, 0, 0, 0); }
-            if (lb) B_nxt = load_fp8_chunk32(w_data + (size_t)rb * HIDDEN, c_nxt);
-            else { B_nxt.q0 = make_uint4(0, 0, 0, 0); B_nxt.q1 = make_uint4(0, 0, 0, 0); }
-        }
-        uint32_t xw[16];
-        int col = (c_base + 4 * u) * 32;
-        if (lx) {
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = ld_dep_u4(xg + col + 8 * v);
-                xw[4 * v + 0] = q.x; xw[4 * v + 1] = q.y;
-                xw[4 * v + 2] = q.z; xw[4 * v + 3] = q.w;
-            }
-        } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[v] = 0;
-        }
-        uint32_t dep = (A_cur.q0.x ^ A_cur.q1.w ^ B_cur.q0.x ^ B_cur.q1.w ^ xw[0]) & zero;
-        uint32_t a[16], b[16];
-        decode_fp8_chunk32_f16(A_cur, a);
-        decode_fp8_chunk32_f16(B_cur, b);
+    #pragma unroll 1
+    for (int jb = 0; jb < NJ; jb += U) {
+        uint4 A[U], B[U], X[U][2];
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
-                                 a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
-                                 xw[2 * i] ^ dep, xw[2 * i + 1],
-                                 d[0], d[1], d[2], d[3]);
+        for (int u = 0; u < U; ++u) {
+            int col = c0 + (jb + u) * SPAN;
+            A[u] = la ? ld_stream_u4(wa + col) : make_uint4(0, 0, 0, 0);
+            B[u] = lb ? ld_stream_u4(wb + col) : make_uint4(0, 0, 0, 0);
         }
-        if (u + 1 < TOTAL_U) { A_cur = A_nxt; B_cur = B_nxt; }
+        if (jb == 0) {
+            pdl_wait_fenced(zero);
+            pdl_trigger();
+        }
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int col = c0 + (jb + u) * SPAN;
+            X[u][0] = lx ? ld_dep_u4(xg + col)     : make_uint4(0, 0, 0, 0);
+            X[u][1] = lx ? ld_dep_u4(xg + col + 8) : make_uint4(0, 0, 0, 0);
+        }
+        uint32_t dep = 0u;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w ^ X[u][0].x;
+        dep &= zero;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w};
+            const uint32_t bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+            const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
+                                    X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(aw[s] & 0xFFFFu));
+                __half2 a1 = cvt_e4m3x2_to_half2(uint16_t(aw[s] >> 16));
+                __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(bw[s] & 0xFFFFu));
+                __half2 b1 = cvt_e4m3x2_to_half2(uint16_t(bw[s] >> 16));
+                mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                     *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                     *reinterpret_cast<uint32_t*>(&a1), *reinterpret_cast<uint32_t*>(&b1),
+                                     xw[2 * s] ^ dep, xw[2 * s + 1],
+                                     d[0], d[1], d[2], d[3]);
+            }
+        }
     }
 
     cs[warp][g][2 * t]     = d[0];
@@ -894,7 +882,7 @@ qkvrg_fused_fp8_mma_kernel(
             float s = 0.f;
             #pragma unroll
             for (int w = 0; w < SPLITK; ++w) s += cs[w][r][m];
-            y_out[(size_t)m * N_out + row] = s * rscales[row];
+            y_out[(size_t)m * N_out + row] = s * __ldg(rscales + row);
         }
     }
 }
@@ -1212,17 +1200,17 @@ static void dispatch_linear_h_b(
     } else if (w.kind == WeightKind::FP8) {
         if constexpr (B_CONST == 1) {
             if (w.cols == 3072) {
-                int grid = (w.rows + 7) / 8;
-                if (add_res) launch_pdl(linear_fp8_b1_pdl_kernel<true, 12>, dim3(grid), 128, stream,
+                int grid = (w.rows + 3) / 4; // 64 threads/CTA (4 rows/CTA -> 576 CTAs evenly spread on 170 SMs!)
+                if (add_res) launch_pdl(linear_fp8_b1_pdl_kernel<true, 12, 64>, dim3(grid), 64, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, w.cols, 0u);
-                else launch_pdl(linear_fp8_b1_pdl_kernel<false, 12>, dim3(grid), 128, stream,
+                else launch_pdl(linear_fp8_b1_pdl_kernel<false, 12, 64>, dim3(grid), 64, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, w.cols, 0u);
                 return;
             } else if (w.cols == 2304) {
                 int grid = (w.rows + 7) / 8;
-                if (add_res) launch_pdl(linear_fp8_b1_pdl_kernel<true, 9>, dim3(grid), 128, stream,
+                if (add_res) launch_pdl(linear_fp8_b1_pdl_kernel<true, 9, 128>, dim3(grid), 128, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, w.cols, 0u);
-                else launch_pdl(linear_fp8_b1_pdl_kernel<false, 9>, dim3(grid), 128, stream,
+                else launch_pdl(linear_fp8_b1_pdl_kernel<false, 9, 128>, dim3(grid), 128, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, w.cols, 0u);
                 return;
             }
@@ -1243,9 +1231,9 @@ static void dispatch_linear_h_b(
                 return;
             } else if (w.cols == 9216) {
                 int grid = (w.rows + 15) / 16;
-                if (add_res) launch_pdl(linear_fp8_mma_kernel<B_CONST, true, 9216, 8>, dim3(grid), 256, stream,
+                if (add_res) launch_pdl(linear_fp8_mma_kernel<B_CONST, true, 9216, 16>, dim3(grid), 512, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, 0u);
-                else launch_pdl(linear_fp8_mma_kernel<B_CONST, false, 9216, 8>, dim3(grid), 256, stream,
+                else launch_pdl(linear_fp8_mma_kernel<B_CONST, false, 9216, 16>, dim3(grid), 512, stream,
                     static_cast<const uint8_t*>(w.data), w.row_scales, x_h, y, w.rows, 0u);
                 return;
             }
@@ -1573,7 +1561,99 @@ lm_head_nvfp4_mma_stage1_kernel(
     }
 }
 
+// Persistent Half-Warp (16 threads/row, 16 rows/CTA) PDL-Prefetched FP8 LM Head for B = 1!
+__global__ void __launch_bounds__(256)
+lm_head_fp8_b1_pdl_stage1_kernel(
+    const uint8_t* __restrict__ w_data,
+    const float* __restrict__ row_scales,
+    const float* __restrict__ x,
+    float* __restrict__ out_logits,
+    float* __restrict__ blk_max_val,
+    int32_t* __restrict__ blk_max_idx,
+    const SampleConfig* __restrict__ sample_cfg,
+    int V, uint32_t zero) {
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
+    __shared__ __half s_xh[HIDDEN];
+    const int tid = threadIdx.x;
+    const int hw = tid >> 4;   // 0..15 (16 rows/CTA!)
+    const int lane = tid & 15; // 0..15 (9 EXACT chunks of 16 bytes)
+    const int first_row = blockIdx.x * 16 + hw;
+    const int stride_r = gridDim.x * 16;
+
+    // Prefetch first row's weights BEFORE pdl_wait_fenced into single register array wv[9] (zero extra regs!)
+    uint4 wv[9];
+    if (first_row < V) {
+        const uint4* wr = reinterpret_cast<const uint4*>(w_data + (size_t)first_row * HIDDEN);
+        #pragma unroll
+        for (int p = 0; p < 9; ++p) wv[p] = ld_stream_u4(wr + lane + p * 16);
+    }
+
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    for (int i = tid; i < HIDDEN; i += 256) {
+        s_xh[i] = __float2half(ld_dep_f32(x + i));
+    }
+    __syncthreads();
+
+    float best_val = -1e30f;
+    int32_t best_idx = 0;
+
+    for (int row = first_row; row < V; row += stride_r) {
+        if (row != first_row) {
+            const uint4* wr = reinterpret_cast<const uint4*>(w_data + (size_t)row * HIDDEN);
+            #pragma unroll
+            for (int p = 0; p < 9; ++p) wv[p] = ld_stream_u4(wr + lane + p * 16);
+        }
+        float acc = 0.0f;
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int koff = (lane + iter * 16) << 4;
+            const __half2* xb = reinterpret_cast<const __half2*>(s_xh + koff);
+            const uint32_t ws[4] = {wv[iter].x, wv[iter].y, wv[iter].z, wv[iter].w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 wf0 = __half22float2(cvt_e4m3x2_to_half2(uint16_t(ws[j] & 0xFFFFu)));
+                float2 wf1 = __half22float2(cvt_e4m3x2_to_half2(uint16_t(ws[j] >> 16)));
+                float2 xf0 = __half22float2(xb[2 * j + 0]);
+                float2 xf1 = __half22float2(xb[2 * j + 1]);
+                acc = fmaf(wf0.x, xf0.x, acc); acc = fmaf(wf0.y, xf0.y, acc);
+                acc = fmaf(wf1.x, xf1.x, acc); acc = fmaf(wf1.y, xf1.y, acc);
+            }
+        }
+        float val = half_warp_sum(acc) * __ldg(row_scales + row);
+        if (lane == 0) {
+            if (write_logits) {
+                float cap_val = fast_tanh(val * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+                out_logits[row] = cap_val;
+                if (cap_val > best_val || (cap_val == best_val && row < best_idx)) {
+                    best_val = cap_val; best_idx = row;
+                }
+            } else {
+                if (val > best_val || (val == best_val && row < best_idx)) {
+                    best_val = val; best_idx = row;
+                }
+            }
+        }
+    }
+
+    __shared__ float sm_val[16];
+    __shared__ int32_t sm_idx[16];
+    if (lane == 0) { sm_val[hw] = best_val; sm_idx[hw] = best_idx; }
+    __syncthreads();
+    if (tid == 0) {
+        float bv = sm_val[0];
+        int32_t bi = sm_idx[0];
+        for (int w = 1; w < 16; ++w) {
+            if (sm_val[w] > bv || (sm_val[w] == bv && sm_idx[w] < bi)) { bv = sm_val[w]; bi = sm_idx[w]; }
+        }
+        blk_max_val[blockIdx.x] = bv;
+        blk_max_idx[blockIdx.x] = bi;
+    }
+}
+
 // Persistent Blackwell Tensor Core (mma.m16n8k16.f32.f16) + PDL FP8 LM Head for B = 2..8!
+// Uses 16-col (1 uint4) steps with U=3 batch hoisting -> ~48 regs, ZERO spills, ~85% DRAM BW!
 template <int B_CONST>
 __global__ void __launch_bounds__(192)
 lm_head_fp8_mma_stage1_kernel(
@@ -1587,7 +1667,11 @@ lm_head_fp8_mma_stage1_kernel(
     int V, uint32_t zero) {
     const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
     constexpr int SPLITK = 6;
-    constexpr int U = 3; // 6 * 3 * 128 = 2304
+    constexpr int CPL = 16;
+    constexpr int SPAN = 4 * CPL;       // 64
+    constexpr int KS = HIDDEN / SPLITK; // 384
+    constexpr int NJ = KS / SPAN;       // 6 (2 batches of U=3)
+    constexpr int U = 3;
     __shared__ __half s_xh[B_CONST][HIDDEN];
     __shared__ float cs[SPLITK][16][8];
 
@@ -1596,7 +1680,7 @@ lm_head_fp8_mma_stage1_kernel(
     const int lane = tid & 31;
     const int g = lane >> 2;
     const int t = lane & 3;
-    const int c_base = warp * (4 * U) + t;
+    const int c0 = warp * KS + t * CPL;
 
     pdl_wait_fenced(zero);
     pdl_trigger();
@@ -1607,22 +1691,18 @@ lm_head_fp8_mma_stage1_kernel(
     }
     __syncthreads();
 
-    uint32_t xw[U][16];
     const bool lx = (g < B_CONST);
+    uint4 X_all[NJ][2];
     #pragma unroll
-    for (int u = 0; u < U; ++u) {
-        int col = (c_base + 4 * u) * 32;
+    for (int j = 0; j < NJ; ++j) {
+        int col = c0 + j * SPAN;
         if (lx) {
             const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
-            #pragma unroll
-            for (int v = 0; v < 4; ++v) {
-                uint4 q = xp[v];
-                xw[u][4 * v + 0] = q.x; xw[u][4 * v + 1] = q.y;
-                xw[u][4 * v + 2] = q.z; xw[u][4 * v + 3] = q.w;
-            }
+            X_all[j][0] = xp[0];
+            X_all[j][1] = xp[1];
         } else {
-            #pragma unroll
-            for (int v = 0; v < 16; ++v) xw[u][v] = 0;
+            X_all[j][0] = make_uint4(0, 0, 0, 0);
+            X_all[j][1] = make_uint4(0, 0, 0, 0);
         }
     }
 
@@ -1631,31 +1711,46 @@ lm_head_fp8_mma_stage1_kernel(
     #pragma unroll
     for (int b = 0; b < B_CONST; ++b) { best_val[b] = -1e30f; best_idx[b] = 0; }
 
-    int n_tiles = (V + 15) / 16;
+    const int n_tiles = (V + 15) / 16;
     for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
         int r0 = tile * 16;
         int ra = r0 + g, rb = r0 + g + 8;
         bool la = (ra < V), lb = (rb < V);
+        const uint8_t* wa = w_data + (size_t)(la ? ra : 0) * HIDDEN;
+        const uint8_t* wb = w_data + (size_t)(lb ? rb : 0) * HIDDEN;
 
         float d[4] = {0.f, 0.f, 0.f, 0.f};
         #pragma unroll
-        for (int u = 0; u < U; ++u) {
-            int c = c_base + 4 * u;
-            Fp8Chunk32 Ac, Bc;
-            if (la) Ac = load_fp8_chunk32(w_data + (size_t)ra * HIDDEN, c);
-            else { Ac.q0 = make_uint4(0, 0, 0, 0); Ac.q1 = make_uint4(0, 0, 0, 0); }
-            if (lb) Bc = load_fp8_chunk32(w_data + (size_t)rb * HIDDEN, c);
-            else { Bc.q0 = make_uint4(0, 0, 0, 0); Bc.q1 = make_uint4(0, 0, 0, 0); }
-            uint32_t dep = (Ac.q0.x ^ Ac.q1.w ^ Bc.q0.x ^ Bc.q1.w) & zero;
-            uint32_t a[16], b[16];
-            decode_fp8_chunk32_f16(Ac, a);
-            decode_fp8_chunk32_f16(Bc, b);
+        for (int jb = 0; jb < NJ; jb += U) {
+            uint4 A[U], B[U];
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
-                                     a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
-                                     xw[u][2 * i] ^ dep, xw[u][2 * i + 1],
-                                     d[0], d[1], d[2], d[3]);
+            for (int u = 0; u < U; ++u) {
+                int col = c0 + (jb + u) * SPAN;
+                A[u] = la ? ld_stream_u4(wa + col) : make_uint4(0, 0, 0, 0);
+                B[u] = lb ? ld_stream_u4(wb + col) : make_uint4(0, 0, 0, 0);
+            }
+            uint32_t dep = 0u;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w;
+            dep &= zero;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w};
+                const uint32_t bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+                const uint32_t xw[8] = {X_all[jb + u][0].x, X_all[jb + u][0].y, X_all[jb + u][0].z, X_all[jb + u][0].w,
+                                        X_all[jb + u][1].x, X_all[jb + u][1].y, X_all[jb + u][1].z, X_all[jb + u][1].w};
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(aw[s] & 0xFFFFu));
+                    __half2 a1 = cvt_e4m3x2_to_half2(uint16_t(aw[s] >> 16));
+                    __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(bw[s] & 0xFFFFu));
+                    __half2 b1 = cvt_e4m3x2_to_half2(uint16_t(bw[s] >> 16));
+                    mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                         *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                         *reinterpret_cast<uint32_t*>(&a1), *reinterpret_cast<uint32_t*>(&b1),
+                                         xw[2 * s] ^ dep, xw[2 * s + 1],
+                                         d[0], d[1], d[2], d[3]);
+                }
             }
         }
         cs[warp][g][2 * t]     = d[0];
@@ -1667,7 +1762,7 @@ lm_head_fp8_mma_stage1_kernel(
         if (tid < 16) {
             int row = r0 + tid;
             if (row < V) {
-                float rscale = row_scales[row];
+                float rscale = __ldg(row_scales + row);
                 #pragma unroll
                 for (int b = 0; b < B_CONST; ++b) {
                     float s = cs[0][tid][b] + cs[1][tid][b] + cs[2][tid][b]
@@ -1709,22 +1804,35 @@ lm_head_fp8_mma_stage1_kernel(
     }
 }
 
-__global__ void lm_head_stage2_argmax_kernel(
+// Multi-block (128 CTAs/row -> saturates all 170 SMs!) stochastic LM-head sampler & exact Leviathan/Chen verifier.
+// Cuts T=1.0 sampling latency from ~1.0-2.0 ms (1 CTA/row) down to ~35 us with identical mathematical top-p/top-k/rejection!
+constexpr int SAMP_PARTS = 128;
+constexpr float SAMP_HIST_RANGE = 20.0f;
+constexpr float SAMP_HIST_SCALE = 256.0f / SAMP_HIST_RANGE; // 12.8 bins/nat
+
+struct LmSampleScratch {
+    float max_val[8];
+    int32_t max_idx[8];
+    float tau[8];
+    float z_sum[8];
+    int32_t accepted[8];
+    unsigned long long hist_sum[8][256];
+    uint32_t hist_cnt[8][256];
+    float part_val[8][SAMP_PARTS];
+    int32_t part_idx[8][SAMP_PARTS];
+};
+__device__ LmSampleScratch g_lm_samp;
+
+__global__ void __launch_bounds__(256)
+lm_head_stage2_argmax_kernel(
     const float* __restrict__ blk_max_val,
     const int32_t* __restrict__ blk_max_idx,
     const float* __restrict__ out_logits,
     int32_t* __restrict__ out_tokens,
     const SampleConfig* __restrict__ sample_cfg,
-    const int32_t* __restrict__ d_pos,
-    const int32_t* __restrict__ d_draft_tokens,
-    const float* __restrict__ d_draft_probs,
-    const float* __restrict__ d_draft_q_sel,
-    const int32_t* __restrict__ d_draft_is_delta,
-    const int32_t* __restrict__ inv_draft_vocab,
-    int draft_vocab_size,
-    int V,
     int B) {
     pdl_wait_fenced(0u);
+    pdl_trigger();
     int b = blockIdx.x;
     if (b >= B) return;
     int tid = threadIdx.x;
@@ -1747,98 +1855,143 @@ __global__ void lm_head_stage2_argmax_kernel(
     __syncthreads();
 
     const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
-    if (!do_sample) {
-        if (tid == 0) {
-            bv = sv[0]; bi = si[0];
-            for (int w = 1; w < 8; ++w) {
-                if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-            }
-            out_tokens[b] = bi;
-        }
-        return;
+    if (do_sample) {
+        g_lm_samp.hist_sum[b][tid] = 0ULL;
+        g_lm_samp.hist_cnt[b][tid] = 0u;
     }
-
-    __shared__ float s_max_val;
-    __shared__ int32_t s_max_idx;
-    __shared__ unsigned long long hist_sum[256];
-    __shared__ uint32_t hist_cnt[256];
-    __shared__ float s_tau;
-    __shared__ float s_inv_z;
-    __shared__ int32_t s_accept;
-    __shared__ int32_t s_draft_tok;
-    __shared__ int32_t s_is_delta;
-
     if (tid == 0) {
         bv = sv[0]; bi = si[0];
         for (int w = 1; w < 8; ++w) {
             if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
         }
-        s_max_val = bv;
-        s_max_idx = bi;
+        if (!do_sample) {
+            out_tokens[b] = bi;
+        } else {
+            g_lm_samp.max_val[b] = bv;
+            g_lm_samp.max_idx[b] = bi;
+            g_lm_samp.z_sum[b] = 0.0f;
+            g_lm_samp.accepted[b] = 0;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256)
+lm_head_sample_hist_kernel(
+    const float* __restrict__ out_logits,
+    const SampleConfig* __restrict__ sample_cfg,
+    int V) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    if (!do_sample) return;
+    const float top_p = sample_cfg->top_p;
+    const int32_t top_k = sample_cfg->top_k;
+    if (!((top_p > 0.0f && top_p < 0.9999f) || top_k > 0)) return;
+
+    const int p = blockIdx.x;
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x;
+    const float max_logit = g_lm_samp.max_val[b];
+    const float inv_temp = sample_cfg->inv_temp;
+    const float* logits = out_logits + (size_t)b * V;
+
+    __shared__ unsigned long long s_sum[256];
+    __shared__ uint32_t s_cnt[256];
+    s_sum[tid] = 0ULL;
+    s_cnt[tid] = 0u;
+    __syncthreads();
+
+    const int per = (V + SAMP_PARTS - 1) / SAMP_PARTS;
+    const int start = p * per;
+    const int end = min(V, start + per);
+    for (int row = start + tid; row < end; row += 256) {
+        float d = (max_logit - ld_dep_f32(logits + row)) * inv_temp;
+        if (d < SAMP_HIST_RANGE) {
+            int bin = (int)(d * SAMP_HIST_SCALE);
+            if (bin < 0) bin = 0;
+            else if (bin > 255) bin = 255;
+            unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
+            atomicAdd(&s_sum[bin], fp);
+            atomicAdd(&s_cnt[bin], 1u);
+        }
     }
     __syncthreads();
 
-    const float max_logit = s_max_val;
-    const int32_t greedy_idx = s_max_idx;
+    uint32_t c = s_cnt[tid];
+    if (c != 0u) {
+        atomicAdd(&g_lm_samp.hist_sum[b][tid], s_sum[tid]);
+        atomicAdd(&g_lm_samp.hist_cnt[b][tid], c);
+    }
+}
+
+__global__ void __launch_bounds__(256)
+lm_head_sample_tau_z_gumbel_kernel(
+    const float* __restrict__ out_logits,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ d_draft_tokens,
+    int V,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    if (!do_sample) return;
+
+    const int p = blockIdx.x;
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x;
+    const float max_logit = g_lm_samp.max_val[b];
     const float inv_temp = sample_cfg->inv_temp;
     const float top_p = sample_cfg->top_p;
     const int32_t top_k = sample_cfg->top_k;
-    const uint64_t seed = sample_cfg->seed;
-    const int32_t pos = d_pos ? (*d_pos + b) : b;
-    const float* logits = out_logits + (size_t)b * V;
 
-    constexpr float HIST_RANGE = 20.0f;
-    constexpr float HIST_SCALE = 256.0f / HIST_RANGE; // 12.8 bins/nat
+    __shared__ unsigned long long s_hsum[256];
+    __shared__ uint32_t s_hcnt[256];
+    __shared__ float s_tau;
+    __shared__ float sv[8];
+    __shared__ int32_t si[8];
 
     if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
-        hist_sum[tid] = 0ULL;
-        hist_cnt[tid] = 0u;
+        s_hsum[tid] = g_lm_samp.hist_sum[b][tid];
+        s_hcnt[tid] = g_lm_samp.hist_cnt[b][tid];
         __syncthreads();
-
-        for (int row = tid; row < V; row += 256) {
-            float d = (max_logit - ld_dep_f32(logits + row)) * inv_temp;
-            if (d < HIST_RANGE) {
-                int bin = (int)(d * HIST_SCALE);
-                if (bin < 0) bin = 0;
-                else if (bin > 255) bin = 255;
-                unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
-                atomicAdd(&hist_sum[bin], fp);
-                atomicAdd(&hist_cnt[bin], 1u);
-            }
-        }
-        __syncthreads();
-
         if (tid == 0) {
             double total_z = 0.0;
-            for (int k = 0; k < 256; ++k) total_z += (double)hist_sum[k];
+            for (int k = 0; k < 256; ++k) total_z += (double)s_hsum[k];
             double cum_z = 0.0;
             uint32_t cum_c = 0u;
             int cut_bin = 255;
             const double target_z = (top_p > 0.0f && top_p < 1.0f) ? ((double)top_p * total_z) : total_z;
             for (int k = 0; k < 256; ++k) {
-                cum_z += (double)hist_sum[k];
-                cum_c += hist_cnt[k];
+                cum_z += (double)s_hsum[k];
+                cum_c += s_hcnt[k];
                 const bool hit_p = (top_p > 0.0f && top_p < 0.9999f && cum_z >= target_z);
                 const bool hit_k = (top_k > 0 && cum_c >= (uint32_t)top_k);
-                if (hit_p || hit_k) {
-                    cut_bin = k;
-                    break;
-                }
+                if (hit_p || hit_k) { cut_bin = k; break; }
             }
-            s_tau = max_logit - ((float)(cut_bin + 1) / HIST_SCALE) / inv_temp;
+            float t_val = max_logit - ((float)(cut_bin + 1) / SAMP_HIST_SCALE) / inv_temp;
+            s_tau = t_val;
+            if (p == 0) g_lm_samp.tau[b] = t_val;
         }
-        __syncthreads();
     } else {
-        if (tid == 0) s_tau = max_logit - HIST_RANGE / inv_temp;
-        __syncthreads();
+        if (tid == 0) {
+            float t_val = max_logit - SAMP_HIST_RANGE / inv_temp;
+            s_tau = t_val;
+            if (p == 0) g_lm_samp.tau[b] = t_val;
+        }
     }
+    __syncthreads();
 
     const float tau = s_tau;
+    const float* logits = out_logits + (size_t)b * V;
+    const int per = (V + SAMP_PARTS - 1) / SAMP_PARTS;
+    const int start = p * per;
+    const int end = min(V, start + per);
 
-    // Exact Leviathan/Chen stochastic rejection sampling for verified draft slots b in 0..B-2!
     if (d_draft_tokens != nullptr && b < B - 1) {
+        // Speculative verify slot: accumulate partition Z = sum exp((l - max_logit) * inv_temp)
         float local_z = 0.0f;
-        for (int row = tid; row < V; row += 256) {
+        for (int row = start + tid; row < end; row += 256) {
             float l = ld_dep_f32(logits + row);
             if (l >= tau) local_z += __expf((l - max_logit) * inv_temp);
         }
@@ -1848,93 +2001,191 @@ __global__ void lm_head_stage2_argmax_kernel(
         if (tid == 0) {
             float tot_z = 0.0f;
             for (int w = 0; w < 8; ++w) tot_z += sv[w];
-            float inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
-            s_inv_z = inv_z;
-            int32_t x = d_draft_tokens[b];
-            s_draft_tok = x;
-            int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
-            s_is_delta = is_d;
-            float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
-            float px = (lx >= tau) ? (__expf((lx - max_logit) * inv_temp) * inv_z) : 0.0f;
-            float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[b] : 1.0f);
-            float u_acc = hash_u01(seed ^ 0x517CC1B727220A95ULL, pos, 0x5A5A5A5A);
-            int32_t acc = (px > 0.0f && (qx <= 0.0f || (u_acc * qx <= px))) ? 1 : 0;
-            s_accept = acc;
-            if (acc) out_tokens[b] = x;
-        }
-        __syncthreads();
-        if (s_accept) return;
-
-        // Rejected: exact residual resampling from norm(max(0, p(v) - q(v))) via Gumbel-Max!
-        const float inv_z = s_inv_z;
-        const int32_t x = s_draft_tok;
-        const int32_t is_d = s_is_delta;
-        float best_s = -1e30f;
-        int32_t best_t = -1;
-        for (int row = tid; row < V; row += 256) {
-            float l = ld_dep_f32(logits + row);
-            if (l >= tau) {
-                float pv = __expf((l - max_logit) * inv_temp) * inv_z;
-                float qv = 0.0f;
-                if (is_d) {
-                    qv = (row == x) ? 1.0f : 0.0f;
-                } else if (d_draft_probs != nullptr) {
-                    int32_t didx = inv_draft_vocab ? inv_draft_vocab[row] : row;
-                    if (didx >= 0 && didx < draft_vocab_size) {
-                        qv = d_draft_probs[(size_t)b * draft_vocab_size + didx];
-                    }
-                }
-                float diff = pv - qv;
-                if (diff > 0.0f) {
-                    float sc = __logf(diff) + hash_gumbel(seed, pos, row);
-                    if (sc > best_s) { best_s = sc; best_t = row; }
-                }
-            }
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            float os = __shfl_xor_sync(0xffffffffu, best_s, off);
-            int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
-            if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
-        }
-        if ((tid & 31) == 0) { sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
-        __syncthreads();
-        if (tid == 0) {
-            best_s = sv[0]; best_t = si[0];
-            for (int w = 1; w < 8; ++w) {
-                if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
-            }
-            // Never emit rejected draft token x on degeneracy fallback
-            int32_t fallback = (greedy_idx != x) ? greedy_idx : ((x > 0) ? (x - 1) : 1);
-            out_tokens[b] = (best_t >= 0) ? best_t : fallback;
+            if (tot_z != 0.0f) atomicAdd(&g_lm_samp.z_sum[b], tot_z);
         }
         return;
     }
 
-    // Direct exact Gumbel-Max sampling from target p(v) (prefill, B=1, or speculative bonus token b=B-1)
+    // Direct exact Gumbel-Max sampling (prefill, B=1, or speculative bonus token b == B - 1)
+    const uint64_t seed = sample_cfg->seed;
+    const int32_t pos = d_pos ? (*d_pos + b) : b;
     float best_s = -1e30f;
-    int32_t best_t = greedy_idx;
-    for (int row = tid; row < V; row += 256) {
+    int32_t best_t = -1;
+    for (int row = start + tid; row < end; row += 256) {
         float l = ld_dep_f32(logits + row);
         if (l >= tau) {
             float sc = (l - max_logit) * inv_temp + hash_gumbel(seed, pos, row);
-            if (sc > best_s) { best_s = sc; best_t = row; }
+            if (sc > best_s || (sc == best_s && (best_t < 0 || row < best_t))) {
+                best_s = sc;
+                best_t = row;
+            }
         }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         float os = __shfl_xor_sync(0xffffffffu, best_s, off);
         int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
-        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
+        if (os > best_s || (os == best_s && ot >= 0 && (best_t < 0 || ot < best_t))) {
+            best_s = os;
+            best_t = ot;
+        }
     }
     if ((tid & 31) == 0) { sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
     __syncthreads();
     if (tid == 0) {
         best_s = sv[0]; best_t = si[0];
         for (int w = 1; w < 8; ++w) {
-            if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
+            if (sv[w] > best_s || (sv[w] == best_s && si[w] >= 0 && (best_t < 0 || si[w] < best_t))) {
+                best_s = sv[w]; best_t = si[w];
+            }
         }
-        out_tokens[b] = best_t;
+        g_lm_samp.part_val[b][p] = best_s;
+        g_lm_samp.part_idx[b][p] = best_t;
+    }
+}
+
+__global__ void __launch_bounds__(256)
+lm_head_sample_verify_resid_kernel(
+    const float* __restrict__ out_logits,
+    int32_t* __restrict__ out_tokens,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ d_draft_tokens,
+    const float* __restrict__ d_draft_probs,
+    const float* __restrict__ d_draft_q_sel,
+    const int32_t* __restrict__ d_draft_is_delta,
+    const int32_t* __restrict__ inv_draft_vocab,
+    int draft_vocab_size,
+    int V,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    const int b = blockIdx.y;
+    if (!do_sample || d_draft_tokens == nullptr || b >= B - 1) return;
+
+    const int p = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float max_logit = g_lm_samp.max_val[b];
+    const float tau = g_lm_samp.tau[b];
+    const float tot_z = g_lm_samp.z_sum[b];
+    const float inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
+    const float inv_temp = sample_cfg->inv_temp;
+    const uint64_t seed = sample_cfg->seed;
+    const int32_t pos = d_pos ? (*d_pos + b) : b;
+    const float* logits = out_logits + (size_t)b * V;
+
+    const int32_t x = d_draft_tokens[b];
+    const int32_t is_d = (d_draft_is_delta != nullptr && *d_draft_is_delta != 0) ? 1 : 0;
+    const float lx = (x >= 0 && x < V) ? ld_dep_f32(logits + x) : -1e30f;
+    const float px = (lx >= tau) ? (__expf((lx - max_logit) * inv_temp) * inv_z) : 0.0f;
+    const float qx = is_d ? 1.0f : (d_draft_q_sel ? d_draft_q_sel[b] : 1.0f);
+    const float u_acc = hash_u01(seed ^ 0x517CC1B727220A95ULL, pos, 0x5A5A5A5A);
+    const int32_t acc = (px > 0.0f && (qx <= 0.0f || (u_acc * qx <= px))) ? 1 : 0;
+
+    if (acc) {
+        if (p == 0 && tid == 0) {
+            g_lm_samp.accepted[b] = 1;
+            out_tokens[b] = x;
+        }
+        return;
+    }
+
+    // Rejected: exact residual resampling from norm(max(0, p(v) - q(v))) via Gumbel-Max across 128 CTAs!
+    const int per = (V + SAMP_PARTS - 1) / SAMP_PARTS;
+    const int start = p * per;
+    const int end = min(V, start + per);
+    float best_s = -1e30f;
+    int32_t best_t = -1;
+    for (int row = start + tid; row < end; row += 256) {
+        float l = ld_dep_f32(logits + row);
+        if (l >= tau) {
+            float pv = __expf((l - max_logit) * inv_temp) * inv_z;
+            float qv = 0.0f;
+            if (is_d) {
+                qv = (row == x) ? 1.0f : 0.0f;
+            } else if (d_draft_probs != nullptr) {
+                int32_t didx = inv_draft_vocab ? inv_draft_vocab[row] : row;
+                if (didx >= 0 && didx < draft_vocab_size) {
+                    qv = d_draft_probs[(size_t)b * draft_vocab_size + didx];
+                }
+            }
+            float diff = pv - qv;
+            if (diff > 0.0f) {
+                float sc = __logf(diff) + hash_gumbel(seed, pos, row);
+                if (sc > best_s || (sc == best_s && (best_t < 0 || row < best_t))) {
+                    best_s = sc;
+                    best_t = row;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float os = __shfl_xor_sync(0xffffffffu, best_s, off);
+        int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
+        if (os > best_s || (os == best_s && ot >= 0 && (best_t < 0 || ot < best_t))) {
+            best_s = os;
+            best_t = ot;
+        }
+    }
+    __shared__ float sv[8];
+    __shared__ int32_t si[8];
+    if ((tid & 31) == 0) { sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
+    __syncthreads();
+    if (tid == 0) {
+        best_s = sv[0]; best_t = si[0];
+        for (int w = 1; w < 8; ++w) {
+            if (sv[w] > best_s || (sv[w] == best_s && si[w] >= 0 && (best_t < 0 || si[w] < best_t))) {
+                best_s = sv[w]; best_t = si[w];
+            }
+        }
+        g_lm_samp.part_val[b][p] = best_s;
+        g_lm_samp.part_idx[b][p] = best_t;
+    }
+}
+
+__global__ void __launch_bounds__(SAMP_PARTS)
+lm_head_sample_finish_kernel(
+    const float* __restrict__ out_logits,
+    int32_t* __restrict__ out_tokens,
+    const SampleConfig* __restrict__ sample_cfg,
+    const int32_t* __restrict__ d_draft_tokens,
+    int B) {
+    pdl_wait_fenced(0u);
+    pdl_trigger();
+    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    const int b = blockIdx.x;
+    if (!do_sample || b >= B || g_lm_samp.accepted[b] != 0) return;
+
+    const int tid = threadIdx.x; // 0..127 (SAMP_PARTS)
+    float bv = g_lm_samp.part_val[b][tid];
+    int32_t bi = g_lm_samp.part_idx[b][tid];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+        int32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) { bv = ov; bi = oi; }
+    }
+    __shared__ float sv[4];
+    __shared__ int32_t si[4];
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+        bv = sv[0]; bi = si[0];
+        for (int w = 1; w < 4; ++w) {
+            if (sv[w] > bv || (sv[w] == bv && si[w] >= 0 && (bi < 0 || si[w] < bi))) {
+                bv = sv[w]; bi = si[w];
+            }
+        }
+        int32_t greedy_idx = g_lm_samp.max_idx[b];
+        if (d_draft_tokens != nullptr && b < B - 1) {
+            int32_t x = d_draft_tokens[b];
+            int32_t fallback = (greedy_idx != x) ? greedy_idx : ((x > 0) ? (x - 1) : 1);
+            out_tokens[b] = (bi >= 0) ? bi : fallback;
+        } else {
+            out_tokens[b] = (bi >= 0) ? bi : greedy_idx;
+        }
     }
 }
 
@@ -2385,18 +2636,32 @@ static void dispatch_lm_head(
                 static_cast<const uint8_t*>(u.data), u.row_scales,
                 x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         } else {
-            launch_pdl(lm_head_stage1_kernel<B_CONST, 1>, dim3(LM_HEAD_BLOCKS), 256, stream,
-                u.data, static_cast<const uint8_t*>(nullptr), u.row_scales, 1.0f,
-                x, out_logits, s_val, s_idx, sample_cfg, u.rows);
+            launch_pdl(lm_head_fp8_b1_pdl_stage1_kernel, dim3(LM_HEAD_BLOCKS), 256, stream,
+                static_cast<const uint8_t*>(u.data), u.row_scales,
+                x, out_logits, s_val, s_idx, sample_cfg, u.rows, 0u);
         }
     } else {
         lm_head_stage1_kernel<B_CONST, 0><<<LM_HEAD_BLOCKS, 256, 0, stream>>>(
             u.data, nullptr, nullptr, 1.0f, x, out_logits, s_val, s_idx, sample_cfg, u.rows);
     }
     launch_pdl(lm_head_stage2_argmax_kernel, dim3(B_CONST), 256, stream,
-        s_val, s_idx, out_logits, out_toks, sample_cfg, d_pos,
-        d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta,
-        inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+        s_val, s_idx, out_logits, out_toks, sample_cfg, B_CONST);
+    if (sample_cfg != nullptr && out_logits != nullptr) {
+        launch_pdl(lm_head_sample_hist_kernel, dim3(SAMP_PARTS, B_CONST), 256, stream,
+            out_logits, sample_cfg, u.rows);
+        launch_pdl(lm_head_sample_tau_z_gumbel_kernel, dim3(SAMP_PARTS, B_CONST), 256, stream,
+            out_logits, sample_cfg, d_pos, d_draft_tokens, u.rows, B_CONST);
+        if constexpr (B_CONST > 1) {
+            if (d_draft_tokens != nullptr) {
+                launch_pdl(lm_head_sample_verify_resid_kernel, dim3(SAMP_PARTS, B_CONST), 256, stream,
+                    out_logits, out_toks, sample_cfg, d_pos,
+                    d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta,
+                    inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+            }
+        }
+        launch_pdl(lm_head_sample_finish_kernel, dim3(B_CONST), SAMP_PARTS, stream,
+            out_logits, out_toks, sample_cfg, d_draft_tokens, B_CONST);
+    }
 }
 
 void launch_lm_head_argmax(

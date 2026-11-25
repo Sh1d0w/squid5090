@@ -408,12 +408,14 @@ markov_rnn_proj_kernel(
     const int32_t* __restrict__ prev_tok_ptr,    // [1]
     const float* __restrict__ state,             // [256]
     float* __restrict__ out_raw) {               // [768]
+    pdl_wait();
+    pdl_trigger();
     __shared__ float sp[512];
     int tid = threadIdx.x;
-    int prev_tok = *prev_tok_ptr;
+    int prev_tok = ld_dep_i32(prev_tok_ptr);
     const __nv_bfloat16* w1_row = markov_w1 + (size_t)prev_tok * MTP_MARKOV_RANK;
-    sp[tid]       = state[tid];
-    sp[128 + tid] = state[128 + tid];
+    sp[tid]       = ld_dep_f32(state + tid);
+    sp[128 + tid] = ld_dep_f32(state + 128 + tid);
     sp[256 + tid] = __bfloat162float(w1_row[tid]);
     sp[384 + tid] = __bfloat162float(w1_row[128 + tid]);
     __syncthreads();
@@ -447,7 +449,66 @@ markov_rnn_proj_kernel(
     }
 }
 
-// Persistent 680-block SMEM NVFP4 base_logits[K, Vd] = unembed_draft @ normed_h + fold_b (HALF-WARP -> 0% idle!)
+// Dynamic context shortlist gather: copies `count` rows from main unembed into unembed_draft[dst_offset..]
+// Works for FP8 (KIND=1), NVFP4 (KIND=2), and BF16 (KIND=0) with zero re-quantization!
+template <int KIND>
+__global__ void __launch_bounds__(256)
+dspark_gather_shortlist_kernel(
+    const void* __restrict__ src_data,
+    const uint8_t* __restrict__ src_scales,
+    const float* __restrict__ src_rscales,
+    void* __restrict__ dst_data,
+    uint8_t* __restrict__ dst_scales,
+    float* __restrict__ dst_rscales,
+    int32_t* __restrict__ draft_vocab_ids,
+    int32_t* __restrict__ d_draft_vocab_size,
+    const int32_t* __restrict__ d_new_ids,
+    int dst_offset,
+    int count) {
+    int idx = blockIdx.x;
+    if (idx >= count) return;
+    int tid = threadIdx.x;
+    int tok = d_new_ids[idx];
+    int dst_row = dst_offset + idx;
+
+    if constexpr (KIND == 1) {
+        // FP8: 2304 bytes = 144 uint4s + 1 float row_scale
+        if (tid < (HIDDEN >> 4)) {
+            const uint4* s = reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(src_data) + (size_t)tok * HIDDEN);
+            uint4* d = reinterpret_cast<uint4*>(static_cast<uint8_t*>(dst_data) + (size_t)dst_row * HIDDEN);
+            d[tid] = s[tid];
+        }
+        if (tid == 0) dst_rscales[dst_row] = src_rscales[tok];
+    } else if constexpr (KIND == 2) {
+        // NVFP4: 1152 code bytes = 72 uint4s + 144 scale bytes = 9 uint4s
+        if (tid < (HIDDEN >> 5)) {
+            const uint4* s = reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(src_data) + (size_t)tok * (HIDDEN >> 1));
+            uint4* d = reinterpret_cast<uint4*>(static_cast<uint8_t*>(dst_data) + (size_t)dst_row * (HIDDEN >> 1));
+            d[tid] = s[tid];
+        }
+        if (tid < (HIDDEN >> 8)) {
+            const uint4* ss = reinterpret_cast<const uint4*>(src_scales + (size_t)tok * (HIDDEN >> 4));
+            uint4* ds = reinterpret_cast<uint4*>(dst_scales + (size_t)dst_row * (HIDDEN >> 4));
+            ds[tid] = ss[tid];
+        }
+    } else {
+        // BF16: 4608 bytes = 288 uint4s
+        const uint4* s = reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(src_data) + (size_t)tok * HIDDEN);
+        uint4* d = reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(dst_data) + (size_t)dst_row * HIDDEN);
+        for (int i = tid; i < (HIDDEN >> 3); i += 256) d[i] = s[i];
+    }
+
+    if (tid == 0) {
+        if (draft_vocab_ids) draft_vocab_ids[dst_row] = tok;
+        if (idx == 0 && d_draft_vocab_size) *d_draft_vocab_size = dst_offset + count;
+    }
+}
+
+__global__ void dspark_set_vocab_size_kernel(int32_t* d_draft_vocab_size, int new_size) {
+    if (threadIdx.x == 0 && d_draft_vocab_size) *d_draft_vocab_size = new_size;
+}
+
+// Persistent 680-block SMEM NVFP4 / FP8 base_logits[K, V_stride] = unembed_draft @ normed_h (dynamic V!)
 constexpr int DSPARK_UNEMBED_BLOCKS = 680;
 
 template <int K_CONST>
@@ -456,18 +517,19 @@ dspark_base_logits_nvfp4_kernel(
     const uint8_t* __restrict__ w_data,
     const uint8_t* __restrict__ w_scales,
     float gscale,
-    const __half* __restrict__ normed_h, // [K_CONST, HIDDEN]
-    const float* __restrict__ fold_b,    // [V]
-    float* __restrict__ out_base,        // [K_CONST, V]
-    int V) {
+    const __half* __restrict__ normed_h,
+    float* __restrict__ out_base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v) {
     __shared__ __half s_xh[K_CONST * HIDDEN];
     int tid = threadIdx.x;
     int total_x = K_CONST * HIDDEN;
     for (int i = tid; i < total_x; i += 256) s_xh[i] = normed_h[i];
     __syncthreads();
 
-    int hw = tid >> 4;   // 0..15 (16 rows/CTA!)
-    int lane = tid & 15; // 0..15 (9 EXACT iters!)
+    const int V = d_active_v ? *d_active_v : V_stride;
+    int hw = tid >> 4;
+    int lane = tid & 15;
     int global_r = blockIdx.x * 16 + hw;
     int total_r = gridDim.x * 16;
 
@@ -498,27 +560,25 @@ dspark_base_logits_nvfp4_kernel(
                 acc[k] = fmaf(pf.x + pf.y, sc, acc[k]);
             }
         }
-        float fb = (lane == 0 && fold_b) ? fold_b[row] : 0.0f;
         #pragma unroll
         for (int k = 0; k < K_CONST; ++k) {
             float val = half_warp_sum(acc[k]) * gscale;
-            if (lane == 0) out_base[(size_t)k * V + row] = val + fb;
+            if (lane == 0) out_base[(size_t)k * V_stride + row] = val;
         }
     }
 }
 
-// Blackwell Tensor Core (mma.m16n8k16) NVFP4 Draft Unembed for K_CONST = 2..7!
-// 192 threads (SPLITK=6 warps, U=3 steps of 128 cols/warp = 2304 exact), persistent across V!
 template <int K_CONST>
 __global__ void __launch_bounds__(192)
 dspark_base_logits_nvfp4_mma_kernel(
     const uint8_t* __restrict__ w_data,
     const uint8_t* __restrict__ w_scales,
     float gscale,
-    const __half* __restrict__ normed_h, // [K_CONST, HIDDEN]
-    const float* __restrict__ fold_b,    // [V]
-    float* __restrict__ out_base,        // [K_CONST, V]
-    int V, uint32_t zero) {
+    const __half* __restrict__ normed_h,
+    float* __restrict__ out_base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v,
+    uint32_t zero) {
     constexpr int SPLITK = 6;
     constexpr int U = 3;
     constexpr int CB = HIDDEN >> 1;
@@ -536,6 +596,7 @@ dspark_base_logits_nvfp4_mma_kernel(
     pdl_wait_fenced(zero);
     pdl_trigger();
 
+    const int V = d_active_v ? *d_active_v : V_stride;
     int total_x = K_CONST * HIDDEN;
     for (int i = tid; i < total_x; i += 192) {
         s_xh[i / HIDDEN][i % HIDDEN] = normed_h[i];
@@ -630,223 +691,528 @@ dspark_base_logits_nvfp4_mma_kernel(
             if (row < V) {
                 float s = cs[0][r][k] + cs[1][r][k] + cs[2][r][k]
                         + cs[3][r][k] + cs[4][r][k] + cs[5][r][k];
-                float fb = fold_b ? __ldg(fold_b + row) : 0.0f;
-                out_base[(size_t)k * V + row] = s * gscale + fb;
+                out_base[(size_t)k * V_stride + row] = s * gscale;
             }
         }
         __syncthreads();
     }
 }
 
-constexpr int MARKOV_BLOCKS = 340; // 2 blocks/SM (16 rows/block = 5440 concurrent rows -> 0% tail!)
-
-template <int KIND> // 0=BF16, 2=NVFP4
+// Persistent Half-Warp FP8 Draft Unembed for K = 1
 __global__ void __launch_bounds__(256)
-markov_fold_argmax_stage1_kernel(
-    const void* __restrict__ fold_data,
-    const uint8_t* __restrict__ fold_scales,
-    float fold_gscale,
-    const float* __restrict__ base_logits, // [V] (unembed @ h_{i+1} [+ fold_b if fold_b==nullptr])
-    const float* __restrict__ fold_b,      // optional [V]
-    const float* __restrict__ raw_rnn,     // [768]: gate[0..255], cand[256..511], lat[512..767]
-    float* __restrict__ state,             // [256] updated by block 0!
-    float* __restrict__ blk_val,
-    int32_t* __restrict__ blk_idx,
-    float* __restrict__ blk_cm,
-    float* __restrict__ blk_csum,
-    float* __restrict__ out_step_probs,
-    const SampleConfig* __restrict__ sample_cfg,
-    int V) {
-    const bool write_logits = (out_step_probs != nullptr) && (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f);
-    __shared__ __half s_lh[256];
+dspark_base_logits_fp8_b1_kernel(
+    const uint8_t* __restrict__ w_data,
+    const float* __restrict__ row_scales,
+    const __half* __restrict__ normed_h,
+    float* __restrict__ out_base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v) {
+    __shared__ __half s_xh[HIDDEN];
+    int tid = threadIdx.x;
+    for (int i = tid; i < HIDDEN; i += 256) s_xh[i] = normed_h[i];
+    __syncthreads();
+
+    const int V = d_active_v ? *d_active_v : V_stride;
+    int hw = tid >> 4;
+    int lane = tid & 15;
+    int global_r = blockIdx.x * 16 + hw;
+    int total_r = gridDim.x * 16;
+
+    for (int row = global_r; row < V; row += total_r) {
+        const uint4* wr = reinterpret_cast<const uint4*>(w_data + (size_t)row * HIDDEN);
+        uint4 wv[9];
+        #pragma unroll
+        for (int p = 0; p < 9; ++p) wv[p] = ld_stream_u4(wr + lane + p * 16);
+        float acc = 0.0f;
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int koff = (lane + iter * 16) << 4;
+            const __half2* xb = reinterpret_cast<const __half2*>(s_xh + koff);
+            const uint32_t ws[4] = {wv[iter].x, wv[iter].y, wv[iter].z, wv[iter].w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 wf0 = __half22float2(cvt_e4m3x2_to_half2(uint16_t(ws[j] & 0xFFFFu)));
+                float2 wf1 = __half22float2(cvt_e4m3x2_to_half2(uint16_t(ws[j] >> 16)));
+                float2 xf0 = __half22float2(xb[2 * j + 0]);
+                float2 xf1 = __half22float2(xb[2 * j + 1]);
+                acc = fmaf(wf0.x, xf0.x, acc); acc = fmaf(wf0.y, xf0.y, acc);
+                acc = fmaf(wf1.x, xf1.x, acc); acc = fmaf(wf1.y, xf1.y, acc);
+            }
+        }
+        float val = half_warp_sum(acc) * __ldg(row_scales + row);
+        if (lane == 0) out_base[row] = val;
+    }
+}
+
+// Persistent Spill-Free 16-Col U=3 FP8 Tensor Core Draft Unembed for K = 2..7!
+template <int K_CONST>
+__global__ void __launch_bounds__(192)
+dspark_base_logits_fp8_mma_kernel(
+    const uint8_t* __restrict__ w_data,
+    const float* __restrict__ row_scales,
+    const __half* __restrict__ normed_h,
+    float* __restrict__ out_base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v,
+    uint32_t zero) {
+    constexpr int SPLITK = 6;
+    constexpr int CPL = 16;
+    constexpr int SPAN = 4 * CPL;       // 64
+    constexpr int KS = HIDDEN / SPLITK; // 384
+    constexpr int NJ = KS / SPAN;       // 6 (2 batches of U=3)
+    constexpr int U = 3;
+    __shared__ __half s_xh[K_CONST][HIDDEN];
+    __shared__ float cs[SPLITK][16][8];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int c0 = warp * KS + t * CPL;
+
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    const int V = d_active_v ? *d_active_v : V_stride;
+    int total_x = K_CONST * HIDDEN;
+    for (int i = tid; i < total_x; i += 192) {
+        s_xh[i / HIDDEN][i % HIDDEN] = normed_h[i];
+    }
+    __syncthreads();
+
+    const bool lx = (g < K_CONST);
+    uint4 X_all[NJ][2];
+    #pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        int col = c0 + j * SPAN;
+        if (lx) {
+            const uint4* xp = reinterpret_cast<const uint4*>(&s_xh[g][col]);
+            X_all[j][0] = xp[0];
+            X_all[j][1] = xp[1];
+        } else {
+            X_all[j][0] = make_uint4(0, 0, 0, 0);
+            X_all[j][1] = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    int n_tiles = (V + 15) / 16;
+    for (int tile = blockIdx.x; tile < n_tiles; tile += gridDim.x) {
+        int r0 = tile * 16;
+        int ra = r0 + g, rb = r0 + g + 8;
+        bool la = (ra < V), lb = (rb < V);
+        const uint8_t* wa = w_data + (size_t)(la ? ra : 0) * HIDDEN;
+        const uint8_t* wb = w_data + (size_t)(lb ? rb : 0) * HIDDEN;
+
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        #pragma unroll
+        for (int jb = 0; jb < NJ; jb += U) {
+            uint4 A[U], B[U];
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                int col = c0 + (jb + u) * SPAN;
+                A[u] = la ? ld_stream_u4(wa + col) : make_uint4(0, 0, 0, 0);
+                B[u] = lb ? ld_stream_u4(wb + col) : make_uint4(0, 0, 0, 0);
+            }
+            uint32_t dep = 0u;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) dep ^= A[u].x ^ A[u].w ^ B[u].x ^ B[u].w;
+            dep &= zero;
+            #pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w};
+                const uint32_t bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+                const uint32_t xw[8] = {X_all[jb + u][0].x, X_all[jb + u][0].y, X_all[jb + u][0].z, X_all[jb + u][0].w,
+                                        X_all[jb + u][1].x, X_all[jb + u][1].y, X_all[jb + u][1].z, X_all[jb + u][1].w};
+                #pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(aw[s] & 0xFFFFu));
+                    __half2 a1 = cvt_e4m3x2_to_half2(uint16_t(aw[s] >> 16));
+                    __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(bw[s] & 0xFFFFu));
+                    __half2 b1 = cvt_e4m3x2_to_half2(uint16_t(bw[s] >> 16));
+                    mma_m16n8k16_f32_f16(d[0], d[1], d[2], d[3],
+                                         *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                         *reinterpret_cast<uint32_t*>(&a1), *reinterpret_cast<uint32_t*>(&b1),
+                                         xw[2 * s] ^ dep, xw[2 * s + 1],
+                                         d[0], d[1], d[2], d[3]);
+                }
+            }
+        }
+        cs[warp][g][2 * t]     = d[0];
+        cs[warp][g][2 * t + 1] = d[1];
+        cs[warp][g + 8][2 * t]     = d[2];
+        cs[warp][g + 8][2 * t + 1] = d[3];
+        __syncthreads();
+
+        for (int idx = tid; idx < 16 * K_CONST; idx += 192) {
+            int r = idx / K_CONST;
+            int k = idx % K_CONST;
+            int row = r0 + r;
+            if (row < V) {
+                float s = cs[0][r][k] + cs[1][r][k] + cs[2][r][k]
+                        + cs[3][r][k] + cs[4][r][k] + cs[5][r][k];
+                out_base[(size_t)k * V_stride + row] = s * __ldg(row_scales + row);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ============================================================================
+// Top-K 1024 Radix Select + 1024-Candidate Exact BF16 Markov Head
+// Adapted from satellitedown/inkling-2-mini-abliterated-ingine markov.cu (Apache-2.0).
+// Cuts 7 sequential Markov fold passes from 32K-200K rows -> ONLY 1,024 rows (~70 us total, T=0 & T=1.0)!
+// ============================================================================
+
+constexpr int DSPARK_CANDS = 1024;
+constexpr int TOPK_SLICES = 32;
+constexpr int TOPK_THREADS = 256;
+
+struct DsparkTopkItem {
+    float val;
+    int32_t idx;
+};
+
+struct DsparkTopkRowWs {
+    uint32_t total_hi[256];
+    uint32_t total_lo[256];
+    int32_t count_gt[TOPK_SLICES];
+    int32_t count_tie[TOPK_SLICES];
+    DsparkTopkItem above[TOPK_SLICES][DSPARK_CANDS];
+    DsparkTopkItem ties[TOPK_SLICES][DSPARK_CANDS];
+};
+
+__device__ __forceinline__ uint32_t dspark_key16(float v) {
+    uint32_t u = __float_as_uint(v);
+    uint32_t k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return k >> 16;
+}
+
+__device__ __forceinline__ void dspark_slice_range(int V, int s, int& b, int& e) {
+    int per = (V + TOPK_SLICES - 1) / TOPK_SLICES;
+    b = min(V, s * per);
+    e = min(V, b + per);
+}
+
+__device__ __forceinline__ int dspark_count_above(int c, int* warp_tot) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    constexpr int NW = TOPK_THREADS / 32;
+    int v = c;
+    #pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int u = __shfl_down_sync(0xffffffffu, v, o);
+        if (lane + o < 32) v += u;
+    }
+    if (lane == 0) warp_tot[warp] = v;
+    __syncthreads();
+    int above = v - c;
+    for (int w = warp + 1; w < NW; ++w) above += warp_tot[w];
+    __syncthreads();
+    return above;
+}
+
+__device__ __forceinline__ void dspark_select_bin(
+    const uint32_t* hist, int k, int above0, int* sh_bin, int* sh_above, int* warp_tot) {
+    int c = (int)hist[threadIdx.x];
+    int above = above0 + dspark_count_above(c, warp_tot);
+    if (above < k && above + c >= k) {
+        *sh_bin = threadIdx.x;
+        *sh_above = above;
+    }
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(TOPK_THREADS)
+dspark_topk_hist_hi_kernel(
+    const float* __restrict__ base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v,
+    DsparkTopkRowWs* __restrict__ ws) {
+    __shared__ uint32_t hist[256];
+    hist[threadIdx.x] = 0u;
+    pdl_wait();
+    pdl_trigger();
+    __syncthreads();
+    const int V = d_active_v ? *d_active_v : V_stride;
+    const int s = blockIdx.x, row = blockIdx.y;
+    const float* x = base + (size_t)row * V_stride;
+    int b, e;
+    dspark_slice_range(V, s, b, e);
+    for (int i = b + threadIdx.x; i < e; i += TOPK_THREADS) {
+        atomicAdd(&hist[dspark_key16(ld_dep_f32(x + i)) >> 8], 1u);
+    }
+    __syncthreads();
+    if (hist[threadIdx.x] != 0u) atomicAdd(&ws[row].total_hi[threadIdx.x], hist[threadIdx.x]);
+}
+
+__global__ void __launch_bounds__(TOPK_THREADS)
+dspark_topk_hist_lo_kernel(
+    const float* __restrict__ base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v,
+    DsparkTopkRowWs* __restrict__ ws) {
+    __shared__ uint32_t hist[256];
+    __shared__ int sh_bin, sh_above, warp_tot[TOPK_THREADS / 32];
+    hist[threadIdx.x] = 0u;
+    pdl_wait();
+    pdl_trigger();
+    const int V = d_active_v ? *d_active_v : V_stride;
+    const int s = blockIdx.x, row = blockIdx.y;
+    DsparkTopkRowWs& w = ws[row];
+    dspark_select_bin(w.total_hi, DSPARK_CANDS, 0, &sh_bin, &sh_above, warp_tot);
+    const uint32_t b1 = (uint32_t)sh_bin;
+    const float* x = base + (size_t)row * V_stride;
+    int b, e;
+    dspark_slice_range(V, s, b, e);
+    for (int i = b + threadIdx.x; i < e; i += TOPK_THREADS) {
+        uint32_t k = dspark_key16(x[i]);
+        if ((k >> 8) == b1) atomicAdd(&hist[k & 255u], 1u);
+    }
+    __syncthreads();
+    if (hist[threadIdx.x] != 0u) atomicAdd(&w.total_lo[threadIdx.x], hist[threadIdx.x]);
+}
+
+__global__ void __launch_bounds__(TOPK_THREADS)
+dspark_topk_collect_kernel(
+    const float* __restrict__ base,
+    int V_stride,
+    const int32_t* __restrict__ d_active_v,
+    DsparkTopkRowWs* __restrict__ ws) {
+    __shared__ int sh_bin, sh_above, warp_tot[TOPK_THREADS / 32];
+    __shared__ uint32_t warp_cnt[TOPK_THREADS / 32];
+    pdl_wait();
+    pdl_trigger();
+    const int V = d_active_v ? *d_active_v : V_stride;
+    const int s = blockIdx.x, row = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    DsparkTopkRowWs& w = ws[row];
+    dspark_select_bin(w.total_hi, DSPARK_CANDS, 0, &sh_bin, &sh_above, warp_tot);
+    uint32_t b1 = (uint32_t)sh_bin;
+    int above1 = sh_above;
+    __syncthreads();
+    dspark_select_bin(w.total_lo, DSPARK_CANDS, above1, &sh_bin, &sh_above, warp_tot);
+    const uint32_t T = (b1 << 8) | (uint32_t)sh_bin;
+
+    const float* x = base + (size_t)row * V_stride;
+    int b, e;
+    dspark_slice_range(V, s, b, e);
+    int n_above = 0, n_tie = 0;
+    for (int i0 = b; i0 < e; i0 += TOPK_THREADS) {
+        int i = i0 + threadIdx.x;
+        float v = 0.f;
+        uint32_t k = 0u;
+        if (i < e) {
+            v = x[i];
+            k = dspark_key16(v);
+        }
+        bool gt = (i < e && k > T);
+        bool tie = (i < e && k == T);
+        unsigned bg = __ballot_sync(0xffffffffu, gt);
+        unsigned bt = __ballot_sync(0xffffffffu, tie);
+        if (lane == 0) warp_cnt[warp] = uint32_t(__popc(bg)) | (uint32_t(__popc(bt)) << 16);
+        __syncthreads();
+        int rg = n_above + __popc(bg & ((1u << lane) - 1u));
+        int rt = n_tie + __popc(bt & ((1u << lane) - 1u));
+        #pragma unroll
+        for (int u = 0; u < TOPK_THREADS / 32; ++u) {
+            uint32_t c = warp_cnt[u];
+            if (u < warp) {
+                rg += int(c & 0xffffu);
+                rt += int(c >> 16);
+            }
+            n_above += int(c & 0xffffu);
+            n_tie += int(c >> 16);
+        }
+        if (gt && rg < DSPARK_CANDS) w.above[s][rg] = DsparkTopkItem{v, i};
+        if (tie && rt < DSPARK_CANDS) w.ties[s][rt] = DsparkTopkItem{v, i};
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        w.count_gt[s] = min(n_above, DSPARK_CANDS);
+        w.count_tie[s] = min(n_tie, DSPARK_CANDS);
+    }
+}
+
+__global__ void __launch_bounds__(DSPARK_CANDS)
+dspark_topk_gather_kernel(
+    DsparkTopkRowWs* __restrict__ ws,
+    const int32_t* __restrict__ draft_vocab_ids,
+    float* __restrict__ cand_val,
+    int32_t* __restrict__ cand_tok) {
+    __shared__ int pre_gt[TOPK_SLICES + 1], pre_tie[TOPK_SLICES + 1];
+    pdl_wait();
+    pdl_trigger();
+    const int tid = threadIdx.x;
+    DsparkTopkRowWs& w = ws[blockIdx.x];
+    if (tid < TOPK_SLICES) {
+        int cg = w.count_gt[tid], ct = w.count_tie[tid];
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            int ug = __shfl_up_sync(0xffffffffu, cg, o);
+            int ut = __shfl_up_sync(0xffffffffu, ct, o);
+            if (tid >= o) { cg += ug; ct += ut; }
+        }
+        pre_gt[tid + 1] = cg;
+        pre_tie[tid + 1] = ct;
+        if (tid == 0) { pre_gt[0] = 0; pre_tie[0] = 0; }
+    }
+    if (tid < 256) {
+        w.total_hi[tid] = 0u;
+        w.total_lo[tid] = 0u;
+    }
+    __syncthreads();
+    const int n_gt = pre_gt[TOPK_SLICES];
+    const bool above = (tid < n_gt);
+    const int* pre = above ? pre_gt : pre_tie;
+    const int j = above ? tid : (tid - n_gt);
+    int s = 0;
+    #pragma unroll
+    for (int step = TOPK_SLICES / 2; step > 0; step >>= 1) {
+        if (pre[s + step] <= j) s += step;
+    }
+    DsparkTopkItem it = above ? w.above[s][j - pre[s]] : w.ties[s][j - pre[s]];
+    size_t at = (size_t)blockIdx.x * DSPARK_CANDS + tid;
+    cand_val[at] = it.val;
+    cand_tok[at] = draft_vocab_ids ? draft_vocab_ids[it.idx] : it.idx;
+}
+
+// 128 blocks x 256 threads (1 warp per candidate, 1024 candidates total): exact BF16 fold_w[tok] + fold_b[tok] + softcap!
+__global__ void __launch_bounds__(256)
+markov_cand1024_logits_kernel(
+    const __nv_bfloat16* __restrict__ fold_w, // [VOCAB_UNPADDED, 256] BF16
+    const float* __restrict__ fold_b,         // [VOCAB_UNPADDED] F32
+    const float* __restrict__ cand_val,       // [1024]
+    const int32_t* __restrict__ cand_tok,     // [1024]
+    const float* __restrict__ raw_rnn,        // [768]
+    float* __restrict__ state,                // [256] updated by block 0
+    float* __restrict__ out_cand_logits) {    // [1024]
+    pdl_wait();
+    pdl_trigger();
     __shared__ float s_lf[256];
     int tid = threadIdx.x;
-    float lat_v = fast_tanh(raw_rnn[512 + tid]);
-    s_lf[tid] = lat_v;
-    s_lh[tid] = __float2half(lat_v);
+    s_lf[tid] = fast_tanh(ld_dep_f32(raw_rnn + 512 + tid));
     if (blockIdx.x == 0) {
-        float gate = fast_sigmoid(raw_rnn[tid]);
-        float cand = fast_tanh(raw_rnn[256 + tid]);
+        float gate = fast_sigmoid(ld_dep_f32(raw_rnn + tid));
+        float cand = fast_tanh(ld_dep_f32(raw_rnn + 256 + tid));
         state[tid] = gate * state[tid] + (1.0f - gate) * cand;
     }
     __syncthreads();
 
-    constexpr int TPR = (KIND == 2) ? 16 : 32;
-    constexpr int RPB = 256 / TPR; // 16 rows/block for NVFP4 (0% idle!), 8 for BF16
-    int r_in_blk = (TPR == 16) ? (tid >> 4) : (tid >> 5);
-    int lane = tid & (TPR - 1);
-    int gr = blockIdx.x * RPB + r_in_blk;
-    int tr = gridDim.x * RPB;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int k = blockIdx.x * 8 + warp; // 0..1023
+    int tok = cand_tok[k];
 
-    float bv = -1e30f;
-    int32_t bi = 0;
-    float cm = -1e30f;
-    float csum = 0.0f;
+    const uint4* wr = reinterpret_cast<const uint4*>(fold_w + (size_t)tok * MTP_MARKOV_RANK);
+    uint4 w8 = __ldg(wr + lane);
+    const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&w8);
+    float2 wf0 = __bfloat1622float2(wb[0]), wf1 = __bfloat1622float2(wb[1]);
+    float2 wf2 = __bfloat1622float2(wb[2]), wf3 = __bfloat1622float2(wb[3]);
+    const float4* xf = reinterpret_cast<const float4*>(s_lf + (lane << 3));
+    float4 x0 = xf[0], x1 = xf[1];
+    float acc = 0.0f;
+    acc = fmaf(wf0.x, x0.x, acc); acc = fmaf(wf0.y, x0.y, acc);
+    acc = fmaf(wf1.x, x0.z, acc); acc = fmaf(wf1.y, x0.w, acc);
+    acc = fmaf(wf2.x, x1.x, acc); acc = fmaf(wf2.y, x1.y, acc);
+    acc = fmaf(wf3.x, x1.z, acc); acc = fmaf(wf3.y, x1.w, acc);
+    acc = warp_sum(acc);
 
-    for (int row = gr; row < V; row += tr) {
-        float acc = 0.0f;
-        if constexpr (KIND == 2) {
-            // HALF-WARP: K = 256 -> 16 blocks of 16 -> 1 EXACT block per lane, 100% active!!
-            const uint2* wr = reinterpret_cast<const uint2*>(
-                static_cast<const uint8_t*>(fold_data) + (size_t)row * 128);
-            const uint8_t* sr = fold_scales + (size_t)row * 16;
-            uint2 w8 = __ldg(wr + lane);
-            float sc = cvt_e4m3_to_float(__ldg(sr + lane));
-            const __half2* xh = reinterpret_cast<const __half2*>(s_lh + (lane << 4));
-            acc = half_warp_sum(nvfp4_block16_dot(w8, xh) * sc) * fold_gscale;
-        } else {
-            // BF16: K = 256 -> 32 uint4 vectors (1 per lane!)
-            const uint4* wr = reinterpret_cast<const uint4*>(
-                static_cast<const __nv_bfloat16*>(fold_data) + (size_t)row * 256);
-            uint4 w8 = __ldg(wr + lane);
-            const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&w8);
-            float2 wf0 = __bfloat1622float2(wb[0]);
-            float2 wf1 = __bfloat1622float2(wb[1]);
-            float2 wf2 = __bfloat1622float2(wb[2]);
-            float2 wf3 = __bfloat1622float2(wb[3]);
-            const float4* xf = reinterpret_cast<const float4*>(s_lf + (lane << 3));
-            float4 x0 = xf[0], x1 = xf[1];
-            acc = fmaf(wf0.x, x0.x, acc); acc = fmaf(wf0.y, x0.y, acc);
-            acc = fmaf(wf1.x, x0.z, acc); acc = fmaf(wf1.y, x0.w, acc);
-            acc = fmaf(wf2.x, x1.x, acc); acc = fmaf(wf2.y, x1.y, acc);
-            acc = fmaf(wf3.x, x1.z, acc); acc = fmaf(wf3.y, x1.w, acc);
-            acc = warp_sum(acc);
-        }
-        if (lane == 0) {
-            float total = base_logits[row] + (fold_b ? fold_b[row] : 0.0f) + acc;
-            if (total > bv) { bv = total; bi = row; }
-            float cap = fast_tanh(total * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
-            if (write_logits) out_step_probs[row] = cap;
-            if (cap > cm) {
-                csum = (csum > 0.0f) ? (csum * __expf(cm - cap) + 1.0f) : 1.0f;
-                cm = cap;
-            } else {
-                csum += __expf(cap - cm);
-            }
-        }
-    }
-
-    __shared__ float sv[RPB], scm[RPB], scs[RPB];
-    __shared__ int32_t si[RPB];
-    if (lane == 0) { sv[r_in_blk] = bv; si[r_in_blk] = bi; scm[r_in_blk] = cm; scs[r_in_blk] = csum; }
-    __syncthreads();
-    if (tid == 0) {
-        bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
-        for (int w = 1; w < RPB; ++w) {
-            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-            if (scs[w] > 0.0f) {
-                float nm = fmaxf(cm, scm[w]);
-                csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
-                cm = nm;
-            }
-        }
-        blk_val[blockIdx.x] = bv;
-        blk_idx[blockIdx.x] = bi;
-        blk_cm[blockIdx.x] = cm;
-        blk_csum[blockIdx.x] = csum;
+    if (lane == 0) {
+        float total = cand_val[k] + __ldg(fold_b + tok) + acc;
+        out_cand_logits[k] = fast_tanh(total * (1.0f / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
     }
 }
 
-__global__ void markov_fold_argmax_stage2_kernel(
-    const float* __restrict__ blk_val,
-    const int32_t* __restrict__ blk_idx,
-    const float* __restrict__ blk_cm,
-    const float* __restrict__ blk_csum,
-    const int32_t* __restrict__ draft_vocab_ids, // optional remap to real vocab ID
+// 1 block x 1024 threads (1 thread per candidate): greedy or exact top-p/top-k Gumbel-Max + sparse full-vocab draft probs!
+__global__ void __launch_bounds__(DSPARK_CANDS)
+markov_cand1024_pick_kernel(
+    const float* __restrict__ cand_logits,    // [1024]
+    const int32_t* __restrict__ cand_tok,     // [1024]
+    int32_t* __restrict__ prev_cand_tok,      // [1024] (for O(1024) sparse zeroing of out_step_probs!)
     int32_t* __restrict__ out_tok,
     float* __restrict__ out_conf,
-    float* __restrict__ out_step_probs,
+    float* __restrict__ out_step_probs,       // optional [VOCAB_UNPADDED] sparse full-vocab q(v)
     float* __restrict__ out_q_sel,
     int32_t* __restrict__ d_draft_is_delta,
     const SampleConfig* __restrict__ sample_cfg,
     const int32_t* __restrict__ d_pos,
-    int step_idx,
-    int V) {
-    int tid = threadIdx.x;
-    float bv = -1e30f;
-    int32_t bi = 0;
-    float cm = -1e30f;
-    float csum = 0.0f;
-    for (int i = tid; i < MARKOV_BLOCKS; i += 256) {
-        float v = blk_val[i];
-        int32_t idx = blk_idx[i];
-        if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
-        float bcm = blk_cm[i], bcs = blk_csum[i];
-        if (bcs > 0.0f) {
-            float nm = fmaxf(cm, bcm);
-            csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + bcs * __expf(bcm - nm);
-            cm = nm;
-        }
-    }
+    int step_idx) {
+    pdl_wait();
+    pdl_trigger();
+    const int tid = threadIdx.x; // 0..1023
+    const int warp = tid >> 5;   // 0..31
+    const int lane = tid & 31;
+
+    const float l = ld_dep_f32(cand_logits + tid);
+    const int32_t tok = cand_tok[tid];
+
+    // 1. Greedy argmax + max_cap
+    float bv = l;
+    int32_t bi = tok;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         float ov = __shfl_xor_sync(0xffffffffu, bv, off);
         int32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
         if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        float om = __shfl_xor_sync(0xffffffffu, cm, off);
-        float os = __shfl_xor_sync(0xffffffffu, csum, off);
-        if (os > 0.0f) {
-            float nm = fmaxf(cm, om);
-            csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + os * __expf(om - nm);
-            cm = nm;
-        }
     }
-    __shared__ float sv[8], scm[8], scs[8];
-    __shared__ int32_t si[8];
-    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; scm[tid >> 5] = cm; scs[tid >> 5] = csum; }
+    __shared__ float sv[32];
+    __shared__ int32_t si[32];
+    __shared__ float sq[32];
+    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+    __syncthreads();
+
+    __shared__ float s_max_cap;
+    __shared__ int32_t s_greedy_tok;
+    if (warp == 0) {
+        float mv = sv[lane];
+        int32_t mi = si[lane];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, mv, off);
+            int32_t oi = __shfl_xor_sync(0xffffffffu, mi, off);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        if (lane == 0) { s_max_cap = mv; s_greedy_tok = mi; }
+    }
+    __syncthreads();
+
+    // 2. Confidence = 1 / sum(exp(l - max_cap))
+    const float max_cap = s_max_cap;
+    float e_conf = warp_sum(__expf(l - max_cap));
+    if (lane == 0) sv[warp] = e_conf;
+    __syncthreads();
+    __shared__ float s_conf;
+    if (warp == 0) {
+        float tot = warp_sum(sv[lane]);
+        if (lane == 0) s_conf = (tot > 0.0f) ? (1.0f / tot) : 0.0f;
+    }
     __syncthreads();
 
     const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && out_step_probs != nullptr);
     if (!do_sample) {
         if (tid == 0) {
-            bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
-            for (int w = 1; w < 8; ++w) {
-                if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-                if (scs[w] > 0.0f) {
-                    float nm = fmaxf(cm, scm[w]);
-                    csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
-                    cm = nm;
-                }
-            }
-            *out_tok = draft_vocab_ids ? draft_vocab_ids[bi] : bi;
-            if (out_conf) *out_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+            *out_tok = s_greedy_tok;
+            if (out_conf) *out_conf = s_conf;
             if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
         }
         return;
     }
 
-    __shared__ float s_max_cap;
-    __shared__ float s_conf;
-    __shared__ int32_t s_greedy;
-    __shared__ unsigned long long hist_sum[256];
-    __shared__ uint32_t hist_cnt[256];
-    __shared__ float s_tau;
-    __shared__ float s_inv_z;
-    __shared__ int32_t s_picked;
-
-    if (tid == 0) {
-        bv = sv[0]; bi = si[0]; cm = scm[0]; csum = scs[0];
-        for (int w = 1; w < 8; ++w) {
-            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-            if (scs[w] > 0.0f) {
-                float nm = fmaxf(cm, scm[w]);
-                csum = (csum > 0.0f ? csum * __expf(cm - nm) : 0.0f) + scs[w] * __expf(scm[w] - nm);
-                cm = nm;
-            }
-        }
-        s_max_cap = cm;
-        s_greedy = bi;
-        s_conf = (csum > 0.0f) ? (1.0f / csum) : 0.0f;
+    // Sparse zero previous call's 1,024 entries in out_step_probs[VOCAB_UNPADDED]!
+    {
+        int32_t old_t = prev_cand_tok[tid];
+        if (old_t >= 0 && old_t < VOCAB_UNPADDED) out_step_probs[old_t] = 0.0f;
     }
     __syncthreads();
 
     const int32_t top_k = sample_cfg->top_k;
     if (top_k == 1) {
-        for (int row = tid; row < V; row += 256) out_step_probs[row] = (row == s_greedy) ? 1.0f : 0.0f;
-        __syncthreads();
+        prev_cand_tok[tid] = tok;
         if (tid == 0) {
-            int32_t pk = s_greedy;
-            *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
+            int32_t gt = s_greedy_tok;
+            out_step_probs[gt] = 1.0f;
+            *out_tok = gt;
             if (out_q_sel) *out_q_sel = 1.0f;
             if (out_conf) *out_conf = s_conf;
             if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
@@ -854,7 +1220,6 @@ __global__ void markov_fold_argmax_stage2_kernel(
         return;
     }
 
-    const float max_cap = s_max_cap;
     const float inv_temp = sample_cfg->inv_temp;
     const float top_p = sample_cfg->top_p;
     const uint64_t draft_seed = sample_cfg->seed ^ 0xD5A2C1B39E3779B9ULL;
@@ -862,21 +1227,22 @@ __global__ void markov_fold_argmax_stage2_kernel(
 
     constexpr float HIST_RANGE = 20.0f;
     constexpr float HIST_SCALE = 256.0f / HIST_RANGE;
+    __shared__ unsigned long long hist_sum[256];
+    __shared__ uint32_t hist_cnt[256];
+    __shared__ float s_tau;
+    __shared__ float s_inv_z;
 
     if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
-        hist_sum[tid] = 0ULL;
-        hist_cnt[tid] = 0u;
+        if (tid < 256) { hist_sum[tid] = 0ULL; hist_cnt[tid] = 0u; }
         __syncthreads();
-        for (int row = tid; row < V; row += 256) {
-            float d = (max_cap - out_step_probs[row]) * inv_temp;
-            if (d < HIST_RANGE) {
-                int bin = (int)(d * HIST_SCALE);
-                if (bin < 0) bin = 0;
-                else if (bin > 255) bin = 255;
-                unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
-                atomicAdd(&hist_sum[bin], fp);
-                atomicAdd(&hist_cnt[bin], 1u);
-            }
+        float d = (max_cap - l) * inv_temp;
+        if (d < HIST_RANGE) {
+            int bin = (int)(d * HIST_SCALE);
+            if (bin < 0) bin = 0;
+            else if (bin > 255) bin = 255;
+            unsigned long long fp = (unsigned long long)(__expf(-d) * 16777216.0f + 0.5f);
+            atomicAdd(&hist_sum[bin], fp);
+            atomicAdd(&hist_cnt[bin], 1u);
         }
         __syncthreads();
         if (tid == 0) {
@@ -902,53 +1268,50 @@ __global__ void markov_fold_argmax_stage2_kernel(
     }
 
     const float tau = s_tau;
-    float local_z = 0.0f;
-    float best_s = -1e30f;
-    int32_t best_t = s_greedy;
-    for (int row = tid; row < V; row += 256) {
-        float l = out_step_probs[row];
-        if (l >= tau) {
-            float e = __expf((l - max_cap) * inv_temp);
-            out_step_probs[row] = e;
-            local_z += e;
-            float sc = (l - max_cap) * inv_temp + hash_gumbel(draft_seed, pos, row);
-            if (sc > best_s) { best_s = sc; best_t = row; }
-        } else {
-            out_step_probs[row] = 0.0f;
-        }
+    const bool kept = (l >= tau);
+    const float e = kept ? __expf((l - max_cap) * inv_temp) : 0.0f;
+    float wz = warp_sum(e);
+    if (lane == 0) sv[warp] = wz;
+    __syncthreads();
+    if (warp == 0) {
+        float tot_z = warp_sum(sv[lane]);
+        if (lane == 0) s_inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
     }
-    local_z = warp_sum(local_z);
+    __syncthreads();
+
+    const float q = e * s_inv_z;
+    out_step_probs[tok] = q;
+    prev_cand_tok[tid] = tok;
+
+    float best_s = kept ? ((l - max_cap) * inv_temp + hash_gumbel(draft_seed, pos, tok)) : -1e30f;
+    int32_t best_t = tok;
+    float best_q = q;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         float os = __shfl_xor_sync(0xffffffffu, best_s, off);
         int32_t ot = __shfl_xor_sync(0xffffffffu, best_t, off);
-        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; }
+        float oq = __shfl_xor_sync(0xffffffffu, best_q, off);
+        if (os > best_s || (os == best_s && ot < best_t)) { best_s = os; best_t = ot; best_q = oq; }
     }
-    if ((tid & 31) == 0) { scs[tid >> 5] = local_z; sv[tid >> 5] = best_s; si[tid >> 5] = best_t; }
+    if (lane == 0) { sv[warp] = best_s; si[warp] = best_t; sq[warp] = best_q; }
     __syncthreads();
-    if (tid == 0) {
-        float tot_z = 0.0f;
-        best_s = sv[0]; best_t = si[0];
-        for (int w = 0; w < 8; ++w) {
-            tot_z += scs[w];
-            if (sv[w] > best_s || (sv[w] == best_s && si[w] < best_t)) { best_s = sv[w]; best_t = si[w]; }
+    if (warp == 0) {
+        float ms = sv[lane];
+        int32_t mt = si[lane];
+        float mq = sq[lane];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float os = __shfl_xor_sync(0xffffffffu, ms, off);
+            int32_t ot = __shfl_xor_sync(0xffffffffu, mt, off);
+            float oq = __shfl_xor_sync(0xffffffffu, mq, off);
+            if (os > ms || (os == ms && ot < mt)) { ms = os; mt = ot; mq = oq; }
         }
-        s_inv_z = (tot_z > 0.0f) ? (1.0f / tot_z) : 0.0f;
-        s_picked = best_t;
-    }
-    __syncthreads();
-
-    const float inv_z = s_inv_z;
-    for (int row = tid; row < V; row += 256) {
-        out_step_probs[row] *= inv_z;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        int32_t pk = s_picked;
-        *out_tok = draft_vocab_ids ? draft_vocab_ids[pk] : pk;
-        if (out_q_sel) *out_q_sel = out_step_probs[pk];
-        if (out_conf) *out_conf = s_conf;
-        if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        if (lane == 0) {
+            *out_tok = mt;
+            if (out_q_sel) *out_q_sel = mq;
+            if (out_conf) *out_conf = s_conf;
+            if (step_idx == 0 && d_draft_is_delta) *d_draft_is_delta = 0;
+        }
     }
 }
 
@@ -1021,6 +1384,39 @@ void launch_dspark_commit(
     }
 }
 
+void launch_dspark_gather_shortlist(
+    const LinearWeight& unembed,
+    LinearWeight& unembed_draft,
+    int32_t* draft_vocab_ids,
+    int32_t* d_draft_vocab_size,
+    const int32_t* d_new_ids,
+    int dst_offset,
+    int count,
+    cudaStream_t stream) {
+    if (count <= 0) {
+        if (d_draft_vocab_size) {
+            dspark_set_vocab_size_kernel<<<1, 1, 0, stream>>>(d_draft_vocab_size, dst_offset);
+        }
+        return;
+    }
+    if (unembed.kind == WeightKind::FP8) {
+        dspark_gather_shortlist_kernel<1><<<count, 256, 0, stream>>>(
+            unembed.data, nullptr, unembed.row_scales,
+            unembed_draft.data, nullptr, unembed_draft.row_scales,
+            draft_vocab_ids, d_draft_vocab_size, d_new_ids, dst_offset, count);
+    } else if (unembed.kind == WeightKind::NVFP4) {
+        dspark_gather_shortlist_kernel<2><<<count, 256, 0, stream>>>(
+            unembed.data, unembed.scales, nullptr,
+            unembed_draft.data, unembed_draft.scales, nullptr,
+            draft_vocab_ids, d_draft_vocab_size, d_new_ids, dst_offset, count);
+    } else {
+        dspark_gather_shortlist_kernel<0><<<count, 256, 0, stream>>>(
+            unembed.data, nullptr, nullptr,
+            unembed_draft.data, nullptr, nullptr,
+            draft_vocab_ids, d_draft_vocab_size, d_new_ids, dst_offset, count);
+    }
+}
+
 void launch_dspark_draft(
     const ModelWeights& mw, const int32_t* d_anchor_token, const int32_t* d_pos, int num_drafts,
     void* ctx_k[MTP_LAYERS], void* ctx_v[MTP_LAYERS],
@@ -1030,27 +1426,31 @@ void launch_dspark_draft(
     const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
     int32_t* out_draft_is_delta, cudaStream_t stream) {
     const DsparkWeights& dw = mw.dspark;
+    const int V_stride = (dw.draft_vocab_cap > 0) ? dw.draft_vocab_cap : dw.draft_vocab_size;
 
-    // Partition preallocated DSpark workspace (in floats):
-    float* block_x     = ws;
-    float* normed      = block_x + MTP_BLOCK_SIZE * HIDDEN;
-    __half* normed_h   = reinterpret_cast<__half*>(normed + MTP_BLOCK_SIZE * HIDDEN);
-    float* qkv         = reinterpret_cast<float*>(normed_h + MTP_BLOCK_SIZE * HIDDEN);
-    float* attn_out    = qkv + MTP_BLOCK_SIZE * (Q_DIM + 2 * KV_DIM);
-    __half* attn_out_h = reinterpret_cast<__half*>(attn_out + MTP_BLOCK_SIZE * Q_DIM);
-    float* gu          = reinterpret_cast<float*>(attn_out_h + MTP_BLOCK_SIZE * Q_DIM);
-    float* swiglu      = gu + MTP_BLOCK_SIZE * (2 * MTP_INTERMEDIATE);
-    __half* swiglu_h   = reinterpret_cast<__half*>(swiglu + MTP_BLOCK_SIZE * MTP_INTERMEDIATE);
-    float* f_prev      = reinterpret_cast<float*>(swiglu_h + MTP_BLOCK_SIZE * MTP_INTERMEDIATE);
-    float* c_f         = f_prev + HIDDEN;
-    float* c_h         = c_f + 3 * MTP_MARKOV_RANK;
-    float* state       = c_h + MTP_MAX_DRAFTS * (3 * MTP_MARKOV_RANK);
-    float* raw_rnn     = state + MTP_MARKOV_RANK;
-    float* blk_val     = raw_rnn + 3 * MTP_MARKOV_RANK;
-    int32_t* blk_idx   = reinterpret_cast<int32_t*>(blk_val + MARKOV_BLOCKS);
-    float* blk_cm      = reinterpret_cast<float*>(blk_idx + MARKOV_BLOCKS);
-    float* blk_csum    = blk_cm + MARKOV_BLOCKS;
-    float* base_logits = blk_csum + MARKOV_BLOCKS;
+    // Partition preallocated DSpark workspace (in floats; ds_ws = 3,200,000 floats, zeroed at init/reset!):
+    float* block_x      = ws;
+    float* normed       = block_x + MTP_BLOCK_SIZE * HIDDEN;
+    __half* normed_h    = reinterpret_cast<__half*>(normed + MTP_BLOCK_SIZE * HIDDEN);
+    float* qkv          = reinterpret_cast<float*>(normed_h + MTP_BLOCK_SIZE * HIDDEN);
+    float* attn_out     = qkv + MTP_BLOCK_SIZE * (Q_DIM + 2 * KV_DIM);
+    __half* attn_out_h  = reinterpret_cast<__half*>(attn_out + MTP_BLOCK_SIZE * Q_DIM);
+    float* gu           = reinterpret_cast<float*>(attn_out_h + MTP_BLOCK_SIZE * Q_DIM);
+    float* swiglu       = gu + MTP_BLOCK_SIZE * (2 * MTP_INTERMEDIATE);
+    __half* swiglu_h    = reinterpret_cast<__half*>(swiglu + MTP_BLOCK_SIZE * MTP_INTERMEDIATE);
+    float* f_prev       = reinterpret_cast<float*>(swiglu_h + MTP_BLOCK_SIZE * MTP_INTERMEDIATE);
+    float* c_f          = f_prev + HIDDEN;
+    float* c_h          = c_f + 3 * MTP_MARKOV_RANK;
+    float* state        = c_h + MTP_MAX_DRAFTS * (3 * MTP_MARKOV_RANK);
+    float* raw_rnn      = state + MTP_MARKOV_RANK;
+    float* cand_val     = raw_rnn + 3 * MTP_MARKOV_RANK;
+    int32_t* cand_tok   = reinterpret_cast<int32_t*>(cand_val + MTP_MAX_DRAFTS * DSPARK_CANDS);
+    float* cand_logits  = reinterpret_cast<float*>(cand_tok + MTP_MAX_DRAFTS * DSPARK_CANDS);
+    int32_t* prev_ctok  = reinterpret_cast<int32_t*>(cand_logits + MTP_MAX_DRAFTS * DSPARK_CANDS);
+    // Align topk_ws up to 16 bytes
+    uintptr_t topk_addr = (reinterpret_cast<uintptr_t>(prev_ctok + MTP_MAX_DRAFTS * DSPARK_CANDS) + 15u) & ~uintptr_t(15u);
+    DsparkTopkRowWs* topk_ws = reinterpret_cast<DsparkTopkRowWs*>(topk_addr);
+    float* base_logits  = reinterpret_cast<float*>(topk_ws + MTP_MAX_DRAFTS);
 
     bool use_half = (dw.layers[0].w_qkv.kind != WeightKind::BF16);
 
@@ -1058,7 +1458,7 @@ void launch_dspark_draft(
     dspark_init_block_kernel<<<MTP_BLOCK_SIZE, 256, 0, stream>>>(
         mw.embed, mw.embed_norm, dw.mask_embed, d_anchor_token, block_x);
 
-    // 2. Run 3 dense DSpark layers over all 8 rows (ZERO inner-loop F32->F16 conversions!)
+    // 2. Run 3 dense DSpark layers over all 8 rows
     for (int l = 0; l < MTP_LAYERS; ++l) {
         const DsparkLayerWeights& dl = dw.layers[l];
         if (use_half) {
@@ -1105,63 +1505,78 @@ void launch_dspark_draft(
         }
     }
 
-    // 3. Final norm on rows 1..num_drafts -> normed (F32 for rnn_w_h) + normed_h (F16 for unembed_draft!)
+    // 3. Final norm on rows 1..num_drafts -> normed (F32 for rnn_w_h) + normed_h (F16 for unembed_draft)
     dspark_rmsnorm_h_kernel<<<num_drafts, 256, 0, stream>>>(block_x + HIDDEN, dw.norm_w, normed, normed_h);
 
-    // 4. Precompute Markov inputs + zero RNN state in ONE kernel (no cudaMemsetAsync!)
+    // 4. Precompute Markov inputs + zero RNN state
     copy_f_prev_zero_state_kernel<<<(HIDDEN + 255) / 256, 256, 0, stream>>>(f_ring, d_pos, f_prev, state);
     launch_bf16_linear(dw.rnn_w_f, f_prev, c_f, 1, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
     launch_bf16_linear(dw.rnn_w_h, normed, c_h, num_drafts, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
 
-    // 5. Precompute base_logits[0..num_drafts-1, 0..Vd-1] (+ fold_b inline for NVFP4!)
-    int Vd = dw.draft_vocab_size;
-    bool fold_b_in_base = false;
+    // 5. Precompute base_logits[0..num_drafts-1, 0..active_V-1] (stride = V_stride)
     if (dw.unembed_draft.kind == WeightKind::NVFP4) {
-        fold_b_in_base = true;
         const auto* wd = static_cast<const uint8_t*>(dw.unembed_draft.data);
         const auto* ws_sc = dw.unembed_draft.scales;
         float gs = dw.unembed_draft.global_scale;
         switch (num_drafts) {
-            case 1: dspark_base_logits_nvfp4_kernel<1><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd); break;
-            case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
-            case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, dw.fold_b, base_logits, Vd, 0u); break;
+            case 1: dspark_base_logits_nvfp4_kernel<1><<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size); break;
+            case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
         }
-    } else if (dw.unembed_draft.kind != WeightKind::BF16) {
-        launch_linear_h(dw.unembed_draft, normed_h, base_logits, num_drafts, false, stream);
+    } else if (dw.unembed_draft.kind == WeightKind::FP8) {
+        const auto* wd = static_cast<const uint8_t*>(dw.unembed_draft.data);
+        const float* rs = dw.unembed_draft.row_scales;
+        switch (num_drafts) {
+            case 1: dspark_base_logits_fp8_b1_kernel<<<DSPARK_UNEMBED_BLOCKS, 256, 0, stream>>>(wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size); break;
+            case 2: launch_pdl(dspark_base_logits_fp8_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 3: launch_pdl(dspark_base_logits_fp8_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 4: launch_pdl(dspark_base_logits_fp8_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 5: launch_pdl(dspark_base_logits_fp8_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 6: launch_pdl(dspark_base_logits_fp8_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+            case 7: launch_pdl(dspark_base_logits_fp8_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, rs, normed_h, base_logits, V_stride, dw.d_draft_vocab_size, 0u); break;
+        }
     } else {
         launch_linear(dw.unembed_draft, normed, base_logits, num_drafts, false, stream);
     }
 
-    // 6. Run num_drafts sequential Markov steps (24-block coalesced RNN + half-warp fused argmax + exact confidence!)
-    const float* fb_arg = fold_b_in_base ? nullptr : dw.fold_b;
+    // 6. Parallel Top-K 1024 radix select across all num_drafts rows!
+    launch_pdl(dspark_topk_hist_hi_kernel, dim3(TOPK_SLICES, num_drafts), TOPK_THREADS, stream,
+        base_logits, V_stride, dw.d_draft_vocab_size, topk_ws);
+    launch_pdl(dspark_topk_hist_lo_kernel, dim3(TOPK_SLICES, num_drafts), TOPK_THREADS, stream,
+        base_logits, V_stride, dw.d_draft_vocab_size, topk_ws);
+    launch_pdl(dspark_topk_collect_kernel, dim3(TOPK_SLICES, num_drafts), TOPK_THREADS, stream,
+        base_logits, V_stride, dw.d_draft_vocab_size, topk_ws);
+    launch_pdl(dspark_topk_gather_kernel, dim3(num_drafts), DSPARK_CANDS, stream,
+        topk_ws, dw.draft_vocab_ids, cand_val, cand_tok);
+
+    // 7. Run num_drafts sequential Markov steps over ONLY 1,024 exact BF16 fold_w candidates!
+    const __nv_bfloat16* fold_w_bf16 = static_cast<const __nv_bfloat16*>(dw.fold_w.data);
     for (int i = 0; i < num_drafts; ++i) {
         const int32_t* prev_ptr = (i == 0) ? d_anchor_token : (out_draft_tokens + i - 1);
-        markov_rnn_proj_kernel<<<24, 128, 0, stream>>>(
+        launch_pdl(markov_rnn_proj_kernel, dim3(24), 128, stream,
             dw.rnn_w_sp, dw.rnn_bias, dw.markov_w1,
             c_h + i * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state, raw_rnn);
 
-        const float* bl_i = base_logits + (size_t)i * Vd;
-        float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * Vd) : nullptr;
-        if (dw.fold_w.kind == WeightKind::NVFP4) {
-            markov_fold_argmax_stage1_kernel<2><<<MARKOV_BLOCKS, 256, 0, stream>>>(
-                dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
-                dp_i, sample_cfg, Vd);
-        } else {
-            markov_fold_argmax_stage1_kernel<0><<<MARKOV_BLOCKS, 256, 0, stream>>>(
-                dw.fold_w.data, nullptr, 1.0f,
-                bl_i, fb_arg, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
-                dp_i, sample_cfg, Vd);
-        }
-        markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
-            blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
-            out_draft_tokens + i, out_draft_conf ? (out_draft_conf + i) : nullptr,
-            dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
-            sample_cfg, d_pos, i, Vd);
+        const float* cv_i = cand_val + (size_t)i * DSPARK_CANDS;
+        const int32_t* ct_i = cand_tok + (size_t)i * DSPARK_CANDS;
+        float* cl_i = cand_logits + (size_t)i * DSPARK_CANDS;
+        int32_t* pc_i = prev_ctok + (size_t)i * DSPARK_CANDS;
+        float* dp_i = out_draft_probs ? (out_draft_probs + (size_t)i * VOCAB_UNPADDED) : nullptr;
+
+        launch_pdl(markov_cand1024_logits_kernel, dim3(128), 256, stream,
+            fold_w_bf16, dw.fold_b, cv_i, ct_i, raw_rnn, state, cl_i);
+        launch_pdl(markov_cand1024_pick_kernel, dim3(1), DSPARK_CANDS, stream,
+            cl_i, ct_i, pc_i,
+            out_draft_tokens + i,
+            out_draft_conf ? (out_draft_conf + i) : nullptr,
+            dp_i,
+            out_draft_q_sel ? (out_draft_q_sel + i) : nullptr,
+            out_draft_is_delta,
+            sample_cfg, d_pos, i);
     }
 }
 

@@ -254,6 +254,26 @@ $$h' = h_3 + \omega\,(h_3 - h_b), \qquad b \in \{1, 2\}$$
 
 ---
 
+## 5.6 Lever 17: Blackwell Cluster Controllers/Router, 16-Col `U=3` FP8 MMA, Top-K `1024` Radix Markov, & Fused Prefill
+
+Inspired by head-to-head profiling against [`ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0) while preserving **100% CUDA 13.1 compatibility**, **zero accuracy loss**, and **zero-spill 512K–1M VRAM budgets**, we incorporated 4 verified optimization phases:
+
+1. **128-CTA Multi-Block Stochastic LM-Head Sampler + 64-Bit Gumbel (`cuda/kernels_gemv.cu`, `cuda/kernels_common.cuh`):**
+   - Replaced the single-CTA `lm_head_stage2_argmax_kernel` sampling tail (which serialized 200K logit scans on 1 SM at `T > 0`) with 4 PDL-overlapped 128-CTA kernels (`hist` → `tau_z_gumbel` → `verify_resid` → `finish`) and upgraded `hash_gumbel` to 64-bit precision (`__clzll` + `-log1pf(-v)`).
+   - Cut `T=1.0` sampling overhead across all modes (`exact/bf16` `T=1.0` Code `+54%`, Copy `+89%`; `fp8/q4` `T=1.0` Copy `+105%`).
+2. **1-Launch 16-CTA Cluster DSMEM/`mbarrier` BF16 Controller & Router (`cuda/kernels_inkling.cu`):**
+   - Replaced 192 un-PDL'd controller launches/step and 96 router launches/step with single-launch 16-CTA cluster kernels (`controller_cluster_bf16_kernel<1..8>`, `router_cluster_bf16_kernel<1..8>`) using `mapa.shared::cluster` + `st.async.weak.shared::cluster.mbarrier::complete_tx::bytes`, weight prefetch before `pdl_wait_fenced(0u)`, and exact FP32 activations / BF16 weights.
+   - Combined with Phase 1, lifted `fp8/fp8` decode `+23%` at `B=1` (`189.8 → 234.2 tok/s`) and `+28–31%` at adaptive `mtp=7`.
+3. **Spill-Free 16-Col `U=3` FP8 MMA + FP8 DSpark + Top-K `1024` Radix Markov + Dynamic Context Shortlist (`cuda/kernels_gemv.cu`, `cuda/kernels_dspark.cu`, `src/weights.zig`, `src/engine.zig`):**
+   - **CUDA 13.1 & register-pressure lesson:** System CUDA 13.1 `ptxas` does not support `cvt.rn.bf16x2.e4m3x2`, so FP8 MMA uses lossless `cvt.rn.f16x2.e4m3x2` + `mma_m16n8k16_f32_f16`. Using 32-col chunks × `U=3` spilled registers (`B=8` regressed `244 → 233 tok/s`); switching to 16-col (`1 uint4`) × `U=3` eliminated all spills (~48 regs) and jumped `fp8/fp8` `B=2` (`275 → 313 tok/s`), `B=4` (`298 → 330 tok/s`), and `B=8` (`244 → 265 tok/s`).
+   - Replaced the full-49K Markov scan with a 4-stage multi-CTA radix `Top-K 1024` selector + 1024-candidate exact full-vocab BF16 `fold_w` Markov head + sparse O(1024) rejection-sampling probability writeback, backed by an FP8 DSpark drafter and a `4,096`-row dynamic context shortlist populated on-the-fly from prompt & generated tokens.
+4. **Fused 2D-Parallel Prefill SConv + Batched `dspark_commit` + Single-Shot Short-Prompt Prefill (`cuda/kernels_prefill.cu`, `src/engine.zig`):**
+   - Fused static (local) and dynamic (global) 4-tap K/V sconv directly into the 2D-parallel `prep_store` kernels (eliminating 4–8 SM serial loops: `attn_sub 66.7 → 32.2 ms`), batched `dspark_commit` into 7 cuBLAS/store launches instead of 1,792 micro-launches (`commit 17.1 → 0.85 ms`, **20×**), vectorized FP8/BF16 dequant (`dense_tc 49.9 → 42.7 ms`), bumped `prefill_local_attn_sub` `256 → 512`, and fused `compute_last_lm` directly into `prefill_chunk_batched` for arbitrary `chunk_len >= 16`.
+   - Cold 18.9K prefill jumped `7,911 → 9,677 tok/s` (`fp8/q4`, `9,800` with LoopCD) and `7,808 → 8,933 tok/s` (`fp8/fp8`); 41-tok TTFT dropped `-28.5%` (`36.3 → 25.9 ms`).
+- **Zero Accuracy Loss Verified:** `exact/bf16` greedy `mtp=0 == mtp=7` parity passes on both 41-tok and 1,146-tok prompts; 7,784-tok raw KLD improved across all modes (`fp8/fp8`: `0.0061 → 0.0056`, `top1=97.47%`; `fp8/q4`: `0.0096 → 0.0093`, `ΔPPL=+0.0015`; `nvfp4/q4`: `0.0263`); and `fp8/q4` scored **`29/30 (96.7%)`** on both `effort=low` and `effort=none` in the live 30-task H2H suite.
+
+---
+
 ## 6. Repository Map
 
 ```text

@@ -74,6 +74,8 @@ pub const CDsparkWeights = extern struct {
     hidden_out_w: ?*anyopaque = null,
     hidden_out_b: ?*anyopaque = null,
     draft_vocab_size: i32 = 0,
+    draft_vocab_cap: i32 = 0,
+    d_draft_vocab_size: ?[*]i32 = null,
     draft_vocab_ids: ?[*]i32 = null,
     inv_draft_vocab_ids: ?[*]i32 = null,
     unembed_draft: CLinearWeight = .{},
@@ -540,6 +542,17 @@ pub extern "c" fn squid_adaptive_graph_instantiate(graph: ?*anyopaque) i32;
 pub extern "c" fn squid_adaptive_graph_launch(graph: ?*anyopaque, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_adaptive_graph_destroy(graph: ?*anyopaque) i32;
 
+pub extern "c" fn squid_launch_dspark_gather_shortlist(
+    unembed: *const CLinearWeight,
+    unembed_draft: *const CLinearWeight,
+    draft_vocab_ids: [*]i32,
+    d_draft_vocab_size: ?*i32,
+    d_new_ids: ?[*]const i32,
+    dst_offset: i32,
+    count: i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_spec_verify(
     target_preds: [*]const i32,
     draft_tokens: [*]const i32,
@@ -734,5 +747,25 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     sorted_w: [*]const f32,
     out_slots: [*]f32,
     batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_dspark_commit(
+    dw_in: *const CDsparkWeights,
+    taps: [*]const f32,
+    ctx_k: [*]const ?*anyopaque,
+    ctx_v: [*]const ?*anyopaque,
+    ctx_ks: [*]const ?*anyopaque,
+    ctx_vs: [*]const ?*anyopaque,
+    ctx_cap: [*]const i32,
+    global_kv_fmt: u8,
+    f_ring: [*]f32,
+    mix_h0: *anyopaque,
+    mix_h1: *anyopaque,
+    mix_h2: *anyopaque,
+    scratch_kv: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    d_pos: *const i32,
     stream: ?*anyopaque,
 ) void;

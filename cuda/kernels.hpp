@@ -470,6 +470,17 @@ void launch_dspark_draft(
     int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
     cudaStream_t stream);
 
+// Dynamically gather rows from main unembed into unembed_draft shortlist (FP8 / NVFP4 / BF16)
+void launch_dspark_gather_shortlist(
+    const LinearWeight& unembed,
+    LinearWeight& unembed_draft,
+    int32_t* draft_vocab_ids,
+    int32_t* d_draft_vocab_size,
+    const int32_t* d_new_ids,
+    int dst_offset,
+    int count,
+    cudaStream_t stream);
+
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
 // computes n_accepted (1..B) and next anchor token, updates d_pos += n_accepted!
 void launch_spec_verify(
@@ -629,6 +640,25 @@ void launch_prefill_moe_down_h(
     const float* sorted_w,
     float* out_slots,
     int B,
+    cudaStream_t stream);
+
+void launch_prefill_dspark_commit(
+    const DsparkWeights& dw,
+    const float* taps,
+    void* ctx_k[MTP_LAYERS],
+    void* ctx_v[MTP_LAYERS],
+    __half* ctx_ks[MTP_LAYERS],
+    __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* f_ring,
+    __half* mix_h0,
+    __half* mix_h1,
+    __half* mix_h2,
+    float* scratch_kv,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
     cudaStream_t stream);
 
 } // namespace squid
