@@ -101,25 +101,11 @@ struct Nvfp4Chunk32 {
     uint16_t s;
 };
 
-struct Mxfp8Chunk32 {
-    uint4 q0, q1;
-    uint8_t s;
-};
-
 __device__ __forceinline__ Nvfp4Chunk32 load_nvfp4_chunk32(
     const uint8_t* codes, const uint8_t* scales, int c) {
     Nvfp4Chunk32 ch;
     ch.q = ld_stream_u4(codes + (size_t)c * 16);
     ch.s = ld_scale_u16(scales + (size_t)c * 2);
-    return ch;
-}
-
-__device__ __forceinline__ Mxfp8Chunk32 load_mxfp8_chunk32(
-    const uint8_t* codes, const uint8_t* scales, int c) {
-    Mxfp8Chunk32 ch;
-    ch.q0 = ld_stream_u4(codes + (size_t)c * 32);
-    ch.q1 = ld_stream_u4(codes + (size_t)c * 32 + 16);
-    ch.s = ld_scale_u8(scales + c);
     return ch;
 }
 
@@ -139,25 +125,6 @@ __device__ __forceinline__ void decode_nvfp4_chunk32_f16(const Nvfp4Chunk32& ch,
         o[4 * w + 1] = *reinterpret_cast<uint32_t*>(&p1);
         o[4 * w + 2] = *reinterpret_cast<uint32_t*>(&p2);
         o[4 * w + 3] = *reinterpret_cast<uint32_t*>(&p3);
-    }
-}
-
-__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
-    __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&v);
-}
-
-__device__ __forceinline__ void decode_mxfp8_chunk32_bf16(const Mxfp8Chunk32& ch, uint32_t (&o)[16]) {
-    const float sc = cvt_ue8m0_to_float(ch.s);
-    const uint32_t words[8] = {ch.q0.x, ch.q0.y, ch.q0.z, ch.q0.w, ch.q1.x, ch.q1.y, ch.q1.z, ch.q1.w};
-    #pragma unroll
-    for (int w = 0; w < 8; ++w) {
-        #pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {
-            __half2 h2 = cvt_e4m3x2_to_half2(uint16_t(words[w] >> (16 * hh)));
-            float2 v = __half22float2(h2);
-            o[2 * w + hh] = pack_bf16x2(v.x * sc, v.y * sc);
-        }
     }
 }
 
@@ -1270,7 +1237,6 @@ lm_head_stage1_kernel(
     int tid = threadIdx.x;
     int total_x = B_CONST * HIDDEN;
     pdl_wait();
-    pdl_trigger();
     if constexpr (KIND == 0) {
         for (int i = tid; i < total_x; i += 256) {
             __nv_bfloat16 bv = __float2bfloat16(ld_dep_f32(x + i));
@@ -1399,6 +1365,7 @@ lm_head_stage1_kernel(
 
     __shared__ float sm_val[B_CONST][RPB];
     __shared__ int32_t sm_idx[B_CONST][RPB];
+    pdl_trigger();
     if (lane == 0) {
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) { sm_val[b][r_in_blk] = best_val[b]; sm_idx[b][r_in_blk] = best_idx[b]; }
@@ -1445,7 +1412,6 @@ lm_head_nvfp4_mma_stage1_kernel(
     const int c_base = warp * (4 * U) + t;
 
     pdl_wait_fenced(zero);
-    pdl_trigger();
 
     int total_x = B_CONST * HIDDEN;
     for (int i = tid; i < total_x; i += 192) {
@@ -1542,6 +1508,7 @@ lm_head_nvfp4_mma_stage1_kernel(
         __syncthreads();
     }
 
+    pdl_trigger();
     if (tid < 16) {
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
@@ -1589,7 +1556,6 @@ lm_head_fp8_b1_pdl_stage1_kernel(
     }
 
     pdl_wait_fenced(zero);
-    pdl_trigger();
 
     for (int i = tid; i < HIDDEN; i += 256) {
         s_xh[i] = __float2half(ld_dep_f32(x + i));
@@ -1639,6 +1605,7 @@ lm_head_fp8_b1_pdl_stage1_kernel(
 
     __shared__ float sm_val[16];
     __shared__ int32_t sm_idx[16];
+    pdl_trigger();
     if (lane == 0) { sm_val[hw] = best_val; sm_idx[hw] = best_idx; }
     __syncthreads();
     if (tid == 0) {
@@ -1683,7 +1650,6 @@ lm_head_fp8_mma_stage1_kernel(
     const int c0 = warp * KS + t * CPL;
 
     pdl_wait_fenced(zero);
-    pdl_trigger();
 
     int total_x = B_CONST * HIDDEN;
     for (int i = tid; i < total_x; i += 192) {
@@ -1785,6 +1751,7 @@ lm_head_fp8_mma_stage1_kernel(
         __syncthreads();
     }
 
+    pdl_trigger();
     if (tid < 16) {
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
@@ -2236,51 +2203,70 @@ constexpr int MOE_DOWN_WARPS = MOE_DOWN_GROUPS * MOE_DOWN_PAR; // 18 warps (576 
 
 template <int FMT> struct MoeFrag;
 template <> struct MoeFrag<0> { Nvfp4Chunk32 r0, r1; uint32_t x[16]; };
-template <> struct MoeFrag<1> { Mxfp8Chunk32 r0, r1; uint32_t x[16]; };
+// Block-aligned lossless FP16 MXFP8 fragment: all 4 lanes t=0..3 stay inside the SAME 32-elem block
+// for each u=0..3 -> zero x_h conversion, hardware cvt.rn.f16x2.e4m3x2, deferred FP32 ue8m0 scale!
+template <> struct MoeFrag<1> {
+    uint2 r0_q[4], r1_q[4];
+    uint8_t r0_s[4], r1_s[4];
+    uint4 x[4];
+};
 
 template <int FMT, int K>
 __device__ __forceinline__ void moe_load_w(
-    MoeFrag<FMT>& f, const uint8_t* codes, const uint8_t* scales, int c) {
+    MoeFrag<FMT>& f, const uint8_t* codes, const uint8_t* scales, int group, int t) {
     if constexpr (FMT == 0) {
         constexpr int CB = K >> 1, SB = K >> 4;
+        const int c = 4 * group + t;
         f.r0 = load_nvfp4_chunk32(codes, scales, c);
         f.r1 = load_nvfp4_chunk32(codes + 8 * CB, scales + 8 * SB, c);
     } else {
         constexpr int CB = K, SB = K >> 5;
-        f.r0 = load_mxfp8_chunk32(codes, scales, c);
-        f.r1 = load_mxfp8_chunk32(codes + 8 * CB, scales + 8 * SB, c);
+        const int blk0 = 4 * group;
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int blk = blk0 + u;
+            const size_t off = (size_t)blk * 32 + t * 8;
+            f.r0_q[u] = ld_stream_u2(codes + off);
+            f.r1_q[u] = ld_stream_u2(codes + 8 * CB + off);
+            f.r0_s[u] = ld_scale_u8(scales + blk);
+            f.r1_s[u] = ld_scale_u8(scales + 8 * SB + blk);
+        }
     }
 }
 
 template <int FMT>
-__device__ __forceinline__ void moe_load_x(MoeFrag<FMT>& f, const __half* xrow, int c) {
-    if (xrow) {
-        const __half* xp = xrow + c * 32;
-        #pragma unroll
-        for (int v = 0; v < 4; ++v) {
-            uint4 q = ld_dep_u4(xp + v * 8);
-            if constexpr (FMT == 0) {
+__device__ __forceinline__ void moe_load_x(MoeFrag<FMT>& f, const __half* xrow, int group, int t) {
+    if constexpr (FMT == 0) {
+        if (xrow) {
+            const __half* xp = xrow + (4 * group + t) * 32;
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                uint4 q = ld_dep_u4(xp + v * 8);
                 f.x[4 * v + 0] = q.x; f.x[4 * v + 1] = q.y;
                 f.x[4 * v + 2] = q.z; f.x[4 * v + 3] = q.w;
-            } else {
-                const uint32_t ws[4] = {q.x, q.y, q.z, q.w};
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    float2 fv = __half22float2(*reinterpret_cast<const __half2*>(&ws[j]));
-                    f.x[4 * v + j] = pack_bf16x2(fv.x, fv.y);
-                }
             }
+        } else {
+            #pragma unroll
+            for (int v = 0; v < 16; ++v) f.x[v] = 0;
         }
     } else {
-        #pragma unroll
-        for (int v = 0; v < 16; ++v) f.x[v] = 0;
+        if (xrow) {
+            const int blk0 = 4 * group;
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                f.x[u] = ld_dep_u4(xrow + (blk0 + u) * 32 + t * 8);
+            }
+        } else {
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) f.x[u] = make_uint4(0, 0, 0, 0);
+        }
     }
 }
 
 template <int FMT>
 __device__ __forceinline__ void moe_mma_frag(const MoeFrag<FMT>& f, float (&d)[4]) {
-    uint32_t a[16], b[16];
     if constexpr (FMT == 0) {
+        uint32_t a[16], b[16];
         decode_nvfp4_chunk32_f16(f.r0, a);
         decode_nvfp4_chunk32_f16(f.r1, b);
         #pragma unroll
@@ -2291,14 +2277,39 @@ __device__ __forceinline__ void moe_mma_frag(const MoeFrag<FMT>& f, float (&d)[4
                                  d[0], d[1], d[2], d[3]);
         }
     } else {
-        decode_mxfp8_chunk32_bf16(f.r0, a);
-        decode_mxfp8_chunk32_bf16(f.r1, b);
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            mma_m16n8k16_f32_bf16(d[0], d[1], d[2], d[3],
-                                  a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
-                                  f.x[2 * i], f.x[2 * i + 1],
-                                  d[0], d[1], d[2], d[3]);
+        for (int u = 0; u < 4; ++u) {
+            float td0 = 0.f, td1 = 0.f, td2 = 0.f, td3 = 0.f;
+            {
+                const uint32_t w0 = f.r0_q[u].x, w1 = f.r1_q[u].x;
+                __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(w0 & 0xFFFFu));
+                __half2 a2 = cvt_e4m3x2_to_half2(uint16_t(w0 >> 16));
+                __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(w1 & 0xFFFFu));
+                __half2 b2 = cvt_e4m3x2_to_half2(uint16_t(w1 >> 16));
+                mma_m16n8k16_f32_f16(td0, td1, td2, td3,
+                                     *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                     *reinterpret_cast<uint32_t*>(&a2), *reinterpret_cast<uint32_t*>(&b2),
+                                     f.x[u].x, f.x[u].y,
+                                     td0, td1, td2, td3);
+            }
+            {
+                const uint32_t w0 = f.r0_q[u].y, w1 = f.r1_q[u].y;
+                __half2 a0 = cvt_e4m3x2_to_half2(uint16_t(w0 & 0xFFFFu));
+                __half2 a2 = cvt_e4m3x2_to_half2(uint16_t(w0 >> 16));
+                __half2 b0 = cvt_e4m3x2_to_half2(uint16_t(w1 & 0xFFFFu));
+                __half2 b2 = cvt_e4m3x2_to_half2(uint16_t(w1 >> 16));
+                mma_m16n8k16_f32_f16(td0, td1, td2, td3,
+                                     *reinterpret_cast<uint32_t*>(&a0), *reinterpret_cast<uint32_t*>(&b0),
+                                     *reinterpret_cast<uint32_t*>(&a2), *reinterpret_cast<uint32_t*>(&b2),
+                                     f.x[u].z, f.x[u].w,
+                                     td0, td1, td2, td3);
+            }
+            const float sca = cvt_ue8m0_to_float(f.r0_s[u]);
+            const float scb = cvt_ue8m0_to_float(f.r1_s[u]);
+            d[0] = fmaf(td0, sca, d[0]);
+            d[1] = fmaf(td1, sca, d[1]);
+            d[2] = fmaf(td2, scb, d[2]);
+            d[3] = fmaf(td3, scb, d[3]);
         }
     }
 }
@@ -2346,8 +2357,8 @@ moe_up_tc_kernel(
     const size_t row = (size_t)e * R + tile * MOE_TILE + g;
     const bool on = (g < M) && (((mask >> (8 * g)) & 0xffu) != 0);
     MoeFrag<FMT> f;
-    moe_load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t);
-    moe_load_x<FMT>(f, on ? (x_h + (size_t)g * K) : nullptr, 4 * warp + t);
+    moe_load_w<FMT, K>(f, w + row * CB, ws + row * SB, warp, t);
+    moe_load_x<FMT>(f, on ? (x_h + (size_t)g * K) : nullptr, warp, t);
     float d[4] = {0.f, 0.f, 0.f, 0.f};
     moe_mma_frag<FMT>(f, d);
 
@@ -2439,7 +2450,7 @@ moe_down_tc_kernel(
 
     const int U = nuniq;
     const int p = warp / MOE_DOWN_GROUPS;
-    const int c = 4 * (warp % MOE_DOWN_GROUPS) + t;
+    const int grp = warp % MOE_DOWN_GROUPS;
 
     auto xrow = [&](int u) -> const __half* {
         const uint32_t kmask = (g < M) ? (uint32_t(umask[u] >> (8 * g)) & 0xffu) : 0u;
@@ -2448,14 +2459,14 @@ moe_down_tc_kernel(
     auto load_w_u = [&](int u, MoeFrag<FMT>& f) {
         const int e = uexp[u];
         const size_t row = (size_t)e * R + tile * MOE_TILE + g;
-        moe_load_w<FMT, K>(f, w + row * CB, ws + row * SB, c);
+        moe_load_w<FMT, K>(f, w + row * CB, ws + row * SB, grp, t);
     };
 
     // Prefetch round 0 W2 weights BEFORE pdl_wait() -> hides moe_up tail completely!
     MoeFrag<FMT> nxt;
     if (p < U) load_w_u(p, nxt);
     pdl_wait();
-    if (p < U) moe_load_x<FMT>(nxt, xrow(p), c);
+    if (p < U) moe_load_x<FMT>(nxt, xrow(p), grp, t);
 
     #pragma unroll 1
     for (int base = 0; base < U; base += MOE_DOWN_PAR) {
@@ -2463,7 +2474,7 @@ moe_down_tc_kernel(
         const int u = base + p;
         if (u + MOE_DOWN_PAR < U) {
             load_w_u(u + MOE_DOWN_PAR, nxt);
-            moe_load_x<FMT>(nxt, xrow(u + MOE_DOWN_PAR), c);
+            moe_load_x<FMT>(nxt, xrow(u + MOE_DOWN_PAR), grp, t);
         }
         float d[4] = {0.f, 0.f, 0.f, 0.f};
         if (u < U) moe_mma_frag<FMT>(cur, d);

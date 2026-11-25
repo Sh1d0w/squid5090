@@ -10,11 +10,11 @@ following open-source projects:
      (optional `--ablation <path.safetensors>` support in src/weights.zig,
      cuda/kernels_inkling.cu, and cuda/kernels_prefill.cu).
    - Blackwell Programmatic Dependent Launch (PDL) overlap pattern, 16-CTA cluster
-     DSMEM/`mbarrier` BF16 controller & router kernels (`mapa.shared::cluster`,
-     `st.async.weak.shared::cluster`), spill-free 16-column `U=3` FP8/NVFP4
-     `mma.m16n8k16` GEMVs & LM-head, and 128-CTA multi-block stochastic LM-head
-     sampling with 64-bit Gumbel precision (cuda/kernels_common.cuh,
-     cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
+     DSMEM/`mbarrier` BF16 controller & router kernels and 1-launch cluster decode
+     attention (`mapa.shared::cluster`, `st.async.weak.shared::cluster`), spill-free
+     16-column `U=3` FP8/NVFP4 `mma.m16n8k16` GEMVs & LM-head, and 128-CTA
+     multi-block stochastic LM-head sampling with 64-bit Gumbel precision
+     (cuda/kernels_common.cuh, cuda/kernels_gemv.cu, cuda/kernels_inkling.cu).
    - Device-side adaptive `{2, 4, 8}` DSpark speculative verify width selection via
      CUDA Graph conditional switch (`cudaGraphCondTypeSwitch`), Top-K `1024`
      multi-CTA radix Markov candidate selection, dynamic context shortlist

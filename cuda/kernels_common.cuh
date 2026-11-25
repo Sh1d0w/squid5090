@@ -103,6 +103,15 @@ __device__ __forceinline__ float ld_dep_f32(const float* p) {
     return v;
 }
 
+__device__ __forceinline__ float4 ld_dep_f4(const float* p) {
+    float4 v;
+    asm volatile("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
+}
+
 __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
     float& d0, float& d1, float& d2, float& d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,

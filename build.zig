@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
     root_module.linkSystemLibrary("cudart", .{});
     root_module.linkSystemLibrary("cublas", .{});
+    root_module.linkSystemLibrary("cublasLt", .{});
     root_module.linkSystemLibrary("stdc++", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("pthread", .{});

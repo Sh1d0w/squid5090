@@ -272,6 +272,31 @@ Inspired by head-to-head profiling against [`ingine`](https://github.com/satelli
    - Cold 18.9K prefill jumped `7,911 → 9,677 tok/s` (`fp8/q4`, `9,800` with LoopCD) and `7,808 → 8,933 tok/s` (`fp8/fp8`); 41-tok TTFT dropped `-28.5%` (`36.3 → 25.9 ms`).
 - **Zero Accuracy Loss Verified:** `exact/bf16` greedy `mtp=0 == mtp=7` parity passes on both 41-tok and 1,146-tok prompts; 7,784-tok raw KLD improved across all modes (`fp8/fp8`: `0.0061 → 0.0056`, `top1=97.47%`; `fp8/q4`: `0.0096 → 0.0093`, `ΔPPL=+0.0015`; `nvfp4/q4`: `0.0263`); and `fp8/q4` scored **`29/30 (96.7%)`** on both `effort=low` and `effort=none` in the live 30-task H2H suite.
 
+### Lever 18 — 1-Launch Cluster Decode Attention + Native Blackwell `sm_120a` Block-Scaled & FP8 Prefill (1.9× Prefill, +40% `T=1.0` Decode)
+
+Following a full `nsys` kernel-by-kernel audit against `ingine` and `basalt v0.5.7`, four targeted upgrades closed both the decode and prefill gaps while keeping full CUDA 13.1 compatibility and zero accuracy loss:
+
+1. **Decode Quick Wins (`src/engine.zig`, `cuda/kernels_dspark.cu`, `cuda/kernels_gemv.cu`, `cuda/kernels_inkling.cu`):**
+   - Disabled `PromptLookupIndex` for stochastic sampling (`temperature >= 1e-4 && top_k != 1`), eliminating the `T=1.0` rejection-sampling cliff while keeping greedy `T=0` copy bursts fast.
+   - Upgraded `dspark_mix_kernel` to a 576-thread zero-SMEM `float4` PDL kernel feeding FP16 Tensor Core `launch_linear_h` (`dspark_commit`: `148 → ~18 µs`, vanished from `nsys` top-32); deferred `pdl_trigger()` to post-loop in `lm_head_*_stage1_kernel` (eliminating `138 µs` stage-2 stall) and `dspark_base_logits_*_mma_kernel`.
+   - Upgraded `MoeFrag<1>` (MXFP8 L20–23 MoE) to block-aligned `uint2` + deferred FP32 `ue8m0` scale + lossless FP16 `mma_m16n8k16_f32_f16` (4× fewer ALU ops, zero `x_h` BF16 convert).
+   - Hoisted predecessor-independent loads and depth-attn dot products before `pdl_wait_fenced(0u)` in `mega_attn_post_mlp_in_kernel` (`7.6 → 6.0 µs`) and `mega_mlp_post_next_depth_norm_kernel` (`10.6 → 8.9 µs`).
+2. **1-Launch Cluster Fused Decode Attention (`cuda/kernels_inkling.cu`):**
+   - Built `attn_cluster_decode_kernel<M, FULL, KV_FMT, CS>`, fusing local/global K/V sconv (with pre-PDL-wait dynamic tap projection), Q/R/K clip, V RMSNorm, BF16/FP8/Q4 KV store + ring commit, round-robin attention (`M=1` vectorized, `M=2..8` FP16 TC `m16n8k16`), cluster barrier/DSMEM reduction, sink, and sigmoid gate into **1 launch/visit** (down from 4).
+   - **RTX 5090 GPC/SMEM lesson:** GB202 has 170 SMs across 11 GPCs (~14–16 SMs/GPC) and 100 KB SMEM/SM. Aliasing `NKF` over `Q` for `M>1` keeps SMEM `<46 KB` (2 blocks/SM so 16-CTA global clusters fit every 14-SM GPC cleanly) and using `CS=8` (64 CTAs) for local SWA leaves 106 SMs free for PDL overlap. Total decode attention GPU time dropped `2.25×` (`151 → 67 ms`), lifting `fp8/fp8` `B=1` (`mtp=0`) from `~195 → 271.5 tok/s` CLI (`247 tok/s` HTTP) and `T=1.0` `fp8/fp8` Code `+46%` (`244.5 → 356.8 tok/s`).
+3. **Native Blackwell `sm_120a` Tensor Core Prefill (`build.zig`, `cuda/kernels_prefill.cu`, `src/engine.zig`):**
+   - Linked `cublasLt` with a zero-alloc 64-entry descriptor/algo cache pre-tuned at startup (`launch_prefill_warmup_cublas`) for native FP8 `CUDA_R_8F_E4M3 × CUDA_R_8F_E4M3 → FP32` (`667–692 TFLOPS` on `w_qrgs`/`w_o`, single-pass register-cached rowwise quantizer, **`dense_tc: 42.7 → 15.9 ms`, 2.69× faster!**).
+   - Built native Blackwell `sm_120a` block-scaled MoE prefill `p_wgemm_blkscale_kernel` using `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` (NVFP4) and `kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32` (MXFP8) with `BK=128` (64B full-sector weight loads), SMEM `s_tok` caching, O(1) precomputed tile lookup, and L2-resident FP32 `atomicAdd` accumulation (`151 MB → 18.8 MB`, 8× less DRAM traffic for `fp8`/`nvfp4`, keeping `exact` mode on deterministic slotted reduction; **`moe: 94.5 → 38.3 ms`, 2.47× faster!**).
+   - Upgraded `p_flash_attn_prefill_tc_kernel` with 1-shot full-GPU Local SWA (`prefill_local_attn_sub: 512 → 2048`, 512 CTAs instead of 128), native BF16 `cp.async16` 2-stage pipelining + BF16 MMA (`KV_FMT=0`), reversed causal `blockIdx.y`, zero-modulo KV slot indexing, `exp2f`, unified 32-key softmax with warp-uniform conditional `o` rescaling, and a branchless `uint4` (`LDS.128`) interior rel-bias fast path (**`attn_sub: 32.2 → 14.0 ms`, 2.31× faster!**).
+   - Vectorized `fused_depth_norm_kernel`, `p_ctrl_prep_h_kernel`, `p_ctrl_finish_kernel`, and `p_sconv_post_res_kernel` to `float4` (**`pre_sub: 30.6 → 17.2 ms`, 1.78× faster!**).
+   - **Cold 18.9K prefill jumped `8,933 → 16,855 tok/s` HTTP (`18,318 tok/s` CLI, `20,007 tok/s` `B=2048` chunk peak) in `fp8/fp8` (+89%) and `9,677 → 15,632 tok/s` HTTP (`18,168 tok/s` CLI) in `fp8/q4`!**
+4. **Negative Prefill Experiments Verified & Reverted (Do Not Repeat):**
+   - *Materializing `precomp_rel[B*24, 1024]` via cuBLAS:* Wrote 4 GB across DRAM/L2 and regressed `attn_sub` `32.2 → 129.9 ms` (`+97.7 ms`). Reverted.
+   - *`CUDA_R_16BF` `cublasGemmEx` on controller matrices:* Regressed `pre_sub` `30.6 → 63.2 ms` (`+32.6 ms`). Reverted.
+   - *`BK=64` 4-stage NVFP4 MoE:* Halved per-row contiguous burst (`64 B → 32 B`, half cache line) and doubled `__syncthreads()`, regressing `moe` `37.9 → 47.2 ms` (`+9.3 ms`). Reverted to `BK=128`.
+   - *Fused `HFMA2` `-1031*sc` Q4 KV unpack:* Caused FP16 mantissa cancellation on small scales, regressing `fp8/q4` KLD `0.0094 → 0.0112`. Reverted to exact `__hmul2(__hsub2(u, 1031), sc)`.
+- **Zero Accuracy Loss Verified:** Short & >1,024-tok `exact/bf16` parity passes bit-identically (`mtp=0 == mtp=7`); 7,784-tok `--raw` KLD holds `0.005840` (`fp8/fp8`, `top1=97.53%`, `ΔPPL=-0.0073`), `0.009439` (`fp8/q4`, `top1=96.79%`, `ΔPPL=+0.0021`), and `0.026796` (`nvfp4/q4`, `top1=94.75%`); and `exact/bf16` scores `29/30` on both `low` and `none` in the live 30-task suite.
+
 ---
 
 ## 6. Repository Map

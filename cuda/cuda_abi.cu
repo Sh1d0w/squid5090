@@ -611,6 +611,24 @@ void squid_launch_linear_h(const CLinearWeight* w, const void* x_h, float* y, in
     launch_linear_h(to_lw(*w), static_cast<const __half*>(x_h), y, B, add_res != 0, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_attn_cluster_decode(
+    const float* qrgs, const float* k_proj, const float* v_proj, const float* in_k, const float* in_v,
+    const void* k_sw, const void* v_sw, const void* k_sp, const void* v_sp,
+    float* k_ring, float* v_ring, const void* q_cs, const void* r_cs, const void* rel_proj,
+    void* k_cache, void* v_cache, void* k_scale, void* v_scale, uint8_t kv_fmt,
+    float* split_buf, float* out_gated, void* out_gated_h,
+    int32_t kv_cap, uint8_t is_global, int32_t B, const int32_t* d_pos, void* stream) {
+    launch_attn_cluster_decode(
+        qrgs, k_proj, v_proj, in_k, in_v,
+        static_cast<const __nv_bfloat16*>(k_sw), static_cast<const __nv_bfloat16*>(v_sw),
+        static_cast<const __nv_bfloat16*>(k_sp), static_cast<const __nv_bfloat16*>(v_sp),
+        k_ring, v_ring, static_cast<const __nv_bfloat16*>(q_cs), static_cast<const __nv_bfloat16*>(r_cs),
+        static_cast<const __nv_bfloat16*>(rel_proj),
+        k_cache, v_cache, static_cast<__half*>(k_scale), static_cast<__half*>(v_scale),
+        static_cast<KVFormat>(kv_fmt), split_buf, out_gated, static_cast<__half*>(out_gated_h),
+        kv_cap, is_global != 0, B, d_pos, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_mega_global_sconv_prep_store(
     float* qrgs, const float* k_proj, const float* v_proj, const float* in_k, const float* in_v,
     const void* k_sw, const void* v_sw, const void* k_sp, const void* v_sp,
@@ -980,12 +998,13 @@ void squid_launch_prefill_flash_attn_tc(
     const float* qrgs, const void* rel_proj,
     const void* k_cache, const void* v_cache,
     const void* k_scale, const void* v_scale,
-    uint8_t kv_fmt, void* out_gated_h,
+    uint8_t kv_fmt, void* out_gated_h, void* scratch_rel,
     int32_t kv_cap, int32_t window, int32_t B, const int32_t* d_pos, void* stream) {
     launch_prefill_flash_attn_tc(
         qrgs, static_cast<const __nv_bfloat16*>(rel_proj),
         k_cache, v_cache, static_cast<const __half*>(k_scale), static_cast<const __half*>(v_scale),
         static_cast<KVFormat>(kv_fmt), static_cast<__half*>(out_gated_h),
+        static_cast<__half*>(scratch_rel),
         kv_cap, window, B, d_pos, static_cast<cudaStream_t>(stream));
 }
 
@@ -1017,21 +1036,21 @@ void squid_launch_prefill_route_and_sort(
 void squid_launch_prefill_moe_gate_up_h(
     const CExpertBank* w13, const void* x_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
-    void* out_act_h, int32_t B, void* stream) {
+    void* out_act_h, void* scratch_q, int32_t B, void* stream) {
     launch_prefill_moe_gate_up_h(
         to_eb(*w13), static_cast<const __half*>(x_h),
         expert_offsets, sorted_tok, sorted_slot,
-        static_cast<__half*>(out_act_h), B, static_cast<cudaStream_t>(stream));
+        static_cast<__half*>(out_act_h), scratch_q, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_moe_down_h(
     const CExpertBank* w2, const void* act_h,
     const int32_t* expert_offsets, const int32_t* sorted_tok, const int32_t* sorted_slot,
-    const float* sorted_w, float* out_slots, int32_t B, void* stream) {
+    const float* sorted_w, float* out_slots, void* scratch_q, int32_t B, void* stream) {
     launch_prefill_moe_down_h(
         to_eb(*w2), static_cast<const __half*>(act_h),
         expert_offsets, sorted_tok, sorted_slot, sorted_w,
-        out_slots, B, static_cast<cudaStream_t>(stream));
+        out_slots, scratch_q, B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_dspark_commit(

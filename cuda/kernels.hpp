@@ -304,6 +304,38 @@ void launch_controller_mega_nvfp4(
     int B,
     cudaStream_t stream);
 
+// 1-Launch 128-CTA (16x8 cluster) Fused Decode Attention:
+// Fuses (global/local) K/V sconv + Q/R/K clip + V norm + KV cache & ring store +
+// round-robin bulk/tail attention (BF16 / FP8 / Q4) + cluster merge + sink + sigmoid gate!
+void launch_attn_cluster_decode(
+    const float* qrgs,
+    const float* k_proj,
+    const float* v_proj,
+    const float* in_k,
+    const float* in_v,
+    const __nv_bfloat16* k_sconv_w,
+    const __nv_bfloat16* v_sconv_w,
+    const __nv_bfloat16* k_sconv_proj,
+    const __nv_bfloat16* v_sconv_proj,
+    float* k_ring,
+    float* v_ring,
+    const __nv_bfloat16* q_clip_scale,
+    const __nv_bfloat16* rel_clip_scale,
+    const __nv_bfloat16* rel_proj,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
+    float* split_buf,
+    float* out_gated,
+    __half* out_gated_h,
+    int kv_cap,
+    bool is_global,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
 // MEGA-FUSION 6: Global-layer fused dynamic k_sconv + v_sconv + Q/R/K clip + log-pos scale + V norm + KV store (BF16/FP8/Q4!)
 void launch_mega_global_sconv_prep_store(
     float* qrgs,
@@ -584,6 +616,7 @@ void launch_prefill_flash_attn_tc(
     const __half* v_scale,
     KVFormat kv_fmt,
     __half* out_gated_h,
+    __half* scratch_rel,
     int kv_cap,
     int window,
     int B,
@@ -628,6 +661,7 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* sorted_tok,
     const int32_t* sorted_slot,
     __half* out_act_h,
+    void* scratch_q,
     int B,
     cudaStream_t stream);
 
@@ -639,6 +673,7 @@ void launch_prefill_moe_down_h(
     const int32_t* sorted_slot,
     const float* sorted_w,
     float* out_slots,
+    void* scratch_q,
     int B,
     cudaStream_t stream);
 

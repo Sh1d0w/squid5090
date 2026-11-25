@@ -357,6 +357,36 @@ pub extern "c" fn squid_launch_mega_attn_post_mlp_in(
     stream: ?*anyopaque,
 ) void;
 
+pub extern "c" fn squid_launch_attn_cluster_decode(
+    qrgs: [*]const f32,
+    k_proj: [*]const f32,
+    v_proj: [*]const f32,
+    in_k: ?[*]const f32,
+    in_v: ?[*]const f32,
+    k_sw: *const anyopaque,
+    v_sw: *const anyopaque,
+    k_sp: ?*const anyopaque,
+    v_sp: ?*const anyopaque,
+    k_ring: [*]f32,
+    v_ring: [*]f32,
+    q_cs: *const anyopaque,
+    r_cs: *const anyopaque,
+    rel_proj: *const anyopaque,
+    k_cache: *anyopaque,
+    v_cache: *anyopaque,
+    k_scale: ?*anyopaque,
+    v_scale: ?*anyopaque,
+    kv_fmt: u8,
+    split_buf: [*]f32,
+    out_gated: ?[*]f32,
+    out_gated_h: ?*anyopaque,
+    kv_cap: i32,
+    is_global: u8,
+    batch_size: i32,
+    d_pos: *const i32,
+    stream: ?*anyopaque,
+) void;
+
 pub extern "c" fn squid_launch_route_topk_nvfp4(
     m_h: *const anyopaque,
     router_nvfp4: *const CLinearWeight,
@@ -687,6 +717,7 @@ pub extern "c" fn squid_launch_prefill_flash_attn_tc(
     v_scale: ?*const anyopaque,
     kv_fmt: u8,
     out_gated_h: *anyopaque,
+    scratch_rel: ?*anyopaque,
     kv_cap: i32,
     window: i32,
     batch_size: i32,
@@ -734,6 +765,7 @@ pub extern "c" fn squid_launch_prefill_moe_gate_up_h(
     sorted_tok: [*]const i32,
     sorted_slot: [*]const i32,
     out_act_h: *anyopaque,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;
@@ -746,6 +778,7 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     sorted_slot: [*]const i32,
     sorted_w: [*]const f32,
     out_slots: [*]f32,
+    scratch_q: ?*anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,
 ) void;

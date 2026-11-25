@@ -122,7 +122,7 @@ const PromptLookupIndex = struct {
 const prefix_checkpoint_count: usize = 4;
 const side_shield_max_tokens: u32 = 4096;
 const prefill_batch_max: u32 = 2048;
-const prefill_local_attn_sub: u32 = 512;
+const prefill_local_attn_sub: u32 = 2048;
 const prefill_sub_chunks_max: u32 = prefill_batch_max / constants.mtp_block_size_max; // 256
 
 inline fn offset_f16_ptr(base: *anyopaque, elem_offset: usize) *anyopaque {
@@ -1120,8 +1120,11 @@ pub const Engine = struct {
             }
         } else if (use_adaptive) {
             // Hybrid O(1) Prompt-Lookup + Overlapped Adaptive {2, 4, 8} DSpark Speculative Decode!
+            // Disable delta Prompt-Lookup during stochastic sampling (T > 0, top_k != 1): delta drafts
+            // have q(x)=1 which forces strict rejection sampling and hurts acceptance on T=1.0 Code/Copy.
+            const allow_lookup: bool = self.use_prompt_lookup and (self.sample_params.temperature < 1e-4 or self.sample_params.top_k == 1);
             // Seed prompt-lookup ring with trailing prompt tokens + first_tok (<=8192 tok -> <25 us CPU).
-            if (self.use_prompt_lookup) {
+            if (allow_lookup) {
                 self.prompt_lookup.reset();
                 const seed_start: usize = if (prompt.len > PromptLookupIndex.hist_cap) (prompt.len - PromptLookupIndex.hist_cap) else 0;
                 for (prompt[seed_start..]) |ptok| self.prompt_lookup.push(ptok);
@@ -1131,7 +1134,7 @@ pub const Engine = struct {
             var draft_in_flight: bool = false;
             while (stats.generated_tokens < max_new_tokens and @as(u32, @intCast(self.current_position)) + constants.mtp_block_size_max <= self.context_tokens_max) {
                 var lookup_hit: bool = false;
-                if (self.use_prompt_lookup) {
+                if (allow_lookup) {
                     const out_ptr: *[constants.mtp_draft_count_max]i32 = @ptrCast(self.h_lookup_drafts.?);
                     if (self.prompt_lookup.match(out_ptr)) {
                         lookup_hit = true;
@@ -1191,7 +1194,7 @@ pub const Engine = struct {
                 var idx: u32 = 0;
                 while (idx < n_acc and stats.generated_tokens < max_new_tokens) : (idx += 1) {
                     const tok: i32 = self.h_accepted.?[idx];
-                    if (self.use_prompt_lookup) self.prompt_lookup.push(tok);
+                    if (allow_lookup) self.prompt_lookup.push(tok);
                     if (out_tokens.len > 0) out_tokens[stats.generated_tokens] = tok;
                     stats.generated_tokens += 1;
                     stats.last_token_id = tok;
@@ -1480,7 +1483,7 @@ pub const Engine = struct {
                 const abl = ablation_slice(w, true, vi - 1);
                 cuda.squid_launch_prefill_sconv_post_res(
                     self.p_moe_slot_out,
-                    1,
+                    if (w.mode == .exact) @as(c_int, 1) else @as(c_int, 0),
                     prev_lw.mlp_sconv_w.?,
                     self.mlp_ring[vi - 1],
                     self.p_residual,
@@ -1665,6 +1668,7 @@ pub const Engine = struct {
                     self.v_scale[vi],
                     @intFromEnum(self.kv_format),
                     self.p_attn_gated_h,
+                    self.p_w_f16,
                     self.kv_cap[vi],
                     0,
                     b_i32,
@@ -1708,6 +1712,7 @@ pub const Engine = struct {
                         null,
                         @intFromEnum(constants.KVFormat.bf16),
                         offset_f16_ptr(self.p_attn_gated_h, off * constants.query_dim),
+                        self.p_w_f16,
                         self.kv_cap[vi],
                         constants.swa_window_tokens,
                         @intCast(sub_b),
@@ -1829,6 +1834,7 @@ pub const Engine = struct {
                 b_i32,
                 self.stream,
             );
+            const moe_scratch: ?*anyopaque = if (w.mode == .exact) null else self.p_w_f16;
             cuda.squid_launch_prefill_moe_gate_up_h(
                 &lw.w13,
                 self.p_mlp_normed_h,
@@ -1836,6 +1842,7 @@ pub const Engine = struct {
                 self.p_sorted_tok,
                 self.p_sorted_slot,
                 self.p_moe_act_h,
+                moe_scratch,
                 b_i32,
                 self.stream,
             );
@@ -1847,6 +1854,7 @@ pub const Engine = struct {
                 self.p_sorted_slot,
                 self.p_sorted_w,
                 self.p_moe_slot_out,
+                moe_scratch,
                 b_i32,
                 self.stream,
             );
@@ -1861,7 +1869,7 @@ pub const Engine = struct {
                 const mlp_abl = ablation_slice(w, true, vi);
                 cuda.squid_launch_prefill_sconv_post_res(
                     self.p_moe_slot_out,
-                    1,
+                    if (w.mode == .exact) @as(c_int, 1) else @as(c_int, 0),
                     lw.mlp_sconv_w.?,
                     self.mlp_ring[vi],
                     self.p_residual,
@@ -1898,7 +1906,7 @@ pub const Engine = struct {
         const last_mlp_abl = ablation_slice(w, true, constants.visit_count - 1);
         cuda.squid_launch_prefill_sconv_post_res(
             self.p_moe_slot_out,
-            1,
+            if (w.mode == .exact) @as(c_int, 1) else @as(c_int, 0),
             last_lw.mlp_sconv_w.?,
             self.mlp_ring[constants.visit_count - 1],
             self.p_residual,
@@ -2421,53 +2429,20 @@ pub const Engine = struct {
                 cuda.squid_launch_linear(&lw.w_v, in_v, self.v_proj, batch_size, 0, self.stream);
             }
 
-            if (v.is_global) {
-                cuda.squid_launch_mega_global_sconv_prep_store(
-                    self.qrgs,
-                    self.k_proj,
-                    self.v_proj,
-                    in_k,
-                    in_v,
-                    lw.k_sconv_w.?,
-                    lw.v_sconv_w.?,
-                    lw.k_sconv_proj.?,
-                    lw.v_sconv_proj.?,
-                    self.k_ring[vi],
-                    self.v_ring[vi],
-                    lw.q_clip_scale.?,
-                    lw.rel_clip_scale.?,
-                    self.k_cache[vi].?,
-                    self.v_cache[vi].?,
-                    self.k_scale[vi],
-                    self.v_scale[vi],
-                    @intFromEnum(self.kv_format),
-                    self.kv_cap[vi],
-                    batch_size,
-                    self.d_pos,
-                    self.stream,
-                );
-            } else {
-                cuda.squid_launch_mega_local_sconv_prep_store(
-                    self.qrgs,
-                    self.k_proj,
-                    self.v_proj,
-                    lw.k_sconv_w.?,
-                    lw.v_sconv_w.?,
-                    self.k_ring[vi],
-                    self.v_ring[vi],
-                    lw.q_clip_scale.?,
-                    lw.rel_clip_scale.?,
-                    self.k_cache[vi].?,
-                    self.v_cache[vi].?,
-                    self.kv_cap[vi],
-                    batch_size,
-                    self.d_pos,
-                    self.stream,
-                );
-            }
-
-            cuda.squid_launch_relative_attention_gated(
+            cuda.squid_launch_attn_cluster_decode(
                 self.qrgs,
+                self.k_proj,
+                self.v_proj,
+                if (v.is_global) in_k else null,
+                if (v.is_global) in_v else null,
+                lw.k_sconv_w.?,
+                lw.v_sconv_w.?,
+                if (v.is_global) lw.k_sconv_proj else null,
+                if (v.is_global) lw.v_sconv_proj else null,
+                self.k_ring[vi],
+                self.v_ring[vi],
+                lw.q_clip_scale.?,
+                lw.rel_clip_scale.?,
                 lw.rel_logits_proj.?,
                 self.k_cache[vi].?,
                 self.v_cache[vi].?,
@@ -2478,7 +2453,7 @@ pub const Engine = struct {
                 if (use_half_dense) null else self.attn_gated,
                 if (use_half_dense) self.attn_gated_h else null,
                 self.kv_cap[vi],
-                if (v.is_global) 0 else constants.swa_window_tokens,
+                if (v.is_global) 1 else 0,
                 batch_size,
                 self.d_pos,
                 self.stream,
