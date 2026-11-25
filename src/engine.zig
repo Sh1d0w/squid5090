@@ -22,12 +22,29 @@ pub const SampleParams = struct {
     loopcd_ref: i32 = 1,
 };
 
+pub const PromptImage = struct {
+    pos: u32 = 0,
+    height: i32 = 0,
+    width: i32 = 0,
+    tokens: u32 = 0,
+    rgb: [*]const u8,
+};
+
+const EncodedImage = struct {
+    pos: u32 = 0,
+    tokens: u32 = 0,
+    dev_bf16: ?*anyopaque = null,
+};
+
 pub const GenerateStats = struct {
     prompt_tokens: u32 = 0,
     cached_tokens: u32 = 0,
     generated_tokens: u32 = 0,
     prefill_ms: f64 = 0.0,
     decode_ms: f64 = 0.0,
+    vision_ms: f64 = 0.0,
+    images_encoded: u32 = 0,
+    image_tokens: u32 = 0,
     spec_steps: u32 = 0,
     lookup_steps: u32 = 0,
     total_drafts: u32 = 0,
@@ -266,6 +283,8 @@ pub const Engine = struct {
     loopcd_h1: [*]f32 = undefined,
     loopcd_h2: [*]f32 = undefined,
     sample_params: SampleParams = .{},
+    active_encoded_images: []const EncodedImage = &.{},
+    pending_post_decode_ckpt: bool = false,
 
     // Fast batched prefill scratch (B <= 256, ~119 MiB total inside same VRAMArena)
     p_tokens: [*]i32 = undefined,
@@ -878,8 +897,39 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
     }
 
+    pub fn save_post_decode_checkpoint(self: *Engine) void {
+        if (!self.pending_post_decode_ckpt) return;
+        self.pending_post_decode_ckpt = false;
+        if (self.prefix_cache.enabled and self.prefix_cache.session_len >= 128) {
+            self.save_local_state_checkpoint(3, self.prefix_cache.session_len);
+        }
+    }
+
+    fn scatter_overlapping_images(self: *const Engine, dst_hidden: [*]f32, chunk_start: u32, chunk_len: u32) void {
+        if (self.active_encoded_images.len == 0 or chunk_len == 0) return;
+        const chunk_end: u32 = chunk_start + chunk_len;
+        for (self.active_encoded_images) |enc| {
+            const dev_ptr = enc.dev_bf16 orelse continue;
+            const img_end: u32 = enc.pos + enc.tokens;
+            const ov_start: u32 = @max(chunk_start, enc.pos);
+            const ov_end: u32 = @min(chunk_end, img_end);
+            if (ov_end <= ov_start) continue;
+            const src_row: usize = ov_start - enc.pos;
+            const dst_row: i32 = @intCast(ov_start - chunk_start);
+            const count: i32 = @intCast(ov_end - ov_start);
+            const src_bytes: [*]const u8 = @ptrCast(dev_ptr);
+            cuda.squid_launch_scatter_image_embeds(
+                @ptrCast(src_bytes + src_row * constants.hidden_dim * 2),
+                dst_hidden,
+                dst_row,
+                count,
+                self.stream,
+            );
+        }
+    }
+
     /// Generate up to `max_new_tokens` into `out_tokens` (and optionally invoke `on_token`).
-    /// ZERO heap allocations occur during the entire prefill + decode execution!
+    /// ZERO heap allocations occur during text-only prefill + decode execution!
     pub fn generate(
         self: *Engine,
         prompt: []const i32,
@@ -889,7 +939,7 @@ pub const Engine = struct {
         on_token: ?TokenCallbackFn,
         callback_context: ?*anyopaque,
     ) GenerateStats {
-        return self.generate_with_hint(prompt, 0, max_new_tokens_in, num_drafts_in, out_tokens, on_token, callback_context);
+        return self.generate_with_images(prompt, &.{}, 0, max_new_tokens_in, num_drafts_in, out_tokens, on_token, callback_context);
     }
 
     pub fn generate_with_hint(
@@ -902,7 +952,22 @@ pub const Engine = struct {
         on_token: ?TokenCallbackFn,
         callback_context: ?*anyopaque,
     ) GenerateStats {
+        return self.generate_with_images(prompt, &.{}, system_prefix_hint, max_new_tokens_in, num_drafts_in, out_tokens, on_token, callback_context);
+    }
+
+    pub fn generate_with_images(
+        self: *Engine,
+        prompt: []const i32,
+        images: []const PromptImage,
+        system_prefix_hint: u32,
+        max_new_tokens_in: u32,
+        num_drafts_in: u32,
+        out_tokens: []i32,
+        on_token: ?TokenCallbackFn,
+        callback_context: ?*anyopaque,
+    ) GenerateStats {
         tiger.assert(self.weights != null);
+        self.pending_post_decode_ckpt = false;
         var stats: GenerateStats = .{ .prompt_tokens = @intCast(prompt.len) };
         if (prompt.len == 0 or max_new_tokens_in == 0) return stats;
         if (prompt.len >= self.context_tokens_max) return stats;
@@ -999,8 +1064,45 @@ pub const Engine = struct {
             self.prefix_cache.gpu_live_at_pos = -1;
         };
 
+        // --- ENCODE UNSEEN PROMPT IMAGES (skip any image fully inside cached prefix `start_pos`!) ---
+        var enc_imgs_storage: [constants.vision_max_images_default]EncodedImage = @splat(.{});
+        var enc_imgs_count: usize = 0;
+        defer {
+            self.active_encoded_images = &.{};
+            for (enc_imgs_storage[0..enc_imgs_count]) |*ei| {
+                if (ei.dev_bf16) |ptr| {
+                    tiger.assert_cuda(cuda.squid_cuda_free(ptr));
+                    ei.dev_bf16 = null;
+                }
+            }
+        }
+        if (images.len > 0) {
+            tiger.assert(w.vision.loaded != 0);
+            const vis_start_ns = tiger.clock_monotonic_ns();
+            for (images) |img| {
+                stats.image_tokens += img.tokens;
+                if (img.pos + img.tokens <= start_pos) continue; // Already in prefix KV cache!
+                tiger.assert(enc_imgs_count < enc_imgs_storage.len);
+                const np: usize = ((@as(usize, img.tokens) + 63) / 64) * 64;
+                var dev_opt: ?*anyopaque = null;
+                tiger.assert_cuda(cuda.squid_cuda_malloc(&dev_opt, np * constants.hidden_dim * 2));
+                cuda.squid_launch_vision_encode(&w.vision, img.rgb, img.height, img.width, dev_opt.?, self.stream);
+                enc_imgs_storage[enc_imgs_count] = .{
+                    .pos = img.pos,
+                    .tokens = img.tokens,
+                    .dev_bf16 = dev_opt,
+                };
+                enc_imgs_count += 1;
+                stats.images_encoded += 1;
+            }
+            if (stats.images_encoded > 0) {
+                stats.vision_ms = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - vis_start_ns)) / 1_000_000.0;
+            }
+            self.active_encoded_images = enc_imgs_storage[0..enc_imgs_count];
+        }
+
         // --- PREFILL (ONLY prompt[start_pos .. prompt_len]) ---
-        // Append any unseen prompt tokens into DSpark's dynamic context shortlist (<= 4096 rows, O(new) GPU gather).
+        // Append any unseen prompt tokens into DSpark's dynamic context shortlist (<= 16384 rows, O(new) GPU gather).
         if (use_mtp) self.note_draft_tokens(prompt);
         // Invalidate any stale checkpoints past the branch point `start_pos` BEFORE prefill writes new KV!
         if (self.prefix_cache.enabled and shield_tokens == 0) {
@@ -1053,7 +1155,7 @@ pub const Engine = struct {
             for (&self.prefix_cache.checkpoints) |*ckpt| {
                 if (ckpt.valid and ckpt.pos > prompt_len) ckpt.valid = false;
             }
-            if (prompt_len >= 128) {
+            if (prompt_len >= 128 or images.len > 0) {
                 self.save_local_state_checkpoint(2, prompt_len);
             }
         }
@@ -1328,8 +1430,9 @@ pub const Engine = struct {
 
         if (self.prefix_cache.enabled and shield_tokens == 0) {
             self.prefix_cache.gpu_live_at_pos = self.current_position;
-            if (self.prefix_cache.session_len >= 128) {
-                self.save_local_state_checkpoint(3, self.prefix_cache.session_len);
+            if (self.prefix_cache.session_len >= 128 or images.len > 0) {
+                // Defer 193 MiB D2H checkpoint copy until AFTER the server flushes [DONE] to the client!
+                self.pending_post_decode_ckpt = true;
             }
         }
         return stats;
@@ -1346,7 +1449,7 @@ pub const Engine = struct {
             self.prefill_chunk_batched(prompt, i, chunk, use_mtp, is_last);
             i += chunk;
         }
-        if (self.use_graphs and end_i - i >= constants.mtp_block_size_max) {
+        if (self.use_graphs and self.active_encoded_images.len == 0 and end_i - i >= constants.mtp_block_size_max) {
             self.ensure_prefill_b8_graph(use_mtp);
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
@@ -1385,7 +1488,7 @@ pub const Engine = struct {
             i += chunk;
             if (is_last) return 1;
         }
-        if (self.use_graphs and prompt_len - i > constants.mtp_block_size_max) {
+        if (self.use_graphs and self.active_encoded_images.len == 0 and prompt_len - i > constants.mtp_block_size_max) {
             self.ensure_prefill_b8_graph(use_mtp);
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
@@ -1436,6 +1539,7 @@ pub const Engine = struct {
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_tokens), @ptrCast(prompt[start_i..].ptr), b_usize * @sizeOf(i32), self.stream));
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.p_tokens, self.p_hidden, b_i32, self.stream);
+        self.scatter_overlapping_images(self.p_hidden, start_i, chunk_len);
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -2225,6 +2329,9 @@ pub const Engine = struct {
         const moe_slotted: u8 = 0;
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
+        if (self.active_encoded_images.len > 0) {
+            self.scatter_overlapping_images(self.hidden, @intCast(self.current_position), @intCast(batch_size));
+        }
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -2520,6 +2627,7 @@ pub const Engine = struct {
             } else {
                 cuda.squid_launch_route_topk(
                     self.mlp_normed,
+                    if (w.mode == .fp8) self.mlp_normed_h else null,
                     lw.router_w.?,
                     lw.router_bias.?,
                     self.router_logits,

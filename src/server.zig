@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -45,6 +46,9 @@ pub const ServerConfig = struct {
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
+    vision_enabled: bool = false,
+    image_max_tokens: u32 = constants.vision_max_tokens_default,
+    max_images: u32 = constants.vision_max_images_default,
 };
 
 const StopList = struct {
@@ -626,7 +630,7 @@ fn handle_connection(
         var bw = tiger.ByteWriter.init(buffers.response_buf);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"engine\":\"squid5090\"}}", .{ config.context_tokens_max, config.default_mtp });
+        bw.append_fmt(",\"max_context\":{d},\"mtp\":{d},\"vision\":{s},\"engine\":\"squid5090\"}}", .{ config.context_tokens_max, config.default_mtp, if (config.vision_enabled) "true" else "false" });
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -796,7 +800,14 @@ fn handle_chat_completions(
     if (req_loopcd_ref != 1 and req_loopcd_ref != 2) req_loopcd_ref = config.default_loopcd_ref;
     req_mtp = tiger.max_i32(0, tiger.min_i32(@intCast(constants.mtp_draft_count_max), req_mtp));
 
-    // Encode Inkling-2-Mini chat template directly into prompt_tokens:
+    var decoded_imgs: [constants.vision_max_images_default]cuda.CDecodedImage = @splat(.{});
+    var decoded_pos: [constants.vision_max_images_default]u32 = @splat(0);
+    var decoded_count: usize = 0;
+    defer {
+        for (decoded_imgs[0..decoded_count]) |*di| cuda.squid_image_free(di);
+    }
+
+    // Encode Inkling-2-Mini chat template directly into prompt_tokens (with optional multimodal image parts!):
     // server-emitted control tags use parse_special=true, while all untrusted user/tool/assistant text
     // uses parse_special=false (blocking control-token spoofing AND avoiding 32 MiB intermediate overflow!).
     const enc_res = encode_chat_template_zero_alloc(
@@ -804,14 +815,32 @@ fn handle_chat_completions(
         messages_json,
         tools_json,
         effort,
-        config.keep_history_thinking,
+        config,
         enable_thinking,
         buffers,
+        &decoded_imgs,
+        &decoded_pos,
+        &decoded_count,
     );
+    if (enc_res.img_error.len > 0) {
+        send_error_json(fd, 400, enc_res.img_error, "invalid_request_error", buffers.response_buf);
+        return;
+    }
     if (enc_res.overflow) {
         send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", buffers.response_buf);
         return;
     }
+    var prompt_imgs_buf: [constants.vision_max_images_default]engine_mod.PromptImage = undefined;
+    for (0..decoded_count) |ii| {
+        prompt_imgs_buf[ii] = .{
+            .pos = decoded_pos[ii],
+            .height = decoded_imgs[ii].height,
+            .width = decoded_imgs[ii].width,
+            .tokens = @intCast(decoded_imgs[ii].tokens),
+            .rgb = decoded_imgs[ii].rgb.?,
+        };
+    }
+    const prompt_images: []const engine_mod.PromptImage = prompt_imgs_buf[0..decoded_count];
     const system_prefix_tokens: u32 = enc_res.system_prefix_tokens;
     const prompt_len: usize = enc_res.prompt_len;
     if (prompt_len == 0 or prompt_len >= config.context_tokens_max) {
@@ -868,8 +897,9 @@ fn handle_chat_completions(
             }
         };
         var ctx: NonStreamCtx = .{ .parser = &parser, .stops = &stops };
-        const stats = engine.generate_with_hint(
+        const stats = engine.generate_with_images(
             buffers.prompt_tokens[0..prompt_len],
+            prompt_images,
             system_prefix_tokens,
             gen_limit,
             @intCast(req_mtp),
@@ -938,11 +968,19 @@ fn handle_chat_completions(
             return;
         }
 
-        tiger.print_stdout(
-            "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-        );
+        if (stats.image_tokens > 0) {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        } else {
+            tiger.print_stdout(
+                "[http] POST /v1/chat/completions prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+                .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+            );
+        }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -1018,8 +1056,9 @@ fn handle_chat_completions(
         .stops = &stops,
     };
 
-    const stats = engine.generate_with_hint(
+    const stats = engine.generate_with_images(
         buffers.prompt_tokens[0..prompt_len],
+        prompt_images,
         system_prefix_tokens,
         gen_limit,
         @intCast(req_mtp),
@@ -1027,16 +1066,25 @@ fn handle_chat_completions(
         StreamCtx.on_token,
         @ptrCast(&sctx),
     );
-    if (!sctx.conn_ok) return;
+    if (!sctx.conn_ok) {
+        engine.save_post_decode_checkpoint();
+        return;
+    }
 
     if (stops.count > 0 and !sctx.hit_stop and sctx.emitted_len < parser.content_writer.length) {
         const rem = parser.content_writer.slice()[sctx.emitted_len..];
-        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) return;
+        if (!send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .content, rem, null, null)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     // Emit streaming OpenAI tool_calls delta chunk(s) before final finish_reason="tool_calls"!
     if (parser.tool_call_count > 0) {
-        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) return;
+        if (!send_chat_sse_tool_calls(fd, buffers.sse_buf, req_id, created, req_model, &parser)) {
+            engine.save_post_decode_checkpoint();
+            return;
+        }
     }
 
     const hit_eos: bool = (stats.last_token_id == constants.eos_token_id);
@@ -1044,14 +1092,22 @@ fn handle_chat_completions(
     const usage_opt: ?engine_mod.GenerateStats = if (include_usage) stats else null;
     _ = send_chat_sse_delta(fd, buffers.sse_buf, req_id, created, req_model, .empty, "", finish_reason, usage_opt);
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 
     const dec_toks: f64 = @floatFromInt(if (stats.generated_tokens > 0) stats.generated_tokens - 1 else 0);
     const tps: f64 = if (stats.decode_ms > 0.0) (dec_toks * 1000.0 / stats.decode_ms) else 0.0;
     const dl: f64 = if (stats.spec_steps > 0) (dec_toks / @as(f64, @floatFromInt(stats.spec_steps))) else 1.0;
-    tiger.print_stdout(
-        "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
-        .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
-    );
+    if (stats.image_tokens > 0) {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}, img={d}/{d}tok vis={d:.1}ms) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.images_encoded, stats.image_tokens, stats.vision_ms, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    } else {
+        tiger.print_stdout(
+            "[http] POST /v1/chat/completions (stream) prompt={d} (cached={d}) gen={d} temp={d:.2} prefill={d:.1}ms decode={d:.1}ms ({d:.1} tok/s, dl={d:.2})\n",
+            .{ stats.prompt_tokens, stats.cached_tokens, stats.generated_tokens, req_temp, stats.prefill_ms, stats.decode_ms, tps, dl },
+        );
+    }
 }
 
 fn handle_text_completions(
@@ -1237,6 +1293,7 @@ fn handle_text_completions(
             return;
         }
         send_json_response(fd, 200, bw.slice());
+        engine.save_post_decode_checkpoint();
         return;
     }
 
@@ -1283,6 +1340,7 @@ fn handle_text_completions(
     bw.append_slice("}]}\n\n");
     _ = send_all(fd, bw.slice());
     _ = send_all(fd, "data: [DONE]\n\n");
+    engine.save_post_decode_checkpoint();
 }
 
 const DeltaKind = enum { role, content, reasoning, empty };
@@ -1402,6 +1460,7 @@ const ChatEncodeResult = struct {
     prompt_len: usize = 0,
     system_prefix_tokens: u32 = 0,
     overflow: bool = false,
+    img_error: []const u8 = "",
 };
 
 fn json_array_has_items(arr: []const u8) bool {
@@ -1438,12 +1497,17 @@ fn encode_chat_template_zero_alloc(
     messages_json: []const u8,
     tools_json: []const u8,
     effort: []const u8,
-    keep_history_thinking: bool,
+    config: *const ServerConfig,
     enable_thinking: bool,
     buffers: *ServerBuffers,
+    decoded_imgs: []cuda.CDecodedImage,
+    decoded_pos: []u32,
+    decoded_count: *usize,
 ) ChatEncodeResult {
+    const keep_history_thinking: bool = config.keep_history_thinking;
     var out_len: usize = 0;
     var overflow: bool = false;
+    var img_error: []const u8 = "";
     const scratch = buffers.scratch_str_buf;
     buffers.tool_id_map.clear();
 
@@ -1595,7 +1659,89 @@ fn encode_chat_template_zero_alloc(
                         const ps_start = ap;
                         tokenizer_mod.skip_json_value(c_raw, &ap);
                         const part_obj = c_raw[ps_start..ap];
-                        if (extract_string_field(part_obj, "text", scratch)) |ts| {
+                        var ptype_buf: [64]u8 = undefined;
+                        const ptype = extract_string_field(part_obj, "type", &ptype_buf) orelse "";
+                        const is_img_part: bool = std.mem.eql(u8, ptype, "image_url") or
+                            std.mem.eql(u8, ptype, "input_image") or
+                            std.mem.eql(u8, ptype, "image");
+                        if (is_img_part) {
+                            if (!config.vision_enabled) {
+                                img_error = "Vision tower is not loaded on this server";
+                                return .{ .img_error = img_error };
+                            }
+                            if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "tool")) {
+                                img_error = "Image content is only supported for user and tool messages";
+                                return .{ .img_error = img_error };
+                            }
+                            const max_imgs: usize = @min(@as(usize, config.max_images), decoded_imgs.len);
+                            if (decoded_count.* >= max_imgs) {
+                                img_error = "Request exceeds maximum number of images";
+                                return .{ .img_error = img_error };
+                            }
+                            var uri_slice: ?[]const u8 = null;
+                            var b64_slice: ?[]const u8 = null;
+                            if (extract_raw_field(part_obj, "image_url")) |iu_raw| {
+                                if (iu_raw.len > 0 and iu_raw[0] == '{') {
+                                    uri_slice = extract_string_field(iu_raw, "url", scratch);
+                                } else if (iu_raw.len > 0 and iu_raw[0] == '"') {
+                                    var iup: usize = 0;
+                                    uri_slice = tokenizer_mod.parse_json_string(iu_raw, &iup, scratch);
+                                }
+                            }
+                            if (uri_slice == null) uri_slice = extract_string_field(part_obj, "image", scratch);
+                            if (uri_slice == null) uri_slice = extract_string_field(part_obj, "url", scratch);
+                            if (uri_slice == null) {
+                                if (extract_raw_field(part_obj, "source")) |src_obj| {
+                                    if (src_obj.len > 0 and src_obj[0] == '{') {
+                                        var sk_buf: [32]u8 = undefined;
+                                        const sk = extract_string_field(src_obj, "type", &sk_buf) orelse "";
+                                        if (std.mem.eql(u8, sk, "base64")) {
+                                            b64_slice = extract_string_field(src_obj, "data", scratch);
+                                        } else if (std.mem.eql(u8, sk, "url")) {
+                                            uri_slice = extract_string_field(src_obj, "url", scratch);
+                                        }
+                                    }
+                                }
+                            }
+                            if (uri_slice == null and b64_slice == null) {
+                                img_error = "Image part requires a base64 data: URI (image_url.url) or base64 source.data";
+                                return .{ .img_error = img_error };
+                            }
+                            const slot_idx: usize = decoded_count.*;
+                            const max_tok_i32: i32 = @intCast(config.image_max_tokens);
+                            const dec_rc: i32 = if (uri_slice) |u|
+                                cuda.squid_image_decode_data_uri(u.ptr, u.len, max_tok_i32, &decoded_imgs[slot_idx])
+                            else
+                                cuda.squid_image_decode_base64(b64_slice.?.ptr, b64_slice.?.len, max_tok_i32, &decoded_imgs[slot_idx]);
+                            if (dec_rc != 0 or decoded_imgs[slot_idx].rgb == null or decoded_imgs[slot_idx].tokens <= 0) {
+                                img_error = if (dec_rc == -7)
+                                    "Only base64 data: URIs (data:image/...;base64,...) are supported"
+                                else if (dec_rc == -5)
+                                    "WebP decoding not enabled in this build (use PNG/JPEG/GIF/BMP or build with -Dwebp=true)"
+                                else
+                                    "Failed to decode image payload";
+                                return .{ .img_error = img_error };
+                            }
+                            const n_img_toks: usize = @intCast(decoded_imgs[slot_idx].tokens);
+                            decoded_count.* = slot_idx + 1;
+
+                            emitted_assistant_block = true;
+                            append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
+                            if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
+                            append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, &out_len, &overflow);
+                            if (out_len + n_img_toks >= buffers.prompt_tokens.len) {
+                                overflow = true;
+                            } else {
+                                decoded_pos[slot_idx] = @intCast(out_len);
+                                const img_hash: u64 = decoded_imgs[slot_idx].hash;
+                                var ki: usize = 0;
+                                while (ki < n_img_toks) : (ki += 1) {
+                                    buffers.prompt_tokens[out_len + ki] = cuda.squid_image_token_id(img_hash, @intCast(ki));
+                                }
+                                out_len += n_img_toks;
+                            }
+                            append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
+                        } else if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
                             if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);

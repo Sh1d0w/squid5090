@@ -77,6 +77,7 @@ pub const ModelWeights = struct {
 
     layers: [constants.layer_count]LayerWeights = @splat(.{}),
     dspark: cuda.CDsparkWeights = .{},
+    vision: cuda.CVisionWeights = .{},
     draft_vocab_base_ids: []i32 = &.{},
     ablation: AblationWeights = .{},
 
@@ -100,6 +101,7 @@ pub const ModelWeights = struct {
         load_mtp: bool,
         embed_on_host: bool,
         ablation_path: []const u8,
+        enable_vision: bool,
     ) bool {
         tiger.assert(model_directory.len > 0);
         tiger.assert(self.arena.base_ptr == null);
@@ -169,6 +171,8 @@ pub const ModelWeights = struct {
         }
         self.draft_vocab_base_ids = draft_vocab_host;
 
+        const has_vision: bool = enable_vision and (sf_main.lookup_optional("model.visual.proj_out.weight") != null);
+
         // --- PASS 1: Compute Exact 256-Byte-Aligned VRAM Arena Capacity ---
         const total_vram_bytes: u64 = compute_total_vram_bytes(
             quant_mode,
@@ -180,6 +184,7 @@ pub const ModelWeights = struct {
             draft_vocab_cap,
             has_ablation,
             has_ablation_detectors,
+            has_vision,
         );
         self.arena = vram_arena.VRAMArena.init(total_vram_bytes);
 
@@ -392,6 +397,10 @@ pub const ModelWeights = struct {
             self.load_ablation(&sf_abl, has_ablation_detectors);
         }
 
+        if (has_vision) {
+            self.load_vision(&sf_main);
+        }
+
         tiger.assert_cuda(cuda.squid_cuda_device_sync());
         // Paired TigerStyle invariant: Pass 1 predicted byte total == Pass 2 exact arena usage!
         self.arena.assert_exact_fill();
@@ -399,13 +408,14 @@ pub const ModelWeights = struct {
         const elapsed_sec: f64 = @as(f64, @floatFromInt(tiger.clock_monotonic_ns() - start_ns)) / 1_000_000_000.0;
         const vram_gib: f64 = @as(f64, @floatFromInt(self.arena.capacity_bytes)) / (1024.0 * 1024.0 * 1024.0);
         tiger.print_stdout(
-            "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s} | Ablation={s}\n",
+            "[weights] Loaded mode={s} in {d:.2}s | VRAM={d:.2} GiB (1 arena, {d} tensors) | MTP={s} | Vision={s} | Ablation={s}\n",
             .{
                 quant_mode.name(),
                 elapsed_sec,
                 vram_gib,
                 self.arena.allocation_count,
                 if (self.dspark.loaded != 0) "on" else "off",
+                if (self.vision.loaded != 0) "on" else "off",
                 if (!self.ablation.active) "off" else if (self.ablation.has_detectors) "gated-lda" else "plain",
             },
         );
@@ -830,6 +840,91 @@ pub const ModelWeights = struct {
         self.ablation.active = true;
         self.ablation.has_detectors = has_detectors;
     }
+
+    fn load_vision(self: *ModelWeights, sf: *const safetensors.SafetensorsFile) void {
+        const vh: u64 = constants.vision_hidden_dim;
+        const vmlp: u64 = constants.vision_mlp_dim;
+        const vmerg: u64 = constants.vision_merged_dim;
+        const pos_elems: u64 = @as(u64, constants.vision_pos_grid) * constants.vision_pos_grid * vh;
+
+        const host_f32 = tiger.alloc_host_zeroed(f32, @intCast(pos_elems));
+        defer tiger.free_host_slice(f32, host_f32);
+
+        const upload_bf16_as_f32 = struct {
+            fn run(w: *ModelWeights, sff: *const safetensors.SafetensorsFile, name: []const u8, n: usize, buf: []f32) [*]const f32 {
+                read_f32_or_bf16(sff, name, buf[0..n]);
+                const dst = w.arena.alloc_many(f32, n);
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(dst), @ptrCast(buf.ptr), n * 4));
+                return dst;
+            }
+        }.run;
+
+        self.vision.patch_w = self.upload_bf16(sf, "model.visual.backbone.embeddings.patch_embedding.weight", vh * constants.vision_patch_dim);
+        self.vision.pos = upload_bf16_as_f32(self, sf, "model.visual.backbone.embeddings.position_embedding", @intCast(pos_elems), host_f32);
+
+        // cls = class_embedding + cls_position_embedding
+        {
+            var cls_a: [constants.vision_hidden_dim]f32 = undefined;
+            var cls_b: [constants.vision_hidden_dim]f32 = undefined;
+            read_f32_or_bf16(sf, "model.visual.backbone.embeddings.class_embedding", &cls_a);
+            read_f32_or_bf16(sf, "model.visual.backbone.embeddings.cls_position_embedding", &cls_b);
+            for (0..constants.vision_hidden_dim) |c| cls_a[c] += cls_b[c];
+            const cls_dev = self.arena.alloc_many(f32, constants.vision_hidden_dim);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(cls_dev), @ptrCast(&cls_a), constants.vision_hidden_dim * 4));
+            self.vision.cls = cls_dev;
+        }
+
+        self.vision.ln_pre_w = upload_bf16_as_f32(self, sf, "model.visual.backbone.ln_pre.weight", constants.vision_hidden_dim, host_f32);
+        self.vision.ln_pre_b = upload_bf16_as_f32(self, sf, "model.visual.backbone.ln_pre.bias", constants.vision_hidden_dim, host_f32);
+
+        var nbuf: [128]u8 = undefined;
+        var l: u32 = 0;
+        while (l < constants.vision_layer_count) : (l += 1) {
+            const vl: *cuda.CVisionLayerWeights = &self.vision.layers[l];
+            vl.ln1_w = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ln_1.weight", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.ln1_b = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ln_1.bias", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.ln2_w = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ln_2.weight", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.ln2_b = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ln_2.bias", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.ls1 = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ls_1.gamma", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.ls2 = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.ls_2.gamma", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+
+            // Stack Q, K, V weights [3072, 1024] BF16 and biases [3072] F32
+            const wqkv_dev = self.arena.alloc_raw(3 * vh * vh * 2);
+            const wqkv_bytes: [*]u8 = @ptrCast(wqkv_dev);
+            const part_bytes: usize = @intCast(vh * vh * 2);
+            const names = [_][]const u8{ "q_proj", "k_proj", "v_proj" };
+            for (names, 0..) |nm, pi| {
+                const wn = std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.self_attn.{s}.weight", .{ l, nm }) catch unreachable;
+                upload_raw(sf, wn, @ptrCast(wqkv_bytes + pi * part_bytes), @intCast(part_bytes));
+                const bn = std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.self_attn.{s}.bias", .{ l, nm }) catch unreachable;
+                read_f32_or_bf16(sf, bn, host_f32[pi * constants.vision_hidden_dim .. (pi + 1) * constants.vision_hidden_dim]);
+            }
+            vl.wqkv = wqkv_dev;
+            const bqkv_dev = self.arena.alloc_many(f32, 3 * constants.vision_hidden_dim);
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(bqkv_dev), @ptrCast(host_f32.ptr), 3 * constants.vision_hidden_dim * 4));
+            vl.bqkv = bqkv_dev;
+
+            vl.wo = self.upload_bf16(sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.self_attn.out_proj.weight", .{l}) catch unreachable, vh * vh);
+            vl.bo = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.self_attn.out_proj.bias", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+            vl.fc = self.upload_bf16(sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.mlp.c_fc.weight", .{l}) catch unreachable, vmlp * vh);
+            vl.bfc = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.mlp.c_fc.bias", .{l}) catch unreachable, constants.vision_mlp_dim, host_f32);
+            vl.proj = self.upload_bf16(sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.mlp.c_proj.weight", .{l}) catch unreachable, vh * vmlp);
+            vl.bproj = upload_bf16_as_f32(self, sf, std.fmt.bufPrint(&nbuf, "model.visual.backbone.layers.{d}.mlp.c_proj.bias", .{l}) catch unreachable, constants.vision_hidden_dim, host_f32);
+        }
+
+        self.vision.proj_in = self.upload_bf16(sf, "model.visual.proj_in.weight", vmerg * vmerg);
+        self.vision.proj_out = self.upload_bf16(sf, "model.visual.proj_out.weight", @as(u64, constants.hidden_dim) * vmerg);
+
+        var inv_freq_h: [constants.vision_rope_freqs]f32 = undefined;
+        for (0..constants.vision_rope_freqs) |fi| {
+            const exp_v: f32 = @as(f32, @floatFromInt(2 * fi)) / @as(f32, @floatFromInt(2 * constants.vision_rope_freqs));
+            inv_freq_h[fi] = 1.0 / std.math.pow(f32, 10000.0, exp_v);
+        }
+        const inv_freq_dev = self.arena.alloc_many(f32, constants.vision_rope_freqs);
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d(@ptrCast(inv_freq_dev), @ptrCast(&inv_freq_h), @sizeOf(@TypeOf(inv_freq_h))));
+        self.vision.inv_freq = inv_freq_dev;
+        self.vision.loaded = 1;
+    }
 };
 
 fn read_f32_or_bf16(sf: *const safetensors.SafetensorsFile, name: []const u8, dst: []f32) void {
@@ -877,55 +972,52 @@ fn stage_layer_raw(sf: *const safetensors.SafetensorsFile, layer_idx: u32, suffi
     return @intCast(expected_bytes);
 }
 
+const embedded_draft_shortlist_bytes = @embedFile("draft_shortlist.bin");
+
 fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.QuantMode) ?[]i32 {
     if (quant_mode == .exact) return null;
-    const env_dv = tiger.getenv("SQUID_DRAFT_VOCAB");
-    var prefer_49k: bool = false;
-    if (env_dv) |ptr| {
+    _ = model_directory;
+    var shortlist_rows: usize = 32768;
+    if (tiger.getenv("SQUID_DRAFT_VOCAB")) |ptr| {
         const s = std.mem.span(ptr);
         if (std.mem.eql(u8, s, "full")) return null;
-        if (std.mem.eql(u8, s, "49k")) prefer_49k = true;
+        if (std.mem.eql(u8, s, "49k")) shortlist_rows = 49152;
+        if (std.mem.eql(u8, s, "64k")) shortlist_rows = 65536;
     }
-    const candidates: [2][]const u8 = if (prefer_49k)
-        .{ "/draft_vocab_49k.bin", "/draft_vocab_32k.bin" }
-    else
-        .{ "/draft_vocab_32k.bin", "/draft_vocab_49k.bin" };
+    const vocab_n: usize = constants.vocab_unpadded_count;
+    const present = tiger.alloc_host_zeroed(u8, vocab_n);
+    defer tiger.free_host_slice(u8, present);
 
-    var path_buf: [1024]u8 = undefined;
-    for (candidates) |suffix| {
-        const path_z = tiger.format_path_z(&path_buf, model_directory, suffix);
-        const fd: i32 = tiger.open(path_z, tiger.O_RDONLY);
-        if (fd < 0) continue;
-        defer _ = tiger.close(fd);
-        const sz_i64: i64 = tiger.lseek(fd, 0, tiger.SEEK_END);
-        if (sz_i64 <= 0 or @mod(sz_i64, 4) != 0) continue;
-        _ = tiger.lseek(fd, 0, tiger.SEEK_SET);
-        const count: usize = @intCast(@divExact(sz_i64, 4));
-        if (count == 0 or count > constants.vocab_unpadded_count) continue;
-        const ids = tiger.alloc_host_zeroed(i32, count);
-        const raw_dst: [*]u8 = @ptrCast(ids.ptr);
-        const want_bytes: usize = count * 4;
-        var got: usize = 0;
-        var iter: u32 = 0;
-        while (got < want_bytes and iter < 4096) : (iter += 1) {
-            const n: isize = tiger.read(fd, raw_dst + got, want_bytes - got);
-            if (n < 0 and tiger.get_errno() == tiger.EINTR) continue;
-            if (n <= 0) break;
-            got += @intCast(n);
+    // Corpus-frequency-ranked top-K shortlist + all special tokens (199990..V), sorted ascending by token ID
+    // (tie-breaking matches full unembed; adapted from satellitedown/inkling-2-mini-abliterated-ingine, Apache-2.0).
+    const n_ranks: usize = embedded_draft_shortlist_bytes.len / 4;
+    var taken: usize = 0;
+    var ri: usize = 0;
+    while (ri < n_ranks and taken < shortlist_rows) : (ri += 1) {
+        const tid = std.mem.readInt(u32, embedded_draft_shortlist_bytes[ri * 4 ..][0..4], .little);
+        if (tid < vocab_n and present[tid] == 0) {
+            present[tid] = 1;
+            taken += 1;
         }
-        if (got == want_bytes) {
-            var all_valid: bool = true;
-            for (ids) |id| {
-                if (id < 0 or id >= @as(i32, @intCast(constants.vocab_unpadded_count))) {
-                    all_valid = false;
-                    break;
-                }
-            }
-            if (all_valid) return ids;
-        }
-        tiger.free_host_slice(i32, ids);
     }
-    return null;
+    var sp: usize = 199990;
+    while (sp < vocab_n) : (sp += 1) {
+        present[sp] = 1;
+    }
+
+    var total: usize = 0;
+    for (present) |p| total += p;
+    if (total == 0) return null;
+
+    const ids = tiger.alloc_host_zeroed(i32, total);
+    var out_i: usize = 0;
+    for (present, 0..) |p, tid| {
+        if (p != 0) {
+            ids[out_i] = @intCast(tid);
+            out_i += 1;
+        }
+    }
+    return ids;
 }
 
 /// Pass 1: exact 256-byte-aligned VRAM byte accounting matching Pass 2 allocation-for-allocation.
@@ -939,6 +1031,7 @@ fn compute_total_vram_bytes(
     draft_vocab_count: u32,
     has_ablation: bool,
     has_ablation_detectors: bool,
+    has_vision: bool,
 ) u64 {
     const a = constants.vram_alignment_bytes;
     var total: u64 = 0;
@@ -1070,6 +1163,31 @@ fn compute_total_vram_bytes(
         if (has_ablation_detectors) {
             total += 2 * tiger.align_up_u64(dir_bytes, a);
         }
+    }
+
+    if (has_vision) {
+        const vh: u64 = constants.vision_hidden_dim;
+        const vmlp: u64 = constants.vision_mlp_dim;
+        const vmerg: u64 = constants.vision_merged_dim;
+        const pos_elems: u64 = @as(u64, constants.vision_pos_grid) * constants.vision_pos_grid * vh;
+        total += tiger.align_up_u64(vh * constants.vision_patch_dim * 2, a); // patch_w
+        total += tiger.align_up_u64(pos_elems * 4, a); // pos
+        total += 3 * tiger.align_up_u64(vh * 4, a); // cls, ln_pre_w, ln_pre_b
+        var vl: u32 = 0;
+        while (vl < constants.vision_layer_count) : (vl += 1) {
+            total += 6 * tiger.align_up_u64(vh * 4, a); // ln1/2 w/b, ls1/2
+            total += tiger.align_up_u64(3 * vh * vh * 2, a); // wqkv
+            total += tiger.align_up_u64(3 * vh * 4, a); // bqkv
+            total += tiger.align_up_u64(vh * vh * 2, a); // wo
+            total += tiger.align_up_u64(vh * 4, a); // bo
+            total += tiger.align_up_u64(vmlp * vh * 2, a); // fc
+            total += tiger.align_up_u64(vmlp * 4, a); // bfc
+            total += tiger.align_up_u64(vh * vmlp * 2, a); // proj
+            total += tiger.align_up_u64(vh * 4, a); // bproj
+        }
+        total += tiger.align_up_u64(vmerg * vmerg * 2, a); // proj_in
+        total += tiger.align_up_u64(@as(u64, constants.hidden_dim) * vmerg * 2, a); // proj_out
+        total += tiger.align_up_u64(@as(u64, constants.vision_rope_freqs) * 4, a); // inv_freq
     }
 
     return total;

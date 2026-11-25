@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_inkling.cu", .obj = "kernels_inkling.o" },
         .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
+        .{ .src = "cuda/kernels_vision.cu", .obj = "kernels_vision.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
     };
 
@@ -75,6 +76,22 @@ pub fn build(b: *std.Build) void {
             nvcc.addFileInput(b.path(hdr));
         }
         root_module.addObjectFile(obj_file);
+    }
+
+    // Native C++ image decoder (stb_image.h for PNG/JPEG/GIF/BMP + optional libwebp for WebP).
+    const enable_webp = b.option(bool, "webp", "Enable libwebp WebP image decoding (default: false)") orelse false;
+    if (enable_webp) {
+        root_module.addCSourceFile(.{
+            .file = b.path("cuda/image_decode.cpp"),
+            .flags = &.{ "-O3", "-std=c++20", "-DSQUID_HAS_WEBP=1" },
+        });
+        root_module.linkSystemLibrary("webp", .{});
+        root_module.linkSystemLibrary("webpdemux", .{});
+    } else {
+        root_module.addCSourceFile(.{
+            .file = b.path("cuda/image_decode.cpp"),
+            .flags = &.{ "-O3", "-std=c++20" },
+        });
     }
 
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });

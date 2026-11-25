@@ -60,6 +60,18 @@ constexpr int MTP_MARKOV_RANK = 256;
 constexpr float MTP_ROPE_THETA = 1000000.0f;
 constexpr int MTP_TARGET_VISITS[4] = {5, 23, 41, 48};
 
+// Inkling-2-Mini Vision Tower constants (model.visual.*)
+constexpr int VISION_LAYERS = 23;
+constexpr int VISION_HIDDEN = 1024;
+constexpr int VISION_PATCH = 20;
+constexpr int VISION_TILE = 40;
+constexpr int VISION_PATCH_DIM = VISION_PATCH * VISION_PATCH * 3; // 1200
+constexpr int VISION_MLP_DIM = 4096;
+constexpr int VISION_MERGED = 4 * VISION_HIDDEN; // 4096
+constexpr int VISION_POS_GRID = 32;
+constexpr int VISION_ROPE_FREQS = 16;
+constexpr int VISION_MAX_TOKENS = 4096;
+
 constexpr bool is_global_layer(int physical_layer) {
     return (physical_layer + 1) % BLOCK_LAYERS == 0; // 5, 11, 17, 23
 }

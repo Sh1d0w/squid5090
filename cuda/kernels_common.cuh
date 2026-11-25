@@ -13,8 +13,24 @@ namespace squid {
 // ============================================================================
 // Blackwell Programmatic Dependent Launch (PDL) & Streaming Weight Load Primitives
 // Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache-2.0).
-// Note: L2::cache_hint is intentionally omitted on CUDA 13.1 due to ptxas 13.1 bug.
+// Uses L2::evict_first cache hints automatically on CUDA 13.4+ (ptxas 13.1 bug avoided).
 // ============================================================================
+
+#if defined(__CUDACC_VER_MAJOR__) && ((__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+#define SQUID_HAS_L2_HINT 1
+#else
+#define SQUID_HAS_L2_HINT 0
+#endif
+
+__device__ __forceinline__ uint64_t l2_policy_evict_first() {
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    unsigned long long pol;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    return static_cast<uint64_t>(pol);
+#else
+    return 0ull;
+#endif
+}
 
 __device__ __forceinline__ void pdl_wait() {
 #if __CUDA_ARCH__ >= 900
@@ -53,7 +69,7 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStrea
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
-__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+__device__ __forceinline__ uint4 ld_stream_u4_nohint(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -61,23 +77,55 @@ __device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
     return v;
 }
 
+__device__ __forceinline__ uint4 ld_stream_u4(const void* p) {
+    uint4 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p), "l"(pol));
+#else
+    asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+#endif
+    return v;
+}
+
 __device__ __forceinline__ uint2 ld_stream_u2(const void* p) {
     uint2 v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.L2::256B.v2.u32 {%0,%1}, [%2], %3;"
+                 : "=r"(v.x), "=r"(v.y)
+                 : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v2.u32 {%0,%1}, [%2];"
                  : "=r"(v.x), "=r"(v.y)
                  : "l"(p));
+#endif
     return v;
 }
 
 __device__ __forceinline__ uint16_t ld_scale_u16(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return v;
 }
 
 __device__ __forceinline__ uint8_t ld_scale_u8(const void* p) {
     uint16_t v;
+#if SQUID_HAS_L2_HINT && (__CUDA_ARCH__ >= 900)
+    const uint64_t pol = l2_policy_evict_first();
+    asm volatile("ld.global.nc.L2::cache_hint.u8 %0, [%1], %2;" : "=h"(v) : "l"(p), "l"(pol));
+#else
     asm volatile("ld.global.nc.u8 %0, [%1];" : "=h"(v) : "l"(p));
+#endif
     return static_cast<uint8_t>(v);
 }
 
@@ -770,6 +818,63 @@ __device__ __forceinline__ void cluster_st_async_f4(uint32_t dst_addr, float4 v,
 __device__ __forceinline__ void cp_async16_cg(void* smem_dst, const void* gmem_src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
                  :: "r"(cluster_smem_u32(smem_dst)), "l"(gmem_src) : "memory");
+}
+
+// Single-barrier multi-value warp reduce-scatter & block reduction (adapted from ingine dense.cuh/reduce.cuh, Apache-2.0).
+constexpr int pow2_ceil_const(int n) { return (n <= 1) ? 1 : (2 * pow2_ceil_const((n + 1) / 2)); }
+
+template <int N>
+__device__ __forceinline__ float warp_reduce_scatter(const float (&in)[N]) {
+    constexpr int P = pow2_ceil_const(N);
+    static_assert(P <= 32, "more values than warp lanes");
+    const int lane = threadIdx.x & 31;
+    float t[P];
+    #pragma unroll
+    for (int i = 0; i < P; ++i) t[i] = (i < N) ? in[i] : 0.0f;
+    #pragma unroll
+    for (int o = 16; o >= P; o >>= 1) {
+        #pragma unroll
+        for (int i = 0; i < P; ++i) t[i] += __shfl_xor_sync(0xffffffffu, t[i], o);
+    }
+    #pragma unroll
+    for (int o = P / 2; o >= 1; o >>= 1) {
+        const bool up = (lane & o) != 0;
+        #pragma unroll
+        for (int i = 0; i < o; ++i) {
+            const float send = up ? t[i] : t[i + o];
+            const float keep = up ? t[i + o] : t[i];
+            t[i] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+        }
+    }
+    return t[0];
+}
+
+template <int N, int NW>
+__device__ __forceinline__ void block_sum_bcast(float (&v)[N], float* scratch) {
+    static_assert(N <= 32, "at most 32 values");
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if constexpr (N < 6) {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) v[i] = warp_sum(v[i]);
+        if (lane < N) {
+            float mine = v[0];
+            #pragma unroll
+            for (int i = 1; i < N; ++i) mine = (lane == i) ? v[i] : mine;
+            scratch[warp * 32 + lane] = mine;
+        }
+    } else {
+        const float part = warp_reduce_scatter<N>(v);
+        if (lane < pow2_ceil_const(N)) scratch[warp * 32 + lane] = part;
+    }
+    __syncthreads();
+    float s = 0.0f;
+    if (lane < N) {
+        #pragma unroll
+        for (int w = 0; w < NW; ++w) s += scratch[w * 32 + lane];
+    }
+    #pragma unroll
+    for (int i = 0; i < N; ++i) v[i] = __shfl_sync(0xffffffffu, s, i);
 }
 
 template <class... KArgs, class... Args>

@@ -1,8 +1,8 @@
 # `squid5090` Explained Simply (`LITE.md`)
 
-> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec** (`exact`, `B=1`) to an accuracy-first **349–456 tokens/sec** FP8 Tensor Core default (`0.0058–0.0094` long-context KLD, `ΔPPL -0.0073` to `+0.0021`, **`16.9–18.3K tok/s`** cold prefill, `512K` context in `22.8 GiB`) — and up to **573.5 tokens/sec** (`T=1.0` HTTP copy) / **1,000,000-token memory** in opt-in NVFP4 on one RTX 5090 — plus how to surgically remove refusals using a **1.8 MB geometric "bouncer"** with `0` diff on `53/53` tested harmless chat prompts.*
+> *An intuitive, 3Blue1Brown-style tour of how we took an LLM from **76 tokens/sec** (`exact`, `B=1`) to an accuracy-first **316–545 tokens/sec** FP8 Tensor Core default (`0.0059–0.0093` long-context KLD, `ΔPPL -0.0068` to `+0.0056`, **`17.5–17.7K tok/s`** live HTTP cold prefill, **native 23-layer BF16 Vision in `4.4 ms`**, `512K` + Vision in `22.9 GiB`) — and up to **398 tok/s greedy chat / 508 tok/s copy / 1,000,000-token memory** in opt-in NVFP4 on one RTX 5090 — plus how to surgically remove refusals using a **1.8 MB geometric "bouncer"** with `0` diff on `53/53` tested harmless chat prompts.*
 >
-> **Attribution:** Key Blackwell kernel techniques (PDL overlap, 16-CTA cluster DSMEM/`mbarrier` controllers & router, 1-launch cluster decode attention, spill-free 16-col `U=3` FP8/NVFP4 `mma.m16n8k16` GEMVs & LM-head, 128-CTA stochastic sampling, Top-K `1024` radix Markov drafting, `128×128×64` MoE prefill, `{2, 4, 8}` CUDA Graph switch drafting) and the 1.8 MB runtime-gated Fisher-LDA abliteration method were adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0). Hybrid prompt-lookup drafting was inspired by [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine) (MIT). See [`NOTICE`](NOTICE).
+> **Attribution:** Key Blackwell kernel techniques (PDL overlap, 16-CTA cluster DSMEM/`mbarrier` controllers & single-pass router, single-barrier `warp_reduce_scatter`/`block_sum_bcast`, 1-launch cluster decode attention, coalesced 128B-sector `uint4` MXFP8 BF16 Tensor Core MoE decode, spill-free 16-col `U=3` FP8/NVFP4 `mma.m16n8k16` GEMVs & LM-head, 128-CTA stochastic sampling, Top-K `1024` radix Markov drafting with an embedded corpus-frequency 32K shortlist, `128×128×64` MoE prefill, `{2, 4, 8}` CUDA Graph switch drafting, the native 23-layer BF16 Vision Tower) and the 1.8 MB runtime-gated Fisher-LDA abliteration method were adapted from [`satellitedown/inkling-2-mini-abliterated-ingine`](https://github.com/satellitedown/inkling-2-mini-abliterated-ingine) (Apache-2.0). Image decoding uses vendored `stb_image.h` (MIT/Public Domain) and optional `libwebp` (BSD-3-Clause). Opt-in prompt-lookup drafting was inspired by [`AtomicBot-ai/atomic-engine`](https://github.com/AtomicBot-ai/atomic-engine) (MIT). See [`NOTICE`](NOTICE).
 
 ---
 
@@ -75,12 +75,14 @@ If the hallway is the bottleneck, shrinking weight boxes lets you move far more 
 - **512K–1M Long-Term Memory (`Q4 KV`):** Inkling-2-Mini has a hybrid design: out of 48 layer steps, **40** only look back at the last 1,024 words (tiny fixed BF16 memory!), and only **8** global visits actually store the entire conversation history (`40 + 8 = 48`). Compressing those 8 global histories into `Q4` fits **512K in `22.8 GiB` (`fp8/q4` default)** or **1,048,576 tokens in `23.5 GiB` (`nvfp4/q4`)** — with over 8 GiB to spare on a 32 GiB card!
 - **Instant Multi-Turn Memory (Prefix Cache):** When you send Turn 2 of a 16,000-word coding session, why re-read the first 16,000 words? We snapshot the tiny local state to regular system RAM (`0` extra VRAM), so Turn 2 picks up where Turn 1 left off in **72 milliseconds** instead of re-prefilling.
 
-| Precision Mode | 7,784-Tok KLD | Top-1 Match | ΔPPL *(Ref `2.7028`)* | Live HTTP Code (`T=0` / `T=1.0`) | Live HTTP Copy (`T=0` / `T=1.0`) | 18.9K Cold Prefill |
+| Precision Mode | 7,784-Tok KLD | Top-1 Match | ΔPPL *(Ref `2.7048`)* | Live HTTP Code (`T=0` / `T=1.0`) | Live HTTP Copy (`T=0` / `T=1.0`) | 18.9K Cold Prefill |
 |---|---:|---:|---:|---:|---:|---:|
 | `exact / bf16` *(official ref)* | `0.0000` | 100.00% | `+0.0000` | 246.7 / 225.2 tok/s | 419.2 / 237.2 tok/s | 9,875 tok/s |
-| **`fp8 / fp8`** *(≤448K default)* | **`0.0058`** | **97.53%** | **`-0.0073`** | **349.4 / 356.8 tok/s** | **438.3 / 456.4 tok/s** | **16,855 tok/s** *(CLI: 18,318)* |
-| **`fp8 / q4`** *(512K default)* | **`0.0094`** | **96.79%** | **`+0.0021`** | **394.2 / 293.9 tok/s** | **455.4 / 332.4 tok/s** | 15,632 tok/s *(CLI: 18,168)* |
-| `nvfp4 / q4` *(opt-in max speed)* | `0.0268` | 94.75% | `+0.0541` | **383.0 / 366.2 tok/s** | **479.7 / 573.5 tok/s** | 15,048 tok/s |
+| **`fp8 / fp8`** *(≤448K default)* | **`0.0059`** | **97.40%** | **`-0.0068`** | **425.6 / 442.5 tok/s** | **545.1 / 477.5 tok/s** | **17,741 tok/s** *(CLI: 18,318)* |
+| **`fp8 / q4`** *(512K default)* | **`0.0093`** | **96.69%** | **`+0.0056`** | **412.4 / 460.3 tok/s** | **540.5 / 519.4 tok/s** | **17,476 tok/s** *(CLI: 18,168)* |
+| `nvfp4 / q4` *(opt-in max speed)* | `0.0267` | 94.58% | `+0.0520` | **425.2 / 424.6 tok/s** | **508.4 / 490.9 tok/s** | 14,758 tok/s |
+
+- **Native Vision (`model.visual.*`, 4.4 ms):** Inkling-2-Mini also ships a built-in 23-layer BF16 Vision Transformer (`~609 MiB` inside our single weight arena). `squid5090` decodes PNG/JPEG/GIF/BMP/WebP natively in C++, composites transparent images onto an 8×8 grey checkerboard, downscales cleanly to `40×40` visual tiles, runs the ViT in **~4.4 ms** on Tensor Cores, and tags every image with content-addressed negative synthetic token IDs — so follow-up turns about the same image reuse the prefix cache in **`0.0 ms`** without re-encoding!
 
 ```text
   RTX 5090 32 GiB VRAM: ACCURACY-FIRST DEFAULT (512K) vs OPT-IN 1M CONTEXT

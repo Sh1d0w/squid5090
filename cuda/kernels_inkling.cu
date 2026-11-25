@@ -35,6 +35,7 @@ __global__ void embed_norm_kernel(
     int b = blockIdx.x;
     int tid = threadIdx.x; // 256 threads
     int tok = tokens[b];
+    if (tok < 0) tok = 0; // Synthetic negative image token IDs are overwritten immediately by scatter_image_embeds
     const __nv_bfloat16* row = embed + (size_t)tok * HIDDEN;
     float sum_sq = 0.0f;
     for (int d = tid; d < HIDDEN; d += 256) {
@@ -2403,12 +2404,12 @@ router_cluster_bf16_kernel(
     }
     cluster_arrive_relaxed();
 
-    // Prefetch ALL router weights + bias BEFORE pdl_wait_fenced!
+    // Prefetch ALL router weights + bias BEFORE pdl_wait_fenced (Evict::none — small ~600 KB/layer matrix)!
     const __nv_bfloat16* wr = router_w + (size_t)row * HIDDEN;
     uint4 wv[CH];
     #pragma unroll
     for (int i = 0; i < CH; ++i) {
-        wv[i] = ld_stream_u4(wr + (i * 32 + lane) * 8);
+        wv[i] = ld_stream_u4_nohint(wr + (i * 32 + lane) * 8);
     }
     const float bias_val = (tid < NUM_EXPERTS) ? __ldg(router_bias + tid) : 0.0f;
 
@@ -2454,13 +2455,8 @@ router_cluster_bf16_kernel(
                 }
             }
         }
-        #pragma unroll
-        for (int m = 0; m < XG; ++m) {
-            if (m < cnt) {
-                float s = warp_sum(acc[m]);
-                if (lane == 0) s_part[m0 + m][warp] = s;
-            }
-        }
+        const float logit = warp_reduce_scatter<XG>(acc);
+        if (lane < cnt) s_part[m0 + lane][warp] = logit;
     }
     __syncthreads();
     cluster_wait_acquire();
@@ -2522,6 +2518,154 @@ router_cluster_bf16_kernel(
     }
 }
 
+// Single-pass FP16-activation 16-CTA cluster BF16 Router for M=1..8 (fp8 mode):
+// Stages ALL M<=8 tokens in <=36.8 KB SMEM -> ONE pass over weights, half SMEM bandwidth, warp_reduce_scatter!
+template <int B_CONST>
+__global__ void __launch_bounds__(256)
+router_cluster_bf16_h_kernel(
+    const __half* __restrict__ m_h,            // [B_CONST, HIDDEN]
+    const __nv_bfloat16* __restrict__ router_w,// [128, HIDDEN]
+    const float* __restrict__ router_bias,     // [128]
+    int32_t* __restrict__ out_ids,             // [B_CONST, TOP_K]
+    float* __restrict__ out_weights,           // [B_CONST, TOP_K]
+    uint32_t zero) {
+    constexpr int CL = 16;
+    constexpr int RPC = NUM_EXPERTS / CL; // 8 experts/CTA
+    constexpr int NT = 256;               // 8 warps
+    constexpr int CH = HIDDEN / (8 * 32); // 9 uint4 chunks per lane
+
+    __shared__ __align__(16) __half s_x[B_CONST][HIDDEN]; // max 36,864 B -> ALL B<=8 in ONE pass!
+    __shared__ __align__(16) float s_logits[NUM_EXPERTS];
+    __shared__ __align__(16) float s_part[B_CONST][RPC];
+    __shared__ __align__(8) uint64_t mbar;
+    __shared__ unsigned long long s_keys[NUM_EXPERTS];
+    __shared__ int s_cnt[NT];
+    __shared__ float s_sel_s[TOP_K];
+    __shared__ int32_t s_sel_e[TOP_K];
+
+    cg::cluster_group cl = cg::this_cluster();
+    const int rank = cl.block_rank();
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int row = rank * RPC + warp;
+
+    const uint32_t logits_u = cluster_smem_u32(s_logits);
+    const uint32_t mb = cluster_smem_u32(&mbar);
+    if (tid == 0) {
+        cluster_mb_init(mb);
+        cluster_fence_mb_init();
+        if (rank < B_CONST) cluster_mb_expect_tx(mb, 4u * NUM_EXPERTS);
+    }
+    cluster_arrive_relaxed();
+
+    const __nv_bfloat16* wr = router_w + (size_t)row * HIDDEN;
+    uint4 wv[CH];
+    #pragma unroll
+    for (int i = 0; i < CH; ++i) {
+        wv[i] = ld_stream_u4_nohint(wr + (i * 32 + lane) * 8);
+    }
+    const float bias_val = (tid < NUM_EXPERTS) ? __ldg(router_bias + tid) : 0.0f;
+
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    constexpr int N_U4 = (B_CONST * HIDDEN) >> 3;
+    for (int k = tid; k < N_U4; k += NT) {
+        cp_async16_cg(&s_x[0][0] + (k << 3), m_h + (k << 3));
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+
+    float acc[B_CONST];
+    #pragma unroll
+    for (int m = 0; m < B_CONST; ++m) acc[m] = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < CH; ++i) {
+        const int col = (i * 32 + lane) * 8;
+        const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&wv[i]);
+        float2 wf0 = __bfloat1622float2(wb[0]);
+        float2 wf1 = __bfloat1622float2(wb[1]);
+        float2 wf2 = __bfloat1622float2(wb[2]);
+        float2 wf3 = __bfloat1622float2(wb[3]);
+        #pragma unroll
+        for (int m = 0; m < B_CONST; ++m) {
+            uint4 x8 = *reinterpret_cast<const uint4*>(&s_x[m][col]);
+            const __half2* xb = reinterpret_cast<const __half2*>(&x8);
+            float2 xf0 = __half22float2(xb[0]);
+            float2 xf1 = __half22float2(xb[1]);
+            float2 xf2 = __half22float2(xb[2]);
+            float2 xf3 = __half22float2(xb[3]);
+            float a = acc[m];
+            a = fmaf(wf0.x, xf0.x, a); a = fmaf(wf0.y, xf0.y, a);
+            a = fmaf(wf1.x, xf1.x, a); a = fmaf(wf1.y, xf1.y, a);
+            a = fmaf(wf2.x, xf2.x, a); a = fmaf(wf2.y, xf2.y, a);
+            a = fmaf(wf3.x, xf3.x, a); a = fmaf(wf3.y, xf3.y, a);
+            acc[m] = a;
+        }
+    }
+    const float logit = warp_reduce_scatter<B_CONST>(acc);
+    if (lane < B_CONST) s_part[lane][warp] = logit;
+    __syncthreads();
+    cluster_wait_acquire();
+
+    if (tid < B_CONST * 2) {
+        int tok = tid % B_CONST;
+        int grp = tid / B_CONST;
+        float4 v = *reinterpret_cast<const float4*>(&s_part[tok][grp * 4]);
+        cluster_st_async_f4(
+            cluster_remote_u32(logits_u + 4u * (rank * RPC + grp * 4), tok),
+            v,
+            cluster_remote_u32(mb, tok));
+    }
+    if (rank >= B_CONST) return;
+    cluster_mb_wait(mb);
+
+    float sig = 0.0f;
+    if (tid < NUM_EXPERTS) {
+        sig = fast_sigmoid(s_logits[tid]);
+        uint32_t u = __float_as_uint(sig + bias_val + 0.0f);
+        uint32_t o = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+        s_keys[tid] = (static_cast<unsigned long long>(o) << 7) | static_cast<unsigned long long>(NUM_EXPERTS - 1 - tid);
+    }
+    __syncthreads();
+    {
+        constexpr int PARTS = NT / NUM_EXPERTS;
+        constexpr int W = NUM_EXPERTS / PARTS;
+        int e = tid & (NUM_EXPERTS - 1);
+        int part = tid >> 7;
+        unsigned long long mine = s_keys[e];
+        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        #pragma unroll
+        for (int j = 0; j < W; j += 4) {
+            c0 += (s_keys[part * W + j + 0] > mine);
+            c1 += (s_keys[part * W + j + 1] > mine);
+            c2 += (s_keys[part * W + j + 2] > mine);
+            c3 += (s_keys[part * W + j + 3] > mine);
+        }
+        s_cnt[tid] = c0 + c1 + c2 + c3;
+    }
+    __syncthreads();
+    if (tid < NUM_EXPERTS) {
+        int r = s_cnt[tid] + s_cnt[NUM_EXPERTS + tid];
+        if (r < TOP_K) {
+            s_sel_e[r] = tid;
+            s_sel_s[r] = sig;
+        }
+    }
+    __syncthreads();
+    if (tid < TOP_K) {
+        float my_s = s_sel_s[tid];
+        float sum = my_s;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffu, sum, o);
+        out_ids[rank * TOP_K + tid] = s_sel_e[tid];
+        out_weights[rank * TOP_K + tid] = my_s / (sum + 1e-20f) * ROUTE_SCALE;
+    }
+}
+
 constexpr int CTRL_CL = 16;
 constexpr int CTRL_CPC = HIDDEN / CTRL_CL; // 144 channels per CTA
 constexpr int CTRL_ROW_BYTES = GATE_RANK * 2; // 128 B (64 BF16)
@@ -2543,6 +2687,7 @@ controller_cluster_bf16_kernel(
     uint32_t zero) {
     constexpr int RPC = GATE_RANK / CTRL_CL; // 4 down rows/CTA
     constexpr int NT = 256;                  // 8 warps = 4 rows x 2 halves
+    constexpr int NW = 8;
     constexpr int DCH = HIDDEN / (8 * 32);   // 9 uint4 chunks per lane
     constexpr int MQ = (B_CONST + 3) / 4;    // 1 (B<=4) or 2 (B=5..8)
     constexpr int XG = (B_CONST < 4) ? B_CONST : 4;
@@ -2552,9 +2697,9 @@ controller_cluster_bf16_kernel(
     __shared__ __align__(16) float s_d[B_CONST][GATE_RANK];
     __shared__ __align__(16) float s_part[B_CONST][2][RPC];
     __shared__ __align__(16) float s_ssall[CTRL_CL][4 * MQ];
-    __shared__ __align__(16) float s_local_ss[4 * MQ];
-    __shared__ float s_w0[B_CONST], s_w1[B_CONST], s_inv_rms[B_CONST];
-    __shared__ float s_r0[8], s_r1[8], s_r2[8];
+    __shared__ float s_w0[B_CONST], s_w1[B_CONST];
+    __shared__ float s_red[NW * 32];
+    __shared__ float s_red2[NW * 32];
     __shared__ __align__(8) uint64_t mbar[2];
 
     cg::cluster_group cl = cg::this_cluster();
@@ -2577,7 +2722,7 @@ controller_cluster_bf16_kernel(
     }
     cluster_arrive_relaxed();
 
-    // 1. Prefetch ALL weights (forget/gain via cp.async -> SMEM, down -> regs, cp_q & post_norm -> regs) BEFORE PDL wait!
+    // 1. Prefetch ALL weights (forget/gain via cp.async -> SMEM, down -> regs with Evict::none, cp_q & post_norm -> regs) BEFORE PDL wait!
     {
         const uint8_t* fsrc = reinterpret_cast<const uint8_t*>(cws.forget[g] + (size_t)(rank * CTRL_CPC) * GATE_RANK);
         const uint8_t* gsrc = reinterpret_cast<const uint8_t*>(cws.gain[g]   + (size_t)(rank * CTRL_CPC) * GATE_RANK);
@@ -2595,7 +2740,7 @@ controller_cluster_bf16_kernel(
         const __nv_bfloat16* wr = cws.down[g] + (size_t)(rank * RPC + rl) * (2 * HIDDEN) + half * HIDDEN;
         #pragma unroll
         for (int i = 0; i < DCH; ++i) {
-            wv[i] = ld_stream_u4(wr + (i * 32 + lane) * 8);
+            wv[i] = ld_stream_u4_nohint(wr + (i * 32 + lane) * 8);
         }
     }
 
@@ -2611,6 +2756,7 @@ controller_cluster_bf16_kernel(
     pdl_trigger();
 
     // 2. Stage 1: depth attention + RMSNorm(x) + RMSNorm(msg) + down projection in groups of XG tokens
+    // Single-barrier block_sum_bcast cuts barriers in half vs 2-stage warp/block reductions!
     const float* x_ptr = xs.p[g];
     #pragma unroll
     for (int m0 = 0; m0 < B_CONST; m0 += XG) {
@@ -2623,7 +2769,7 @@ controller_cluster_bf16_kernel(
             const float* pl = prior_last + (size_t)b * HIDDEN;
 
             float x_reg[9], s_reg[9], p_reg[9];
-            float d0 = 0.0f, d1 = 0.0f, xsq = 0.0f;
+            float r3[3] = {0.0f, 0.0f, 0.0f};
             #pragma unroll
             for (int i = 0; i < 9; ++i) {
                 int d = tid + i * NT;
@@ -2631,46 +2777,31 @@ controller_cluster_bf16_kernel(
                 float svv = ld_dep_f32(sv + d);
                 float plv = ld_dep_f32(pl + d);
                 x_reg[i] = xv; s_reg[i] = svv; p_reg[i] = plv;
-                d0 = fmaf(qv[i], svv, d0);
-                d1 = fmaf(qv[i], plv, d1);
-                xsq = fmaf(xv, xv, xsq);
+                r3[0] = fmaf(qv[i], svv, r3[0]);
+                r3[1] = fmaf(qv[i], plv, r3[1]);
+                r3[2] = fmaf(xv, xv, r3[2]);
             }
-            d0 = warp_sum(d0); d1 = warp_sum(d1); xsq = warp_sum(xsq);
-            if (lane == 0) { s_r0[warp] = d0; s_r1[warp] = d1; s_r2[warp] = xsq; }
-            __syncthreads();
-            if (tid == 0) {
-                float t0 = 0.f, t1 = 0.f, tx = 0.f;
-                for (int w = 0; w < 8; ++w) { t0 += s_r0[w]; t1 += s_r1[w]; tx += s_r2[w]; }
-                float l0 = t0 * INV_SQRT_HIDDEN, l1 = t1 * INV_SQRT_HIDDEN;
-                float mx = fmaxf(l0, l1);
-                float e0 = expf(l0 - mx), e1 = expf(l1 - mx);
-                float inv = 1.0f / (e0 + e1);
-                s_w0[b] = e0 * inv;
-                s_w1[b] = e1 * inv;
-                s_r0[0] = rsqrtf(tx / float(HIDDEN) + RMS_EPS);
-            }
-            __syncthreads();
-            float ww0 = s_w0[b], ww1 = s_w1[b], ix = s_r0[0];
+            block_sum_bcast<3, NW>(r3, s_red);
+            float l0 = r3[0] * INV_SQRT_HIDDEN, l1 = r3[1] * INV_SQRT_HIDDEN;
+            float mx = fmaxf(l0, l1);
+            float e0 = expf(l0 - mx), e1 = expf(l1 - mx);
+            float inv = 1.0f / (e0 + e1);
+            float ww0 = e0 * inv, ww1 = e1 * inv;
+            if (tid == 0) { s_w0[b] = ww0; s_w1[b] = ww1; }
+            float ix = rsqrtf(r3[2] / float(HIDDEN) + RMS_EPS);
+
             float m_reg[9];
-            float msq = 0.0f;
+            float msq_arr[1] = {0.0f};
             #pragma unroll
             for (int i = 0; i < 9; ++i) {
                 int d = tid + i * NT;
                 float mv = fmaf(ww0, s_reg[i], ww1 * p_reg[i]);
                 m_reg[i] = mv;
                 s_cat[m][d] = __float2bfloat16_rn(x_reg[i] * ix);
-                msq = fmaf(mv, mv, msq);
+                msq_arr[0] = fmaf(mv, mv, msq_arr[0]);
             }
-            msq = warp_sum(msq);
-            if (lane == 0) s_r0[warp] = msq;
-            __syncthreads();
-            if (tid == 0) {
-                float tm = 0.f;
-                for (int w = 0; w < 8; ++w) tm += s_r0[w];
-                s_r0[0] = rsqrtf(tm / float(HIDDEN) + RMS_EPS);
-            }
-            __syncthreads();
-            float im = s_r0[0];
+            block_sum_bcast<1, NW>(msq_arr, s_red2);
+            float im = rsqrtf(msq_arr[0] / float(HIDDEN) + RMS_EPS);
             #pragma unroll
             for (int i = 0; i < 9; ++i) {
                 int d = tid + i * NT;
@@ -2709,13 +2840,8 @@ controller_cluster_bf16_kernel(
                 }
             }
         }
-        #pragma unroll
-        for (int m = 0; m < XG; ++m) {
-            if (m < cnt) {
-                float s = warp_sum(acc[m]);
-                if (lane == 0) s_part[m0 + m][half][rl] = s;
-            }
-        }
+        const float part_s = warp_reduce_scatter<XG>(acc);
+        if (lane < cnt) s_part[m0 + lane][half][rl] = part_s;
     }
     __syncthreads();
     cluster_wait_acquire();
@@ -2736,23 +2862,38 @@ controller_cluster_bf16_kernel(
             cluster_remote_u32(mb_g, dst_rank));
     }
 
-    asm volatile("cp.async.wait_all;" ::: "memory");
-    cluster_mb_wait(mb_g);
-    __syncthreads();
-
-    // 4. Forget/Gain up-projections from padded SMEM + gated mix + per-CTA sum-of-squares!
-    float merged[B_CONST];
+    // Overlap channel x/saved/prior_last global loads DURING the DSMEM mbarrier exchange!
+    const bool own = (tid < CTRL_CPC);
+    const int ch = rank * CTRL_CPC + tid;
+    float hv[B_CONST], mv[B_CONST];
     #pragma unroll
-    for (int b = 0; b < B_CONST; ++b) merged[b] = 0.0f;
+    for (int b = 0; b < B_CONST; ++b) { hv[b] = 0.0f; mv[b] = 0.0f; }
+    if (own) {
+        #pragma unroll
+        for (int b = 0; b < B_CONST; ++b) {
+            hv[b] = ld_dep_f32(x_ptr + (size_t)b * HIDDEN + ch);
+            mv[b] = fmaf(s_w0[b], ld_dep_f32(saved + (size_t)b * HIDDEN + ch),
+                         s_w1[b] * ld_dep_f32(prior_last + (size_t)b * HIDDEN + ch));
+        }
+    }
 
-    if (tid < CTRL_CPC) {
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+    cluster_mb_wait(mb_g);
+
+    // 4. Forget/Gain up-projections from padded SMEM + gated mix + ONE single-barrier block_sum_bcast!
+    float sq[B_CONST];
+    #pragma unroll
+    for (int b = 0; b < B_CONST; ++b) sq[b] = 0.0f;
+
+    if (own) {
         const uint8_t* frow = fg + tid * CTRL_RS;
         const uint8_t* grow = fg + CTRL_SLICE + tid * CTRL_RS;
         float af[B_CONST], ag[B_CONST];
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) { af[b] = 0.0f; ag[b] = 0.0f; }
 
-        #pragma unroll
+        #pragma unroll 4
         for (int j = 0; j < 8; ++j) {
             uint4 fw8 = *reinterpret_cast<const uint4*>(frow + j * 16);
             uint4 gw8 = *reinterpret_cast<const uint4*>(grow + j * 16);
@@ -2778,59 +2919,42 @@ controller_cluster_bf16_kernel(
                 af[b] = a; ag[b] = c;
             }
         }
-        const int ch = rank * CTRL_CPC + tid;
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
-            float x_ch = ld_dep_f32(x_ptr + (size_t)b * HIDDEN + ch);
-            float m_ch = fmaf(s_w0[b], ld_dep_f32(saved + (size_t)b * HIDDEN + ch),
-                              s_w1[b] * ld_dep_f32(prior_last + (size_t)b * HIDDEN + ch));
-            merged[b] = (1.0f - fast_tanh(af[b])) * x_ch + fast_tanh(ag[b]) * m_ch;
+            hv[b] = (1.0f - fast_tanh(af[b])) * hv[b] + fast_tanh(ag[b]) * mv[b];
+            sq[b] = hv[b] * hv[b];
         }
     }
 
-    if (tid < 4 * MQ) s_local_ss[tid] = 0.0f;
-    #pragma unroll
-    for (int b = 0; b < B_CONST; ++b) {
-        float sq = warp_sum(merged[b] * merged[b]);
-        if (lane == 0) s_r0[warp] = sq;
-        __syncthreads();
-        if (tid == 0) {
-            float tot = 0.0f;
-            for (int w = 0; w < 8; ++w) tot += s_r0[w];
-            s_local_ss[b] = tot;
-        }
-        __syncthreads();
-    }
+    block_sum_bcast<B_CONST, NW>(sq, s_red);
 
     // 5. Exchange per-CTA sum-of-squares across all 16 CTAs via DSMEM, normalize & write outputs!
     const uint32_t ss_u = cluster_smem_u32(s_ssall);
-    if (tid < CTRL_CL * MQ) {
-        int dst_rank = tid & (CTRL_CL - 1);
-        int q = tid >> 4;
-        float4 v = *reinterpret_cast<const float4*>(&s_local_ss[q * 4]);
-        cluster_st_async_f4(
-            cluster_remote_u32(ss_u + 16u * (rank * MQ + q), dst_rank),
-            v,
-            cluster_remote_u32(mb_s, dst_rank));
+    if (tid < CTRL_CL) {
+        float r[4 * MQ];
+        #pragma unroll
+        for (int i = 0; i < 4 * MQ; ++i) r[i] = 0.0f;
+        #pragma unroll
+        for (int b = 0; b < B_CONST; ++b) r[b] = sq[b];
+        #pragma unroll
+        for (int q = 0; q < MQ; ++q) {
+            cluster_st_async_f4(
+                cluster_remote_u32(ss_u + 16u * (rank * MQ + q), tid),
+                make_float4(r[4 * q], r[4 * q + 1], r[4 * q + 2], r[4 * q + 3]),
+                cluster_remote_u32(mb_s, tid));
+        }
     }
     cluster_mb_wait(mb_s);
-    __syncthreads();
 
-    if (tid < B_CONST) {
-        float tot = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < CTRL_CL; ++r) tot += s_ssall[r][tid];
-        s_inv_rms[tid] = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
-    }
-    __syncthreads();
-
-    if (tid < CTRL_CPC) {
-        const int ch = rank * CTRL_CPC + tid;
+    if (own) {
         float* ob = outs.p[g];
         __half* ohb = outs_h.p[g];
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
-            float v = merged[b] * s_inv_rms[b] * post_nw;
+            float tot = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < CTRL_CL; ++r) tot += s_ssall[r][b];
+            float v = hv[b] * rsqrtf(tot / float(HIDDEN) + RMS_EPS) * post_nw;
             ob[(size_t)b * HIDDEN + ch] = v;
             if (ohb) ohb[(size_t)b * HIDDEN + ch] = __float2half(v);
         }
@@ -2860,8 +2984,22 @@ static void dispatch_ctrl_cluster_bf16(
 
 template <int B_CONST>
 static void dispatch_router_cluster_bf16(
-    const float* m, const __nv_bfloat16* router_w, const float* router_bias,
+    const float* m, const __half* m_h, const __nv_bfloat16* router_w, const float* router_bias,
     int32_t* out_ids, float* out_weights, cudaStream_t stream) {
+    if (m_h != nullptr) {
+        static bool attr_set_h = false;
+        if (!attr_set_h) {
+            CUDA_CHECK(cudaFuncSetAttribute(
+                router_cluster_bf16_h_kernel<B_CONST>,
+                cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+            attr_set_h = true;
+        }
+        launch_pdl_cluster(
+            router_cluster_bf16_h_kernel<B_CONST>,
+            dim3(16), 256, 0, 16, stream,
+            m_h, router_w, router_bias, out_ids, out_weights, 0u);
+        return;
+    }
     static bool attr_set = false;
     if (!attr_set) {
         CUDA_CHECK(cudaFuncSetAttribute(
@@ -4050,11 +4188,11 @@ void launch_relative_attention_gated(
 
 template <int B_CONST>
 static void dispatch_route_bf16(
-    const float* m, const __nv_bfloat16* router_w, const float* router_bias,
+    const float* m, const __half* m_h, const __nv_bfloat16* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
     ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
     if (groups == nullptr && moe_down_zero == nullptr) {
-        dispatch_router_cluster_bf16<B_CONST>(m, router_w, router_bias, out_ids, out_weights, stream);
+        dispatch_router_cluster_bf16<B_CONST>(m, m_h, router_w, router_bias, out_ids, out_weights, stream);
         return;
     }
     route_logits_parallel_kernel<B_CONST><<<64, 64, 0, stream>>>(m, router_w, scratch_logits, moe_down_zero);
@@ -4063,18 +4201,18 @@ static void dispatch_route_bf16(
 }
 
 void launch_route_topk(
-    const float* m, const __nv_bfloat16* router_w, const float* router_bias,
+    const float* m, const __half* m_h, const __nv_bfloat16* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
     ExpertGroups* groups, float* moe_down_zero, int B, cudaStream_t stream) {
     switch (B) {
-        case 1: dispatch_route_bf16<1>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 2: dispatch_route_bf16<2>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 3: dispatch_route_bf16<3>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 4: dispatch_route_bf16<4>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 5: dispatch_route_bf16<5>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 6: dispatch_route_bf16<6>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 7: dispatch_route_bf16<7>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
-        case 8: dispatch_route_bf16<8>(m, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 1: dispatch_route_bf16<1>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 2: dispatch_route_bf16<2>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 3: dispatch_route_bf16<3>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 4: dispatch_route_bf16<4>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 5: dispatch_route_bf16<5>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 6: dispatch_route_bf16<6>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 7: dispatch_route_bf16<7>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
+        case 8: dispatch_route_bf16<8>(m, m_h, router_w, router_bias, scratch_logits, out_ids, out_weights, groups, moe_down_zero, stream); break;
     }
 }
 

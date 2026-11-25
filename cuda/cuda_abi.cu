@@ -687,10 +687,10 @@ void squid_launch_route_topk_nvfp4(
 }
 
 void squid_launch_route_topk(
-    const float* m, const void* router_w, const float* router_bias,
+    const float* m, const void* m_h, const void* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights, void* groups, int32_t B, void* stream) {
     launch_route_topk(
-        m, static_cast<const __nv_bfloat16*>(router_w), router_bias,
+        m, static_cast<const __half*>(m_h), static_cast<const __nv_bfloat16*>(router_w), router_bias,
         scratch_logits, out_ids, out_weights, static_cast<ExpertGroups*>(groups), nullptr, B, static_cast<cudaStream_t>(stream));
 }
 
@@ -1074,6 +1074,92 @@ void squid_launch_prefill_dspark_commit(
         static_cast<__half*>(mix_h0), static_cast<__half*>(mix_h1), static_cast<__half*>(mix_h2),
         scratch_kv, static_cast<__half*>(w_f16_scratch),
         B, d_pos, static_cast<cudaStream_t>(stream));
+}
+
+struct CVisionLayerWeights {
+    const float* ln1_w;
+    const float* ln1_b;
+    const float* ln2_w;
+    const float* ln2_b;
+    const float* ls1;
+    const float* ls2;
+    const void* wqkv;
+    const float* bqkv;
+    const void* wo;
+    const float* bo;
+    const void* fc;
+    const float* bfc;
+    const void* proj;
+    const float* bproj;
+};
+
+struct CVisionWeights {
+    uint8_t loaded;
+    const void* patch_w;
+    const float* pos;
+    const float* cls;
+    const float* ln_pre_w;
+    const float* ln_pre_b;
+    const void* proj_in;
+    const void* proj_out;
+    const float* inv_freq;
+    CVisionLayerWeights layers[VISION_LAYERS];
+};
+
+static VisionWeights to_vw(const CVisionWeights& c) {
+    VisionWeights w;
+    w.loaded = (c.loaded != 0);
+    w.patch_w = static_cast<const __nv_bfloat16*>(c.patch_w);
+    w.pos = c.pos;
+    w.cls = c.cls;
+    w.ln_pre_w = c.ln_pre_w;
+    w.ln_pre_b = c.ln_pre_b;
+    w.proj_in = static_cast<const __nv_bfloat16*>(c.proj_in);
+    w.proj_out = static_cast<const __nv_bfloat16*>(c.proj_out);
+    w.inv_freq = c.inv_freq;
+    for (int i = 0; i < VISION_LAYERS; ++i) {
+        w.layers[i].ln1_w = c.layers[i].ln1_w;
+        w.layers[i].ln1_b = c.layers[i].ln1_b;
+        w.layers[i].ln2_w = c.layers[i].ln2_w;
+        w.layers[i].ln2_b = c.layers[i].ln2_b;
+        w.layers[i].ls1 = c.layers[i].ls1;
+        w.layers[i].ls2 = c.layers[i].ls2;
+        w.layers[i].wqkv = static_cast<const __nv_bfloat16*>(c.layers[i].wqkv);
+        w.layers[i].bqkv = c.layers[i].bqkv;
+        w.layers[i].wo = static_cast<const __nv_bfloat16*>(c.layers[i].wo);
+        w.layers[i].bo = c.layers[i].bo;
+        w.layers[i].fc = static_cast<const __nv_bfloat16*>(c.layers[i].fc);
+        w.layers[i].bfc = c.layers[i].bfc;
+        w.layers[i].proj = static_cast<const __nv_bfloat16*>(c.layers[i].proj);
+        w.layers[i].bproj = c.layers[i].bproj;
+    }
+    return w;
+}
+
+void squid_launch_vision_encode(
+    const CVisionWeights* vw_in,
+    const uint8_t* rgb_host,
+    int32_t height,
+    int32_t width,
+    void* out_bf16_dev,
+    void* stream) {
+    VisionWeights vw = to_vw(*vw_in);
+    launch_vision_encode(
+        vw, rgb_host, height, width,
+        static_cast<__nv_bfloat16*>(out_bf16_dev),
+        static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_scatter_image_embeds(
+    const void* src_bf16,
+    float* dst_hidden,
+    int32_t dst_offset,
+    int32_t count,
+    void* stream) {
+    launch_scatter_image_embeds(
+        static_cast<const __nv_bfloat16*>(src_bf16),
+        dst_hidden, dst_offset, count,
+        static_cast<cudaStream_t>(stream));
 }
 
 } // extern "C"

@@ -260,9 +260,10 @@ void launch_route_topk_nvfp4(
     int B,
     cudaStream_t stream);
 
-// Fused MoE Router (BF16): parallel 64-block GEMV [128, 2304] + Fused Top-8 & ExpertGroups!
+// Fused MoE Router (BF16): 16-CTA cluster (single-pass FP16 when m_h != nullptr, FP32 in exact mode)!
 void launch_route_topk(
     const float* m,               // [B, HIDDEN]
+    const __half* m_h,            // optional [B, HIDDEN] for 1-pass fp8-mode routing
     const __nv_bfloat16* router_w,// [128, HIDDEN]
     const float* router_bias,     // [128]
     float* scratch_logits,        // [B, 128]
@@ -694,6 +695,21 @@ void launch_prefill_dspark_commit(
     __half* w_f16_scratch,
     int B,
     const int32_t* d_pos,
+    cudaStream_t stream);
+
+void launch_vision_encode(
+    const VisionWeights& w,
+    const uint8_t* rgb_host,
+    int height,
+    int width,
+    __nv_bfloat16* out_bf16_dev,
+    cudaStream_t stream);
+
+void launch_scatter_image_embeds(
+    const __nv_bfloat16* src_bf16,
+    float* dst_hidden,
+    int dst_offset,
+    int count,
     cudaStream_t stream);
 
 } // namespace squid

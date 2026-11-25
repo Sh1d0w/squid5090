@@ -401,6 +401,7 @@ pub extern "c" fn squid_launch_route_topk_nvfp4(
 
 pub extern "c" fn squid_launch_route_topk(
     m: [*]const f32,
+    m_h: ?*const anyopaque,
     router_w: *const anyopaque,
     router_bias: [*]const f32,
     scratch_logits: [*]f32,
@@ -780,6 +781,67 @@ pub extern "c" fn squid_launch_prefill_moe_down_h(
     out_slots: [*]f32,
     scratch_q: ?*anyopaque,
     batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub const CVisionLayerWeights = extern struct {
+    ln1_w: ?[*]const f32 = null,
+    ln1_b: ?[*]const f32 = null,
+    ln2_w: ?[*]const f32 = null,
+    ln2_b: ?[*]const f32 = null,
+    ls1: ?[*]const f32 = null,
+    ls2: ?[*]const f32 = null,
+    wqkv: ?*const anyopaque = null,
+    bqkv: ?[*]const f32 = null,
+    wo: ?*const anyopaque = null,
+    bo: ?[*]const f32 = null,
+    fc: ?*const anyopaque = null,
+    bfc: ?[*]const f32 = null,
+    proj: ?*const anyopaque = null,
+    bproj: ?[*]const f32 = null,
+};
+
+pub const CVisionWeights = extern struct {
+    loaded: u8 = 0,
+    patch_w: ?*const anyopaque = null,
+    pos: ?[*]const f32 = null,
+    cls: ?[*]const f32 = null,
+    ln_pre_w: ?[*]const f32 = null,
+    ln_pre_b: ?[*]const f32 = null,
+    proj_in: ?*const anyopaque = null,
+    proj_out: ?*const anyopaque = null,
+    inv_freq: ?[*]const f32 = null,
+    layers: [constants.vision_layer_count]CVisionLayerWeights = @splat(.{}),
+};
+
+pub const CDecodedImage = extern struct {
+    width: i32 = 0,
+    height: i32 = 0,
+    tokens: i32 = 0,
+    hash: u64 = 0,
+    rgb: ?[*]u8 = null,
+};
+
+pub extern "c" fn squid_image_token_id(hash: u64, k: i32) i32;
+pub extern "c" fn squid_image_free(img: *CDecodedImage) void;
+pub extern "c" fn squid_image_decode_bytes(data: [*]const u8, len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+pub extern "c" fn squid_image_decode_base64(b64: [*]const u8, b64_len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+pub extern "c" fn squid_image_decode_data_uri(uri: [*]const u8, uri_len: usize, max_tokens: i32, out_img: *CDecodedImage) i32;
+
+pub extern "c" fn squid_launch_vision_encode(
+    vw_in: *const CVisionWeights,
+    rgb_host: [*]const u8,
+    height: i32,
+    width: i32,
+    out_bf16_dev: *anyopaque,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_scatter_image_embeds(
+    src_bf16: *const anyopaque,
+    dst_hidden: [*]f32,
+    dst_offset: i32,
+    count: i32,
     stream: ?*anyopaque,
 ) void;
 

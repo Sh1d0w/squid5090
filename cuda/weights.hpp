@@ -130,6 +130,36 @@ struct DsparkWeights {
     DsparkLayerWeights layers[MTP_LAYERS];
 };
 
+struct VisionLayerWeights {
+    const float* ln1_w = nullptr;         // [1024]
+    const float* ln1_b = nullptr;         // [1024]
+    const float* ln2_w = nullptr;         // [1024]
+    const float* ln2_b = nullptr;         // [1024]
+    const float* ls1 = nullptr;           // [1024]
+    const float* ls2 = nullptr;           // [1024]
+    const __nv_bfloat16* wqkv = nullptr;  // [3072, 1024] stacked Q, K, V
+    const float* bqkv = nullptr;          // [3072]
+    const __nv_bfloat16* wo = nullptr;    // [1024, 1024]
+    const float* bo = nullptr;            // [1024]
+    const __nv_bfloat16* fc = nullptr;    // [4096, 1024]
+    const float* bfc = nullptr;           // [4096]
+    const __nv_bfloat16* proj = nullptr;  // [1024, 4096]
+    const float* bproj = nullptr;         // [1024]
+};
+
+struct VisionWeights {
+    bool loaded = false;
+    const __nv_bfloat16* patch_w = nullptr;  // [1024, 1200]
+    const float* pos = nullptr;              // [32*32, 1024]
+    const float* cls = nullptr;              // [1024] class_embedding + cls_position_embedding
+    const float* ln_pre_w = nullptr;         // [1024]
+    const float* ln_pre_b = nullptr;         // [1024]
+    const __nv_bfloat16* proj_in = nullptr;  // [4096, 4096]
+    const __nv_bfloat16* proj_out = nullptr; // [2304, 4096]
+    const float* inv_freq = nullptr;         // [16]
+    VisionLayerWeights layers[VISION_LAYERS];
+};
+
 struct ModelWeights {
     QuantMode mode = QuantMode::Exact;
 
