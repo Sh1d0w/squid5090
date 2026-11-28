@@ -1,5 +1,7 @@
 # squid5090 — Optimization Plan & Experiment Ledger
 
+> **Historical Archive (v0–Lever 7C):** This file preserves the original C++/CUDA bring-up notes through Lever 7C. For the current TigerStyle Zig + Blackwell engine, Levers 8–14 (PDL, TC `mma.m16n8k16`, adaptive `{2,4,8}` switch graph, `B=2048` prefill, Leviathan/Chen rejection sampling, exact FP64 KLD, and 512K needle recall), see [`README.md`](README.md), [`LEARNINGS.md`](LEARNINGS.md), and [`ledger.jsonl`](ledger.jsonl).
+
 **Target:** `thinkingmachines/Inkling-2-Mini` (text + built-in DSpark MTP) on NVIDIA RTX 5090 (`sm_120a`, 32 GiB GDDR7).
 **Primary Metric:** Single-user (`c=1`) decode tok/s (median of 6 runs, 512 generated tokens), with aggressive quantization + DSpark MTP enabled, verified for bitwise token parity (`mtp=0` == `mtp=K`), coherent output, and 8K/16K long-context needle retrieval.
 **Reference Point:** Basalt on the same RTX 5090 logged `~261–325 tok/s` (`spec=8`, `acc=48–77%`, `dl=1.8–2.9`, using 22.9 GiB VRAM + 8.9 GiB host-RAM expert spill).

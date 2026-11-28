@@ -39,17 +39,25 @@ void launch_bf16_linear(
     int B, int N, int K,
     cudaStream_t stream);
 
-// Fused LM Head + Softcap(30) + GPU Argmax / Nucleus+TopK Gumbel-Max Sampling for B rows!
-// When sample_cfg == nullptr or sample_cfg->inv_temp <= 0: pure greedy argmax (zero logits write).
+// Fused LM Head + Softcap(30) + GPU Argmax / Leviathan-Chen Stochastic Rejection Sampling!
+// sample_cfg->inv_temp == 0: pure greedy argmax (zero logits write).
+// sample_cfg->inv_temp <  0: write post-softcap logits for KLD eval + greedy argmax.
+// sample_cfg->inv_temp >  0: temperature/top_p/top_k sampling (with exact rejection sampling when d_draft_tokens != nullptr).
 void launch_lm_head_argmax(
     const LinearWeight& unembed,
-    const float* x,                  // [B, HIDDEN]
-    int32_t* out_tokens,             // [B]
-    float* out_logits,               // optional [B, VOCAB_UNPADDED]
-    float* scratch_vals,             // [B, 1024]
-    int32_t* scratch_idxs,           // [B, 1024]
-    const SampleConfig* sample_cfg,  // optional device pointer
-    const int32_t* d_pos,            // optional device pointer (batch start pos)
+    const float* x,                      // [B, HIDDEN]
+    int32_t* out_tokens,                 // [B]
+    float* out_logits,                   // optional [B, VOCAB_UNPADDED]
+    float* scratch_vals,                 // [B, 1024]
+    int32_t* scratch_idxs,               // [B, 1024]
+    const SampleConfig* sample_cfg,      // optional device pointer
+    const int32_t* d_pos,                // optional device pointer (batch start pos)
+    const int32_t* d_draft_tokens,       // optional [B-1] for rejection sampling
+    const float* d_draft_probs,          // optional [B-1, draft_vocab_size] normalized q_b(v)
+    const float* d_draft_q_sel,          // optional [B-1] q_b(draft_tokens[b])
+    const int32_t* d_draft_is_delta,     // optional [1] non-zero when prompt-lookup (q = delta_x)
+    const int32_t* inv_draft_vocab,      // optional [VOCAB_UNPADDED] real->draft idx (-1 if absent)
+    int draft_vocab_size,
     int B,
     cudaStream_t stream);
 
@@ -252,9 +260,10 @@ void launch_route_topk_nvfp4(
     int B,
     cudaStream_t stream);
 
-// Fused MoE Router (BF16): parallel 64-block GEMV [128, 2304] + Fused Top-8 & ExpertGroups!
+// Fused MoE Router (BF16): 16-CTA cluster (single-pass FP16 when m_h != nullptr, FP32 in exact mode)!
 void launch_route_topk(
     const float* m,               // [B, HIDDEN]
+    const __half* m_h,            // optional [B, HIDDEN] for 1-pass fp8-mode routing
     const __nv_bfloat16* router_w,// [128, HIDDEN]
     const float* router_bias,     // [128]
     float* scratch_logits,        // [B, 128]
@@ -294,6 +303,38 @@ void launch_controller_mega_nvfp4(
     __half* const* outs_h,
     int n_streams,
     int B,
+    cudaStream_t stream);
+
+// 1-Launch 128-CTA (16x8 cluster) Fused Decode Attention:
+// Fuses (global/local) K/V sconv + Q/R/K clip + V norm + KV cache & ring store +
+// round-robin bulk/tail attention (BF16 / FP8 / Q4) + cluster merge + sink + sigmoid gate!
+void launch_attn_cluster_decode(
+    const float* qrgs,
+    const float* k_proj,
+    const float* v_proj,
+    const float* in_k,
+    const float* in_v,
+    const __nv_bfloat16* k_sconv_w,
+    const __nv_bfloat16* v_sconv_w,
+    const __nv_bfloat16* k_sconv_proj,
+    const __nv_bfloat16* v_sconv_proj,
+    float* k_ring,
+    float* v_ring,
+    const __nv_bfloat16* q_clip_scale,
+    const __nv_bfloat16* rel_clip_scale,
+    const __nv_bfloat16* rel_proj,
+    void* k_cache,
+    void* v_cache,
+    __half* k_scale,
+    __half* v_scale,
+    KVFormat kv_fmt,
+    float* split_buf,
+    float* out_gated,
+    __half* out_gated_h,
+    int kv_cap,
+    bool is_global,
+    int B,
+    const int32_t* d_pos,
     cudaStream_t stream);
 
 // MEGA-FUSION 6: Global-layer fused dynamic k_sconv + v_sconv + Q/R/K clip + log-pos scale + V norm + KV store (BF16/FP8/Q4!)
@@ -349,6 +390,9 @@ void launch_mega_mlp_post_next_depth_norm(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    const float* loopcd_h1,
+    const float* loopcd_h2,
+    const LoopCDConfig* loopcd_cfg,
     cudaStream_t stream);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
@@ -397,10 +441,19 @@ void launch_mega_mlp_post_res(
     float* mlp_ring,
     const float* residual,
     float* hidden_out,
+    float* loopcd_save_out,      // optional [B, HIDDEN] save for LoopCD-Hidden reference state
     int B, const int32_t* d_pos,
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
+    cudaStream_t stream);
+
+// LoopCD-Hidden in-place update for batched prefill: hidden = hidden + omega * (hidden - ref_hidden)
+void launch_loopcd_hidden_apply(
+    float* hidden,
+    const float* ref_hidden,
+    float omega,
+    int B,
     cudaStream_t stream);
 
 // Simple vector ops
@@ -444,6 +497,21 @@ void launch_dspark_draft(
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
     float* out_draft_conf,         // optional [num_drafts] max softmax probability
+    const SampleConfig* sample_cfg,// optional device sampling config (inv_temp > 0 => stochastic draft!)
+    float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
+    float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
+    int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
+    cudaStream_t stream);
+
+// Dynamically gather rows from main unembed into unembed_draft shortlist (FP8 / NVFP4 / BF16)
+void launch_dspark_gather_shortlist(
+    const LinearWeight& unembed,
+    LinearWeight& unembed_draft,
+    int32_t* draft_vocab_ids,
+    int32_t* d_draft_vocab_size,
+    const int32_t* d_new_ids,
+    int dst_offset,
+    int count,
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
@@ -549,6 +617,7 @@ void launch_prefill_flash_attn_tc(
     const __half* v_scale,
     KVFormat kv_fmt,
     __half* out_gated_h,
+    __half* scratch_rel,
     int kv_cap,
     int window,
     int B,
@@ -593,6 +662,7 @@ void launch_prefill_moe_gate_up_h(
     const int32_t* sorted_tok,
     const int32_t* sorted_slot,
     __half* out_act_h,
+    void* scratch_q,
     int B,
     cudaStream_t stream);
 
@@ -604,7 +674,42 @@ void launch_prefill_moe_down_h(
     const int32_t* sorted_slot,
     const float* sorted_w,
     float* out_slots,
+    void* scratch_q,
     int B,
+    cudaStream_t stream);
+
+void launch_prefill_dspark_commit(
+    const DsparkWeights& dw,
+    const float* taps,
+    void* ctx_k[MTP_LAYERS],
+    void* ctx_v[MTP_LAYERS],
+    __half* ctx_ks[MTP_LAYERS],
+    __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* f_ring,
+    __half* mix_h0,
+    __half* mix_h1,
+    __half* mix_h2,
+    float* scratch_kv,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
+    cudaStream_t stream);
+
+void launch_vision_encode(
+    const VisionWeights& w,
+    const uint8_t* rgb_host,
+    int height,
+    int width,
+    __nv_bfloat16* out_bf16_dev,
+    cudaStream_t stream);
+
+void launch_scatter_image_embeds(
+    const __nv_bfloat16* src_bf16,
+    float* dst_hidden,
+    int dst_offset,
+    int count,
     cudaStream_t stream);
 
 } // namespace squid

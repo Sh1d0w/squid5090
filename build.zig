@@ -38,7 +38,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    // Compile all 4 Blackwell CUDA translation units in parallel with full
+    // Compile all 5 Blackwell CUDA translation units in parallel with full
     // content-addressed Zig caching (including header dependency tracking).
     const cuda_headers = [_][]const u8{
         "cuda/config.hpp",
@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .{ .src = "cuda/kernels_inkling.cu", .obj = "kernels_inkling.o" },
         .{ .src = "cuda/kernels_dspark.cu", .obj = "kernels_dspark.o" },
         .{ .src = "cuda/kernels_prefill.cu", .obj = "kernels_prefill.o" },
+        .{ .src = "cuda/kernels_vision.cu", .obj = "kernels_vision.o" },
         .{ .src = "cuda/cuda_abi.cu", .obj = "cuda_abi.o" },
     };
 
@@ -77,9 +78,26 @@ pub fn build(b: *std.Build) void {
         root_module.addObjectFile(obj_file);
     }
 
+    // Native C++ image decoder (stb_image.h for PNG/JPEG/GIF/BMP + optional libwebp for WebP).
+    const enable_webp = b.option(bool, "webp", "Enable libwebp WebP image decoding (default: false)") orelse false;
+    if (enable_webp) {
+        root_module.addCSourceFile(.{
+            .file = b.path("cuda/image_decode.cpp"),
+            .flags = &.{ "-O3", "-std=c++20", "-DSQUID_HAS_WEBP=1" },
+        });
+        root_module.linkSystemLibrary("webp", .{});
+        root_module.linkSystemLibrary("webpdemux", .{});
+    } else {
+        root_module.addCSourceFile(.{
+            .file = b.path("cuda/image_decode.cpp"),
+            .flags = &.{ "-O3", "-std=c++20" },
+        });
+    }
+
     root_module.addLibraryPath(.{ .cwd_relative = cuda_lib });
     root_module.linkSystemLibrary("cudart", .{});
     root_module.linkSystemLibrary("cublas", .{});
+    root_module.linkSystemLibrary("cublasLt", .{});
     root_module.linkSystemLibrary("stdc++", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("pthread", .{});
@@ -97,7 +115,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run squid5090 with arbitrary CLI arguments");
     run_step.dependOn(&run_cmd.step);
 
-    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 3 ...]`
+    // `zig build serve -- <model_dir> [--port 8000 --ctx 65536 --mtp 7 ...]`
     const serve_cmd = b.addRunArtifact(exe);
     serve_cmd.step.dependOn(b.getInstallStep());
     serve_cmd.addArg("serve");
@@ -105,7 +123,7 @@ pub fn build(b: *std.Build) void {
     const serve_step = b.step("serve", "Start the native Zig OpenAI HTTP/SSE API server");
     serve_step.dependOn(&serve_cmd.step);
 
-    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 3 ...]`
+    // `zig build bench -- <model_dir> [--mode nvfp4 --mtp 7 ...]`
     const bench_cmd = b.addRunArtifact(exe);
     bench_cmd.step.dependOn(b.getInstallStep());
     bench_cmd.addArg("bench");
